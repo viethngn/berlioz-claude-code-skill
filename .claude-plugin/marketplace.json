@@ -14,7 +14,7 @@
       "source": "./plugins/ad-suite-skills",
       "strict": false,
       "skills": [
-        "./plugins/ad-suite-skills/skills/prd-writer"
+        "./skills/prd-writer"
       ]
     }
   ]
