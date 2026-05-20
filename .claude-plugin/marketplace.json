@@ -1,0 +1,21 @@
+{
+  "name": "berlioz-claude-code-skill",
+  "owner": {
+    "name": "Viet Nguyen"
+  },
+  "metadata": {
+    "description": "Ad Suite PM skills for Claude Code",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "ad-suite-skills",
+      "description": "PM-focused PRD writing for Ad Suite features — background, user stories, user interaction & design, ROI/RICE scoring",
+      "source": "./plugins/ad-suite-skills",
+      "strict": false,
+      "skills": [
+        "./plugins/ad-suite-skills/skills/prd-writer"
+      ]
+    }
+  ]
+}
