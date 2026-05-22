@@ -16,6 +16,15 @@
       "skills": [
         "./skills/prd-writer"
       ]
+    },
+    {
+      "name": "nano-banana-pro",
+      "description": "Generate detailed, high-quality documentation images using Google's Gemini 3 Pro",
+      "source": "./plugins/nano-banana-pro",
+      "strict": false,
+      "skills": [
+        "./skills/generate"
+      ]
     }
   ]
 }
