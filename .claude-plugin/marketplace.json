@@ -25,6 +25,15 @@
       "skills": [
         "./skills/generate"
       ]
+    },
+    {
+      "name": "release-tools",
+      "description": "Generate Slack-style release notes from a Confluence release manual page and linked JIRA tickets",
+      "source": "./plugins/release-tools",
+      "strict": false,
+      "skills": [
+        "./skills/release-note-writer"
+      ]
     }
   ]
 }
