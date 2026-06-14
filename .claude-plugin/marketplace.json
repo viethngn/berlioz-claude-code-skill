@@ -34,6 +34,15 @@
       "skills": [
         "./skills/release-note-writer"
       ]
+    },
+    {
+      "name": "figma-prd-designer",
+      "description": "Reads a Confluence PRD and builds Figma screen designs using the target file's existing design system — reusing components first, modifying existing ones second, and creating new reusable components only when nothing else fits",
+      "source": "./plugins/figma-prd-designer",
+      "strict": false,
+      "skills": [
+        "./skills/figma-prd-designer"
+      ]
     }
   ]
 }
