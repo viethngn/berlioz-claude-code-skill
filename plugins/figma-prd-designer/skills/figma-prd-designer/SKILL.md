@@ -15,7 +15,10 @@ description: >-
   designs", "build the UI for this feature in Figma", "take the PRD and make the
   mockups", "I need wireframes or mockups for this feature", "create a design file
   for this PRD", "push these requirements to Figma", "design the screens from this
-  spec", "make a Figma file from this Confluence link".
+  spec", "make a Figma file from this Confluence link", "design from these
+  wireframes", "I have wireframe images and want to build in Figma", "here's a
+  PDF of the wireframes, create the Figma designs", "use these mockup images as
+  the design spec", "build Figma screens from these screenshots".
 disable-model-invocation: false
 ---
 
@@ -30,19 +33,24 @@ to serve future screens, not just the current feature.
 ## Prerequisites
 
 - **Figma MCP** — `plugin-figma-figma` server must be connected
-- **Confluence MCP** — `mcp__MCP_DOCKER__confluence_get_page` must be available
-  (same Docker MCP used by the `release-note-writer` skill)
+- **Confluence MCP** — required only when a Confluence URL is provided
+  (`mcp__MCP_DOCKER__confluence_get_page`, same Docker MCP as `release-note-writer`)
 - **figma-use skill** — load before every `use_figma` call (critical API rules)
 - **figma-generate-design skill** — load before Phase 5 screen building
 - **figma-generate-library skill** — load before Phase 4 component creation or modification
 
 ## Required Inputs
 
-Ask for these upfront if not provided:
+Ask for these upfront if not provided. At least one PRD source is required.
 
-| Input | Format example |
-|-------|----------------|
-| Confluence PRD URL | `https://.../confluence/.../pages/{PAGE_ID}/Feature-Name` |
+| PRD Source — pick one or combine | Format |
+|----------------------------------|--------|
+| Confluence URL | `https://.../confluence/.../pages/{PAGE_ID}/Feature-Name` |
+| Wireframe images | Local file paths — `~/wireframes/login.png`, `~/wireframes/dashboard.png` |
+| Wireframe PDF | Local file path — `~/Documents/feature-wireframes.pdf` |
+
+| Always required | Format |
+|-----------------|--------|
 | Figma target file URL | `https://figma.com/design/{fileKey}/FileName?node-id=...` |
 
 If the user doesn't have a Figma file yet, load `figma-create-new-file` skill and
@@ -57,8 +65,13 @@ Use a timestamp run ID: `fprd-YYYYMMDD-HHMMSS`.
 ```json
 {
   "runId": "fprd-20260614-120000",
-  "confluencePageId": "12345678",
   "figmaFileKey": "FILEKEY",
+  "prdSource": {
+    "type": "mixed",
+    "confluencePageId": "12345678",
+    "imagePaths": ["~/wireframes/dashboard.png", "~/wireframes/detail.png"],
+    "pdfPath": null
+  },
   "phase": "phase1",
   "screens": [
     {
@@ -89,24 +102,31 @@ Use a timestamp run ID: `fprd-YYYYMMDD-HHMMSS`.
 
 ## Phase 0 — Setup
 
-1. Extract Confluence page ID from the URL (numeric segment after `/pages/`)
-2. Extract Figma `fileKey` from the URL (`figma.com/design/{fileKey}/...`)
-3. Initialize the state file with both IDs and `phase: "phase0"`
+1. Extract Figma `fileKey` from the URL (`figma.com/design/{fileKey}/...`)
+2. Detect the PRD source mode from what the user provided:
+   - **CONFLUENCE** — Confluence URL given → `prdSource.type = "confluence"`, extract page ID
+   - **IMAGES** — image file paths given (.png/.jpg/.jpeg/.webp/.gif) → `prdSource.type = "images"`, list paths
+   - **PDF** — PDF path given → `prdSource.type = "pdf"`, note path
+   - **MIXED** — multiple source types given → `prdSource.type = "mixed"`, capture all
+3. Initialize the state file with `figmaFileKey`, `prdSource`, and `phase: "phase0"`
 4. Confirm inputs with the user before proceeding
 
 ---
 
 ## Phase 1 — PRD Parsing
 
-Load [references/prd-parsing.md](references/prd-parsing.md) for the full extraction process.
+Load [references/prd-parsing.md](references/prd-parsing.md) and follow the section
+matching `prdSource.type` from the state file:
 
-**Steps:**
-1. Call `mcp__MCP_DOCKER__confluence_get_page` with `{ page_id: "{ID}" }`
-2. Extract: feature title, problem statement, user stories, UX flows, screen references,
-   component hints (field lists, UI element tables, wireframe descriptions)
-3. Derive an ordered screen list — each screen has: name, purpose, major sections,
-   inferred component types needed
-4. Save to state file under `screens[]`
+| `prdSource.type` | Section to follow |
+|-----------------|-------------------|
+| `"confluence"` | Input Mode: Confluence URL |
+| `"images"` | Input Mode: Wireframe Images |
+| `"pdf"` | Input Mode: Wireframe PDF |
+| `"mixed"` | Input Mode: Mixed Sources |
+
+All modes produce the same output: an ordered `screens[]` list saved to the state file,
+where each entry has `name`, `purpose`, `sections[]`, and `componentsNeeded[]`.
 
 **User checkpoint:**
 
