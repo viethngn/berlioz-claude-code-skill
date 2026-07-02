@@ -1,0 +1,25 @@
+# Secrets — never commit
+.wikirc.json
+
+# Volatile per-machine state written by /ingest (last-fetched timestamps etc)
+.wiki-state/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Transient
+*.tmp
+*.bak
+/tmp/

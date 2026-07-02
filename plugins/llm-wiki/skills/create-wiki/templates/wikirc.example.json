@@ -1,0 +1,19 @@
+{
+  "wiki_root": ".",
+  "raw_dir": "raw",
+  "wiki_dir": "wiki",
+  "auto_commit": true,
+  "atlassian": {
+    "confluence_base_url": "https://your-confluence.example.com",
+    "jira_base_url": "https://your-jira.example.com",
+    "confluence_pat": "REPLACE_ME_OR_LEAVE_EMPTY",
+    "jira_pat": "REPLACE_ME_OR_LEAVE_EMPTY",
+    "verify_ssl": true
+  },
+  "nano_banana": {
+    "base_url": "https://your-nano-banana-endpoint.example.com/v1/",
+    "api_key": "REPLACE_ME",
+    "vision_model": "gemini-3-pro",
+    "verify_ssl": true
+  }
+}

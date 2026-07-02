@@ -1,0 +1,5 @@
+{
+  "marketplaces": [
+    { "source": "{{ marketplace_path }}" }
+  ]
+}
