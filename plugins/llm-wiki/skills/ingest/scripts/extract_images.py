@@ -45,6 +45,7 @@ import requests
 
 from config import ConfigError, apply_ssl_env, load_config
 from image_manifest import load_manifest
+from rate_limiter import RateLimitFailure, get_limiter
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
@@ -76,8 +77,14 @@ def _headers_for(url: str, cfg) -> dict:
     return {}
 
 
-def download_to_memory(url: str, headers: dict, verify: bool) -> Optional[bytes]:
-    resp = requests.get(url, headers=headers, verify=verify, timeout=60)
+def download_to_memory(url: str, headers: dict, verify: bool, limiter=None) -> Optional[bytes]:
+    if limiter is None:
+        limiter = get_limiter("atlassian", None)
+    try:
+        resp = limiter.request("GET", url, headers=headers, verify=verify, timeout=60)
+    except RateLimitFailure as e:
+        print(f"WARN: could not download {url} — {e}", file=sys.stderr)
+        return None
     if resp.status_code != 200:
         print(
             f"WARN: could not download {url} — HTTP {resp.status_code}",
@@ -149,6 +156,7 @@ def main() -> int:
 
     apply_ssl_env("atlassian", cfg.atlassian_verify_ssl())
     verify = cfg.atlassian_verify_ssl()
+    limiter = get_limiter("atlassian", cfg.atlassian)
 
     counts = {"downloaded_new": 0, "overwritten": 0, "skipped_unchanged": 0, "skipped_alias": 0, "failed": 0}
     results: list[dict] = []
@@ -162,7 +170,7 @@ def main() -> int:
         ext = choose_extension(url, filename_hint)
 
         headers = _headers_for(url, cfg)
-        payload = download_to_memory(url, headers, verify)
+        payload = download_to_memory(url, headers, verify, limiter=limiter)
         if payload is None:
             counts["failed"] += 1
             results.append({"url": url, "status": "failed"})

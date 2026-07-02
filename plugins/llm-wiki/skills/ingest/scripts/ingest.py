@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""Orchestrate a single ingest: detect source, fetch, extract images,
-describe changed images via nano-banana-pro, then git-commit.
+"""Orchestrate an ingest — single item OR bulk (Confluence space / CQL / JQL).
 
-Usage:
-    python3 ingest.py --wiki-root /path/to/wiki --source <URL-or-key-or-path>
-    python3 ingest.py --wiki-root /path/to/wiki --source ... --no-commit
-    python3 ingest.py --wiki-root /path/to/wiki --commit-only --slug SLUG --new-images N --changed-images M
+Single-item usage:
+    python3 ingest.py --wiki-root PATH --source <URL-or-key-or-path>
+    python3 ingest.py --wiki-root PATH --source ... --no-commit --force
 
-Prints a JSON summary to stdout. Uses only stdlib for the orchestration
-itself — dispatches to fetch_*/describe_image/extract_images scripts via
-subprocess so their dependency checks fire independently.
+Bulk usage:
+    python3 ingest.py --wiki-root PATH --space FOO
+    python3 ingest.py --wiki-root PATH --cql "space=FOO AND label=onboarding"
+    python3 ingest.py --wiki-root PATH --jql "project=PROJ AND updated > -30d"
+    python3 ingest.py --wiki-root PATH --resume <job-id>
+
+Auto-detection: `--source` alone will pick single vs bulk based on URL
+shape. `.../pages/N` or `.../browse/KEY` → single; `.../spaces/KEY` without
+a page → bulk Confluence space.
+
+Prints a JSON summary to stdout. Bulk mode also produces per-item JSON
+lines during the prefetch phase.
 """
 
 from __future__ import annotations
@@ -20,21 +27,58 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urlparse
+from typing import Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 # The orchestrator is stdlib-only so it doesn't need require([...]).
-# config and raw_store are stdlib-only too and never trigger _deps.
+# config, raw_store, and bulk_queue are stdlib-only too.
 from config import ConfigError, load_config
 from raw_store import write_fetch_history
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
+CONFLUENCE_SPACE_URL_RE = re.compile(r"/spaces/([A-Za-z0-9._~-]+)(?:/|$)")
+
+
+def detect_bulk_from_url(source: str) -> Optional[Tuple[str, str]]:
+    """If the URL clearly points at a whole Confluence space, return
+    ('confluence_space', spaceKey). Otherwise return None.
+
+    URLs with `/pages/N` or `pageId=` are always single — this function
+    returns None for them.
+    """
+    parsed = urlparse(source)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    path = parsed.path or ""
+    query = parsed.query or ""
+
+    if re.search(r"/pages/\d+", path) or "pageId=" in query:
+        return None
+
+    m = CONFLUENCE_SPACE_URL_RE.search(path)
+    if m:
+        return "confluence_space", m.group(1)
+
+    # /display/KEY without additional path or with only "?spaceKey=" query.
+    display_match = re.search(r"/display/([A-Za-z0-9._~-]+)/?$", path)
+    if display_match:
+        return "confluence_space", display_match.group(1)
+
+    qs = parse_qs(query)
+    if "spaceKey" in qs and not qs.get("pageId"):
+        return "confluence_space", qs["spaceKey"][0]
+
+    return None
 
 
 def detect_source_type(source: str, wiki_root: Path) -> str:
-    """Return 'confluence' | 'jira' | 'local'."""
+    """Return 'confluence' | 'jira' | 'local' for a single-item source.
+
+    Callers should first check `detect_bulk_from_url` and any explicit bulk
+    flags; this function assumes the source is single-item.
+    """
     if JIRA_KEY_RE.match(source):
         return "jira"
 
@@ -246,6 +290,154 @@ def do_image_diff_loop(
     return {**counts, "images": per_image}
 
 
+def _stream_prefetch(job_id: str, wiki_root: Path, retry_failed: bool, max_items: int, skip_images: bool) -> int:
+    """Run prefetch.py as a subprocess and stream its output line-by-line.
+
+    Returns the child's exit code.
+    """
+    cmd = [
+        sys.executable,
+        str(SCRIPT_DIR / "prefetch.py"),
+        "--wiki-root",
+        str(wiki_root),
+        "--job-id",
+        job_id,
+    ]
+    if retry_failed:
+        cmd.append("--retry-failed")
+    if max_items > 0:
+        cmd.extend(["--max-items", str(max_items)])
+    if skip_images:
+        cmd.append("--skip-images")
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
+    )
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        proc.wait()
+        raise
+    if proc.stderr is not None:
+        err = proc.stderr.read()
+        if err:
+            sys.stderr.write(err)
+    return rc
+
+
+def _cmd_bulk(
+    args: argparse.Namespace,
+    kind: Optional[str],
+    query: Optional[str],
+    resume_job_id: Optional[str],
+) -> int:
+    """Dispatch to discover.py + prefetch.py.
+
+    Either (kind, query) is set (for new/reused jobs), or resume_job_id is
+    set (skip discovery, just resume prefetch).
+    """
+    wiki_root = args.wiki_root.resolve()
+    try:
+        cfg = load_config(wiki_root)
+    except ConfigError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+    job_id: Optional[str] = resume_job_id
+
+    if job_id is None:
+        assert kind is not None and query is not None
+        # Run discover.py
+        discover_args = ["--wiki-root", str(cfg.wiki_root)]
+        if kind == "confluence_space":
+            discover_args += ["--space", query]
+        elif kind == "confluence_cql":
+            discover_args += ["--cql", query]
+        elif kind == "jira_jql":
+            discover_args += ["--jql", query]
+        else:
+            raise SystemExit(f"ERROR: unknown bulk kind: {kind}")
+        if args.replace:
+            discover_args.append("--replace")
+        if args.limit:
+            discover_args += ["--limit", str(args.limit)]
+
+        result = run_script("discover.py", discover_args)
+        job_id = result.get("job_id")
+        if not job_id:
+            # Nothing discovered (empty result). Emit and exit gracefully.
+            print(json.dumps({"mode": "bulk", "discover": result}, indent=2, ensure_ascii=False))
+            return 0
+        counts = result.get("counts") or {}
+        print(
+            json.dumps(
+                {
+                    "mode": "bulk",
+                    "phase": "discover",
+                    "job_id": job_id,
+                    "kind": result.get("kind"),
+                    "query": result.get("query"),
+                    "counts": counts,
+                    "reused": result.get("reused", False),
+                    "replaced": result.get("replaced", False),
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+
+    if args.discover_only:
+        return 0
+
+    # Prefetch phase — stream so Claude/user can watch progress
+    print(
+        json.dumps({"mode": "bulk", "phase": "prefetch", "job_id": job_id}, ensure_ascii=False),
+        flush=True,
+    )
+    rc = _stream_prefetch(
+        job_id=job_id,
+        wiki_root=cfg.wiki_root,
+        retry_failed=bool(resume_job_id) or args.retry_failed,
+        max_items=args.max_items,
+        skip_images=args.skip_images,
+    )
+
+    # After prefetch, report queue counts to guide Claude's synthesis loop
+    try:
+        from bulk_queue import load_queue  # local stdlib import
+        q = load_queue(cfg.wiki_root, job_id)
+        counts = q.counts()
+    except Exception:  # noqa: BLE001
+        counts = {}
+    print(
+        json.dumps(
+            {
+                "mode": "bulk",
+                "phase": "prefetch-complete",
+                "job_id": job_id,
+                "prefetch_exit_code": rc,
+                "counts": counts,
+                "next_step": (
+                    "Claude: iterate items with raw_status in {done,unchanged} and "
+                    "wiki_status=pending. Read raw/<slug>.md, synthesize wiki pages, "
+                    "then run queue_admin.py mark <job-id> --ref <ref> --wiki-done. Commit "
+                    "every --batch items."
+                ),
+                "batch_size": args.batch,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    return rc
+
+
 def _cmd_commit_only(args: argparse.Namespace) -> int:
     wiki_root = args.wiki_root.resolve()
     if not is_git_repo(wiki_root):
@@ -353,15 +545,65 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Ingest a source into an LLM wiki")
+    parser = argparse.ArgumentParser(description="Ingest one source (single or bulk) into an LLM wiki")
     parser.add_argument("--wiki-root", type=Path, required=True)
-    parser.add_argument("--source", help="URL, Jira key, or local file path")
-    parser.add_argument("--no-commit", action="store_true", help="Skip the final git commit")
+
+    # Single-item source (URL / Jira key / local file path)
+    parser.add_argument("--source", help="URL, Jira key, or local file path (single item)")
+
+    # Bulk source flags — mutually exclusive with each other and with --source
+    parser.add_argument("--space", help="Bulk: Confluence space key")
+    parser.add_argument("--cql", help="Bulk: Confluence CQL query")
+    parser.add_argument("--jql", help="Bulk: Jira JQL query")
+    parser.add_argument("--resume", help="Bulk: resume an existing job by id")
+
+    # Bulk knobs
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Bulk discovery: overwrite an existing job for the same (kind, query)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Bulk discovery: cap the number of items enumerated (0 = no cap)",
+    )
+    parser.add_argument(
+        "--discover-only",
+        action="store_true",
+        help="Bulk: only run discovery, do not prefetch",
+    )
+    parser.add_argument(
+        "--max-items",
+        type=int,
+        default=0,
+        help="Bulk prefetch: process at most N items in this run (0 = no cap)",
+    )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Bulk prefetch: also retry items previously marked failed (implicit with --resume)",
+    )
+    parser.add_argument(
+        "--skip-images",
+        action="store_true",
+        help="Bulk prefetch: skip nano-banana-pro description (still downloads image bytes)",
+    )
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=5,
+        help="Bulk synthesis: how many items Claude should synthesize per batch before commit + user checkpoint",
+    )
+
+    # Single-item flags
+    parser.add_argument("--no-commit", action="store_true", help="Single: skip the final git commit")
     parser.add_argument(
         "--force",
         action="store_true",
         help=(
-            "Bypass content-diff gates: re-download images, re-describe them, "
+            "Single: bypass content-diff gates: re-download images, re-describe them, "
             "and commit even if the source content is unchanged"
         ),
     )
@@ -379,8 +621,38 @@ def main() -> int:
             parser.error("--slug is required with --commit-only")
         return _cmd_commit_only(args)
 
+    bulk_flags = [
+        ("confluence_space", args.space),
+        ("confluence_cql", args.cql),
+        ("jira_jql", args.jql),
+    ]
+    active_bulk = [(k, v) for k, v in bulk_flags if v]
+
+    if args.resume:
+        if active_bulk or args.source:
+            parser.error("--resume cannot be combined with --source or --space/--cql/--jql")
+        return _cmd_bulk(args, kind=None, query=None, resume_job_id=args.resume)
+
+    if len(active_bulk) > 1:
+        parser.error("Provide at most one of --space, --cql, --jql")
+
+    if active_bulk:
+        if args.source:
+            parser.error("--source cannot be combined with --space/--cql/--jql")
+        kind, query = active_bulk[0]
+        return _cmd_bulk(args, kind=kind, query=query, resume_job_id=None)
+
     if not args.source:
-        parser.error("--source is required (or use --commit-only)")
+        parser.error(
+            "provide --source (single) or --space / --cql / --jql / --resume (bulk), "
+            "or use --commit-only"
+        )
+
+    # Auto-detect: is --source actually a bulk source URL?
+    bulk_from_url = detect_bulk_from_url(args.source)
+    if bulk_from_url is not None:
+        kind, query = bulk_from_url
+        return _cmd_bulk(args, kind=kind, query=query, resume_job_id=None)
 
     return _cmd_ingest(args)
 

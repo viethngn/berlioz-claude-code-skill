@@ -8,12 +8,20 @@
     "jira_base_url": "https://your-jira.example.com",
     "confluence_pat": "REPLACE_ME_OR_LEAVE_EMPTY",
     "jira_pat": "REPLACE_ME_OR_LEAVE_EMPTY",
-    "verify_ssl": true
+    "verify_ssl": true,
+    "rate_limit_rps": 2,
+    "burst": 5,
+    "max_retries": 5,
+    "retry_base_delay_seconds": 2
   },
   "nano_banana": {
     "base_url": "https://your-nano-banana-endpoint.example.com/v1/",
     "api_key": "REPLACE_ME",
     "vision_model": "gemini-3-pro",
-    "verify_ssl": true
+    "verify_ssl": true,
+    "rate_limit_rps": 1,
+    "burst": 2,
+    "max_retries": 3,
+    "retry_base_delay_seconds": 2
   }
 }

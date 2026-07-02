@@ -31,6 +31,7 @@ import requests
 from markdownify import markdownify
 
 from config import ConfigError, apply_ssl_env, load_config
+from rate_limiter import RateLimitFailure, get_limiter
 from raw_store import write_raw_if_changed
 
 
@@ -60,11 +61,18 @@ def extract_issue_key(url_or_key: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def fetch_issue(base_url: str, pat: str, key: str, verify: bool) -> dict:
+def fetch_issue(base_url: str, pat: str, key: str, verify: bool, limiter=None) -> dict:
     url = f"{base_url}/rest/api/2/issue/{key}"
     params = {"expand": "renderedFields"}
     headers = {"Authorization": f"Bearer {pat}", "Accept": "application/json"}
-    resp = requests.get(url, headers=headers, params=params, verify=verify, timeout=60)
+    if limiter is None:
+        limiter = get_limiter("atlassian", None)
+    try:
+        resp = limiter.request(
+            "GET", url, headers=headers, params=params, verify=verify, timeout=60
+        )
+    except RateLimitFailure as e:
+        raise SystemExit(f"ERROR: {e}")
     if resp.status_code == 401:
         raise SystemExit(
             "ERROR: 401 Unauthorized. Check atlassian.jira_pat in .wikirc.json."
@@ -234,7 +242,8 @@ def main() -> int:
         return 1
 
     verify = cfg.atlassian_verify_ssl()
-    issue = fetch_issue(base_url, pat, key, verify)
+    limiter = get_limiter("atlassian", cfg.atlassian)
+    issue = fetch_issue(base_url, pat, key, verify, limiter=limiter)
 
     title, filename_slug, markdown = build_markdown(issue)
     hints = attachment_hints(issue)

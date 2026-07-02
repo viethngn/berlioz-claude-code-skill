@@ -37,6 +37,7 @@ from google.genai import types
 from PIL import Image
 
 from config import ConfigError, apply_ssl_env, load_config
+from rate_limiter import get_limiter
 
 
 DEFAULT_PROMPT = """You are describing an image so it can be indexed in a knowledge wiki.
@@ -64,6 +65,7 @@ def describe(
     model_id: str,
     verify: bool,
     prompt: str,
+    limiter=None,
 ) -> str:
     if not base_url:
         raise SystemExit("ERROR: nano_banana.base_url is empty in .wikirc.json.")
@@ -89,6 +91,9 @@ def describe(
         raise SystemExit(f"ERROR: cannot open image {image_path}: {e}")
 
     contents = [img, prompt]
+
+    if limiter is not None:
+        limiter.throttle()
 
     config = types.GenerateContentConfig(response_modalities=["TEXT"])
     try:
@@ -150,6 +155,7 @@ def main() -> int:
         model_id=cfg.nano_banana_model(),
         verify=cfg.nano_banana_verify_ssl(),
         prompt=args.prompt or DEFAULT_PROMPT,
+        limiter=get_limiter("nano_banana", cfg.nano_banana),
     )
 
     output = args.output.expanduser().resolve()

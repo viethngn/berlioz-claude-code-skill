@@ -33,6 +33,7 @@ from bs4 import BeautifulSoup
 from markdownify import markdownify
 
 from config import ConfigError, apply_ssl_env, load_config
+from rate_limiter import RateLimitFailure, get_limiter
 from raw_store import write_raw_if_changed
 
 
@@ -65,11 +66,18 @@ def extract_page_id(url_or_id: str) -> Optional[str]:
     return None
 
 
-def fetch_page(base_url: str, pat: str, page_id: str, verify: bool) -> dict:
+def fetch_page(base_url: str, pat: str, page_id: str, verify: bool, limiter=None) -> dict:
     url = f"{base_url}/rest/api/content/{page_id}"
     params = {"expand": "body.storage,version,space,ancestors"}
     headers = {"Authorization": f"Bearer {pat}", "Accept": "application/json"}
-    resp = requests.get(url, headers=headers, params=params, verify=verify, timeout=60)
+    if limiter is None:
+        limiter = get_limiter("atlassian", None)
+    try:
+        resp = limiter.request(
+            "GET", url, headers=headers, params=params, verify=verify, timeout=60
+        )
+    except RateLimitFailure as e:
+        raise SystemExit(f"ERROR: {e}")
     if resp.status_code == 401:
         raise SystemExit(
             "ERROR: 401 Unauthorized. Check atlassian.confluence_pat in .wikirc.json."
@@ -181,7 +189,8 @@ def main() -> int:
         return 1
 
     verify = cfg.atlassian_verify_ssl()
-    page = fetch_page(base_url, pat, page_id, verify)
+    limiter = get_limiter("atlassian", cfg.atlassian)
+    page = fetch_page(base_url, pat, page_id, verify, limiter=limiter)
 
     title = page.get("title") or f"Confluence Page {page_id}"
     body_html = (page.get("body", {}).get("storage") or {}).get("value", "") or ""

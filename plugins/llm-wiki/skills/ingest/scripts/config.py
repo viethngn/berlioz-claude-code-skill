@@ -31,12 +31,20 @@ DEFAULT_CONFIG = {
         "confluence_pat": "",
         "jira_pat": "",
         "verify_ssl": True,
+        "rate_limit_rps": 2,
+        "burst": 5,
+        "max_retries": 5,
+        "retry_base_delay_seconds": 2,
     },
     "nano_banana": {
         "base_url": "",
         "api_key": "",
         "vision_model": "gemini-3-pro",
         "verify_ssl": True,
+        "rate_limit_rps": 1,
+        "burst": 2,
+        "max_retries": 3,
+        "retry_base_delay_seconds": 2,
     },
 }
 

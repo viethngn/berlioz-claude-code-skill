@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.0 - 2026-07-03
+
+### llm-wiki
+
+- `ingest` now handles both single-item and bulk ingest in one skill/one slash command; auto-detects from the source shape or explicit flags
+  - New sources: `--space <KEY>` (Confluence space), `--cql "..."` (Confluence CQL), `--jql "..."` (Jira JQL), `--resume <job-id>` (continue a prior bulk job)
+  - URLs like `.../spaces/<KEY>` (no `/pages/…`) and `.../display/<KEY>` (no page name) auto-route to bulk Confluence space mode
+  - `.../pages/<N>`, `.../browse/<KEY>`, bare Jira keys, and existing file paths continue to auto-detect as single-item
+  - The single-item workflow is unchanged; existing invocations behave the same
+- Resumable job queues under `.wiki-state/bulk-jobs/<job-id>/queue.json` (git-ignored)
+  - `discover.py` paginates the space/query and writes the queue; reuses an existing queue for the same (kind, query) unless `--replace` is passed
+  - `prefetch.py` iterates pending items via subprocess into the existing single-item fetchers so all four diff gates fire per page; checkpoints after every item; circuit-breaks after 5 consecutive failures
+  - `queue_admin.py list|show|reset|mark|delete` for inspecting jobs and re-queueing failures (named `queue_admin.py` rather than `queue.py` so it doesn't shadow the stdlib `queue` module for other scripts in the same directory)
+  - Ctrl-C during prefetch is safe; `/ingest --resume <job-id>` continues where it left off and retries any items marked `failed`
+- Rate limiting: shared `rate_limiter.py` token bucket + `Retry-After` + exponential backoff wraps every Atlassian and nano-banana HTTP call, keyed by API section
+  - Config: `.wikirc.json` gains `atlassian.rate_limit_rps` / `.burst` / `.max_retries` / `.retry_base_delay_seconds` and the same keys under `nano_banana`
+  - Defaults: Atlassian 2 rps / burst 5, nano-banana 1 rps / burst 2 — conservative enough for a first-time whole-space run
+  - Single-item `/ingest` also honors these limits so multiple concurrent chats can't collectively blow the budget
+
 ## 1.1.0 - 2026-07-02
 
 ### llm-wiki

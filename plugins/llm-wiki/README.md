@@ -3,10 +3,14 @@
 Three skills for maintaining a personal LLM knowledge wiki, backed by git.
 
 - **`/ingest`** — Pull content from a Confluence page, Jira issue, or local file
-  (Markdown, HTML, PDF, DOCX, image). Extract embedded images, describe them via
-  a nano-banana-pro-compatible endpoint **only when they change**, and update the
-  wiki. Commits raw + wiki to git at the end of every run so the next ingest
-  can diff against the last committed state.
+  (Markdown, HTML, PDF, DOCX, image), **or** bulk-ingest a whole Confluence
+  space / Confluence CQL query / Jira JQL query. The skill auto-detects single
+  vs bulk from the source shape or an explicit `--space` / `--cql` / `--jql` /
+  `--resume` flag. Extracts embedded images, describes them via a
+  nano-banana-pro-compatible endpoint **only when they change**, and updates
+  the wiki. Bulk mode uses a resumable job queue with rate limiting and a
+  circuit breaker so a whole-space run can be paused and resumed. Commits raw
+  + wiki to git so the next ingest can diff against the last committed state.
 - **`/lint`** — Audit the wiki for knowledge gaps, contradictions, orphaned
   pages, broken `[[wiki-links]]`, format violations, and stale facts. Emits a
   numbered report with suggested fixes and applies them with your approval.
@@ -79,16 +83,30 @@ Personal Access Tokens.
     "jira_base_url": "https://your-jira.example.com",
     "confluence_pat": "YOUR_CONFLUENCE_TOKEN_OR_EMPTY",
     "jira_pat": "YOUR_JIRA_TOKEN_OR_EMPTY",
-    "verify_ssl": true
+    "verify_ssl": true,
+    "rate_limit_rps": 2,
+    "burst": 5,
+    "max_retries": 5,
+    "retry_base_delay_seconds": 2
   },
   "nano_banana": {
     "base_url": "https://your-nano-banana-endpoint.example.com/v1/",
     "api_key": "YOUR_NANO_BANANA_API_KEY",
     "vision_model": "gemini-3-pro",
-    "verify_ssl": true
+    "verify_ssl": true,
+    "rate_limit_rps": 1,
+    "burst": 2,
+    "max_retries": 3,
+    "retry_base_delay_seconds": 2
   }
 }
 ```
+
+Rate-limit knobs are optional. Defaults are conservative (2 rps for
+Atlassian, 1 rps for nano-banana) so a first-time bulk run won't get
+anyone rate-banned. Every HTTP call flows through `rate_limiter.py`, which
+respects `Retry-After` on 429/503 and falls back to exponential backoff
+with jitter.
 
 `.wikirc.json` is git-ignored by default. Only `.wikirc.example.json` is
 committed.
@@ -110,6 +128,34 @@ committed.
 > /ingest ~/Documents/spec.pdf
 >
 > /ingest ~/Downloads/notes.docx
+
+### Bulk-ingest a whole Confluence space
+
+> /ingest --space FOO
+>
+> Or paste the space URL (auto-detected):
+> /ingest https://your-confluence.example.com/spaces/FOO
+
+Discovery paginates the space, prefetch downloads every page (rate-limited
+and resumable), and then Claude synthesizes wiki pages in batches — pausing
+for your OK between batches.
+
+### Bulk-ingest a filtered slice
+
+> /ingest --cql "space=FOO AND label=onboarding AND lastModified > now(-30d)"
+>
+> /ingest --jql "project=PROJ AND updated > -30d AND labels = 'runbook'"
+
+Use CQL/JQL to scope down big spaces before running a full bulk ingest.
+
+### Resume a bulk job
+
+If prefetch got interrupted (Ctrl-C, rate-limit circuit breaker,
+disconnect), continue where it left off:
+
+> /ingest --resume conf-space-foo-20260703-005211
+
+`queue_admin.py list` prints every known job id and its counts.
 
 ### Lint the wiki
 
@@ -154,6 +200,39 @@ committed.
 
 Pass `--force` to `ingest.py` to bypass gates 1 and 2 for a full refresh.
 
+**Bulk mode** (Confluence space / CQL / JQL / `--resume`) reuses the same
+per-item flow but routes it through three phases:
+
+1. **Discovery** — [`discover.py`](skills/ingest/scripts/discover.py)
+   paginates the space/query with the Atlassian rate limiter and writes
+   `.wiki-state/bulk-jobs/<job-id>/queue.json`. If a queue for the same
+   `(kind, query)` already exists, it's reused; pass `--replace` to
+   overwrite.
+2. **Prefetch** — [`prefetch.py`](skills/ingest/scripts/prefetch.py)
+   iterates pending items, invoking the single-item fetchers via
+   subprocess so the diff gates fire per page. Every item is checkpointed
+   to `queue.json`, so Ctrl-C is always safe. A circuit breaker aborts
+   the run after 5 consecutive item failures.
+3. **Synthesis** — Claude reads items with
+   `raw_status in {done, unchanged}` and `wiki_status == pending`, writes
+   wiki pages in batches (default 5), commits per batch, and asks the
+   user whether to continue.
+
+Inspect and re-queue with
+[`queue_admin.py`](skills/ingest/scripts/queue_admin.py):
+
+```bash
+python3 .../queue_admin.py --wiki-root <path> list
+python3 .../queue_admin.py --wiki-root <path> show <job-id>
+python3 .../queue_admin.py --wiki-root <path> reset <job-id> --status failed
+python3 .../queue_admin.py --wiki-root <path> mark <job-id> --ref <ref> --wiki-done
+```
+
+The script is named `queue_admin.py` rather than `queue.py` because
+scripts under this directory get added to `sys.path[0]` at runtime, so a
+top-level `queue.py` would shadow the stdlib `queue` module (which
+`urllib3` imports).
+
 ### `/lint`
 
 Runs [lint.py](skills/lint/scripts/lint.py) to build a JSON report of orphaned
@@ -177,7 +256,9 @@ my-wiki/
 ├── .claude/settings.json     # pins the marketplace so /ingest and /lint auto-discover
 ├── .gitignore                # ignores .wikirc.json, .wiki-state/, tmp files
 ├── .wiki-state/              # git-ignored; volatile per-machine state
-│   └── last-fetched.json     # last-fetch timestamp + status per slug
+│   ├── last-fetched.json     # last-fetch timestamp + status per slug (single mode)
+│   └── bulk-jobs/            # one directory per bulk-ingest job
+│       └── <job-id>/queue.json  # discovery output + per-item status
 ├── .wikirc.json              # your endpoints + PATs (git-ignored)
 ├── .wikirc.example.json      # example config, committed
 ├── CLAUDE.md                 # wiki system prompt
