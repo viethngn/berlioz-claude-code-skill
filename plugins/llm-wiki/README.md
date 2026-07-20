@@ -10,9 +10,12 @@ Three skills for maintaining a personal LLM knowledge wiki, backed by git.
   vision endpoint **only when they change**, and updates the wiki. Bulk mode
   uses a resumable job queue with rate limiting and a circuit breaker. Commits
   raw + wiki to git and optionally pushes to remote.
-- **`/lint`** — Audit the wiki for knowledge gaps, contradictions, orphaned
-  pages, broken `[[wiki-links]]`, format violations, and stale facts. Emits a
-  numbered report with suggested fixes and applies them with your approval.
+- **`/lint`** — Thoroughly clean the wiki. Auto-removes empty/orphaned pages,
+  fixes broken `[[wiki-links]]` and format violations, and archives outdated
+  knowledge with a status banner (never touching `raw/`) so reads always surface
+  the latest info. Contradictions and outdated facts are batched into one report
+  you confirm before applying. Updates `index.md`, appends a `log.md` entry, then
+  commits (grouped by category) and pushes.
 - **`/create-wiki`** — Bootstrap a fresh LLM wiki: folder layout, `CLAUDE.md`
   system prompt, page template, git repo, `.wikirc.json` config, and marketplace
   pinning so `/ingest` and `/lint` are auto-discovered on next session.
@@ -179,8 +182,8 @@ private channels you have access to.
 > /ingest https://your-confluence.example.com/spaces/FOO
 
 Discovery paginates the space, prefetch downloads every page (rate-limited
-and resumable), and then Claude synthesizes wiki pages in batches — pausing
-for your OK between batches.
+and resumable), and then Claude synthesizes wiki pages automatically —
+committing and pushing one commit per item, with no pauses.
 
 ### Bulk-ingest a filtered slice
 
@@ -244,12 +247,15 @@ before new messages arrive returns "unchanged" — nothing is committed.
 5. For images that end up genuinely new or changed, call the nano-banana-pro
    vision endpoint to produce a text description at `raw/images/<slug>/<n>.md`.
    Unchanged images reuse the existing description.
-6. Discuss key takeaways with you.
+6. Print key takeaways for your awareness (non-blocking — no pause).
 7. Create or update pages in `wiki/` following your `CLAUDE.md` rules
    (page format, `[[wiki-links]]`, citations, `wiki/index.md`, `wiki/log.md`).
-8. `git add raw/ wiki/ && git commit -m "ingest: <slug> (N new, M changed images)"`
-   when `auto_commit=true` — the commit is skipped automatically if nothing
-   staged actually differs.
+8. Commit raw + wiki together in a single commit via
+   `ingest.py --commit-only --slug <slug>` (message
+   `ingest: <slug> (N new, M changed images)`), then push when
+   `auto_push=true`. The commit is skipped automatically if nothing staged
+   actually differs. The whole flow — fetch → synthesize → commit → push —
+   runs end-to-end without waiting for confirmation.
 
 **Diff-gate summary:**
 
@@ -277,8 +283,8 @@ per-item flow but routes it through three phases:
    the run after 5 consecutive item failures.
 3. **Synthesis** — Claude reads items with
    `raw_status in {done, unchanged}` and `wiki_status == pending`, writes
-   wiki pages in batches (default 5), commits per batch, and asks the
-   user whether to continue.
+   wiki pages, and commits + pushes one commit per item via
+   `ingest.py --commit-only` automatically — no per-batch pause.
 
 Inspect and re-queue with
 [`queue_admin.py`](skills/ingest/scripts/queue_admin.py):
@@ -298,10 +304,25 @@ top-level `queue.py` would shadow the stdlib `queue` module (which
 ### `/lint`
 
 Runs [lint.py](skills/lint/scripts/lint.py) to build a JSON report of orphaned
-pages, broken links, missing concept pages, format violations, and stale
-pages. Then Claude reads the flagged pages, cross-checks for contradictions,
-compares against `raw/` sources for outdated facts, presents a numbered list of
-findings with suggested fixes, and applies them with your approval.
+pages, broken links, missing concept pages, format violations, empty/stub
+pages, stale pages, unsourced claims, `Status`-tagged pages, and `Sources`
+paths that no longer exist in `raw/`. Then Claude:
+
+1. **Auto-cleans structure** (no approval): deletes empty pages, fixes broken
+   links, links or archives orphans, repairs format violations.
+2. **Verifies conflicts with you**: contradictions and outdated facts are
+   gathered into a single report; you approve the resolutions before they apply.
+3. **Archives, never deletes, retired knowledge**: outdated pages get a
+   `**Status**: Superseded by [[...]]` (or `Archived`) field plus a top-of-page
+   banner, so `raw/` stays immutable and every read is routed to the current
+   page. Archived pages are excluded from future orphan/stale checks and tagged
+   in `index.md`.
+4. **Maintains logs**: appends a `## <date> (lint)` entry to `wiki/log.md` and
+   updates `index.md`.
+5. **Commits + pushes**: one commit per category, then `ingest.py --push-only`
+   pushes them all (gated on `auto_push`).
+
+`raw/` is never modified by lint.
 
 ### `/create-wiki`
 

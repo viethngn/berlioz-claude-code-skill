@@ -1,167 +1,218 @@
 ---
 name: lint
 description: |
-  Audits an LLM wiki for knowledge gaps, contradictions between pages,
-  outdated facts, orphan pages, broken `[[wiki-links]]`, missing concept
-  pages, format violations, and stale pages. Emits a numbered report of
-  findings with suggested fixes, applies them with user approval, and
-  commits the changes.
+  Thoroughly cleans up an LLM wiki: removes empty and orphaned pages,
+  fixes broken `[[wiki-links]]` and format violations, archives outdated
+  knowledge with status banners (never touching `raw/`), and verifies
+  conflicting information with the user before resolving it. Structural
+  cleanup is automatic; conflicts are batched into one report for approval.
+  Updates `wiki/index.md` and appends a `wiki/log.md` entry, then commits
+  (grouped by category) and pushes.
 
   Use this skill whenever the user wants to lint, audit, review, clean up,
   or check the health of their wiki. Trigger on phrases like: "lint the
   wiki", "audit the wiki", "check for contradictions", "find knowledge
   gaps", "clean up broken links", "review my wiki pages", "check what's
-  outdated", or "run lint".
+  outdated", "archive outdated pages", or "run lint".
 ---
 
 # Lint — LLM Wiki
 
-Two-pass audit of an LLM wiki:
-
-1. **Deterministic pass** (via `lint.py`) — finds orphan pages, broken
-   `[[links]]`, missing concept pages, format violations, and stale pages.
-   Emits a JSON report.
-2. **Semantic pass** (this skill / you) — reads the report and the flagged
-   pages, cross-checks pairs of related pages for contradictions, compares
-   wiki claims against `raw/` sources to spot outdated facts, and drafts
-   fixes.
-
-Fixes are always applied with user approval, then committed to git.
+Goal: keep the knowledge base clean so future reads always surface the
+**latest** information. Lint runs mostly automatically — structural cleanup
+(empty/orphan/broken/format) applies without asking; only genuine
+information **conflicts** are batched into one report you approve before
+they're applied. `raw/` is never modified. When done, lint commits (grouped
+by category) and pushes.
 
 ## Prerequisites
 
 - The wiki has a `.wikirc.json` at its root.
-- The wiki root is a git repository (so fixes can be committed).
-- `python3` is available. `lint.py` is stdlib only — no other dependencies.
+- The wiki root is a git repository (so fixes can be committed and pushed).
+- Python is available. `lint.py` is stdlib only — no other dependencies.
+
+## Resolving the Python interpreter
+
+Before running any script, resolve the correct Python binary (the llm-wiki
+deps live in a dedicated venv):
+
+```bash
+_LLMWIKI_VENV="${LLMWIKI_VENV:-${HOME}/.llm-wiki-venv}"
+if [ -x "${_LLMWIKI_VENV}/bin/python3" ]; then
+  WIKI_PY="${_LLMWIKI_VENV}/bin/python3"
+else
+  WIKI_PY="${PYTHON:-python3}"
+fi
+```
+
+Use `${WIKI_PY}` instead of `python3` below. `${SKILL_DIR}` is this file's
+directory; `${WIKI_ROOT}` is the wiki directory (contains `.wikirc.json`).
+`${INGEST_DIR}` is `${SKILL_DIR}/../ingest` (for `ingest.py`).
 
 ## Workflow
 
 ### Phase 1 — Run the deterministic linter
 
 ```bash
-python3 "${SKILL_DIR}/scripts/lint.py" --wiki-root "${WIKI_ROOT}"
+${WIKI_PY} "${SKILL_DIR}/scripts/lint.py" --wiki-root "${WIKI_ROOT}"
 ```
 
-Output is JSON on stdout with these top-level keys:
+JSON on stdout. Top-level keys:
 
 - `page_count` — total wiki pages seen
-- `orphans` — pages that no other wiki page links to (excluding `index.md` and `log.md`)
+- `edges` / `inbound_counts` — the wiki-link graph (for the semantic pass)
+- `orphans` — pages no other page links to (excludes `index`/`log`/`README`
+  **and** `Archived`/`Superseded` pages)
 - `broken_links` — `[[link]]` targets that don't exist in `wiki/`
-- `missing_pages` — de-duplicated broken-link targets, grouped by referring pages
-- `format_violations` — pages missing `Summary` / `Sources` / `Last updated` blocks or an H1
-- `stale_pages` — pages whose `Last updated` is older than `--stale-days` (default 90)
-  and where a newer file exists in `raw/`
-- `unsourced_claims` — pages that mention "needs verification" or that have no `Sources` entries
+- `missing_pages` — de-duplicated broken-link targets, grouped by referrer
+- `format_violations` — pages missing an H1 or `Summary`/`Sources`/`Last updated`
+- `empty_pages` — pages with an empty/stub body (too short, or a placeholder
+  marker like `Placeholder — add content` / `TBD — mentioned in`)
+- `stale_pages` — `Last updated` older than `--stale-days` (default 90) AND a
+  newer matching file exists in `raw/` (excludes retired pages)
+- `unsourced_claims` — pages with no `Sources` or `needs verification` markers
+- `status_pages` — pages carrying a `**Status**` field, with their
+  `superseded_by` target
+- `missing_sources` — `Sources` entries pointing at `raw/` paths that no longer
+  exist on disk
 
-Read the whole report before showing anything to the user.
+Read the whole report before acting.
 
-### Phase 2 — Semantic checks (you do this by reading pages)
+### Phase 2 — Automatic structural cleanup (no approval needed)
 
-For **contradictions**:
+Apply these directly — they are safe and git-recoverable:
 
-- Build the wiki-link graph from the report's `edges` field.
-- For every pair of pages that co-occur (page A links to X and page B also
-  links to X, or A ↔ B), read both pages fully.
-- Look for claims about the same fact (a number, a date, a name, a
-  behavior) that disagree. Report them.
+- **Empty pages** (`empty_pages`): delete the file. (If a page is empty only
+  because it's a deliberate stub for an upcoming concept the user cares about,
+  keep it — but default to deleting placeholder/TBD pages.)
+- **Broken links** (`broken_links` / `missing_pages`): if the target is a real
+  concept worth a page, create a proper page; otherwise remove the `[[ ]]`
+  brackets (leave the plain text). Never leave a dangling wiki-link.
+- **Orphans** (`orphans`): add an inbound link from a naturally-related page.
+  If the page has no clear home and no lasting value, archive it (Phase 4
+  status banner) rather than delete — unless it's also empty (already handled).
+- **Format violations** (`format_violations`): add the missing H1 or
+  `Summary`/`Sources`/`Last updated` block; use today's date for `Last updated`.
+- **Missing sources** (`missing_sources`): the `raw/` file was renamed or
+  removed. Fix the `Sources` path if you can identify the new name; otherwise
+  mark that claim `(source: needs verification)`. Never recreate `raw/`.
 
-For **outdated facts**:
+`Archived`/`Superseded` pages are already excluded from orphan/stale results,
+so they won't be re-flagged here.
 
-- For each page in `stale_pages`, read the raw sources listed in its
-  `Sources` block plus any newer files in `raw/` that reference the same
-  topic (by title similarity or shared wiki-link targets).
-- Flag any claim in the wiki page that the newer raw source contradicts.
+### Phase 3 — Semantic pass (find conflicts and outdated knowledge)
 
-For **knowledge gaps**:
+Read the flagged pages plus their neighbors (via `edges`) and identify:
 
-- For every entry in `missing_pages`, decide if the concept warrants its
-  own page. If yes, propose the new page; if no (e.g., the wiki-link is
-  overkill for a passing mention), propose removing the brackets.
+- **Contradictions**: two pages asserting different values for the same fact
+  (a number, date, name, behavior). For each pair that co-occurs in the graph,
+  read both fully and compare.
+- **Outdated facts**: for each `stale_pages` entry, read the raw sources in its
+  `Sources` block plus the newer `raw/` files listed in `newer_raw_files`; find
+  claims the newer source contradicts. Determine which version is current.
+- **Supersession candidates**: pages whose entire topic has been replaced by a
+  newer page — these become `Superseded by [[...]]` in Phase 4.
 
-### Phase 3 — Present findings to the user
+Do NOT apply semantic changes yet — collect them for the Phase 4 report.
 
-Show a numbered list. Group by severity:
+### Phase 4 — One report, then apply (the conflict gate)
+
+Present a **single** consolidated report: what Phase 2 already cleaned
+(informational) plus every proposed **conflict / outdated / supersession**
+resolution as a numbered list. Then ask the user to approve or edit the set —
+this is the one place lint waits for you.
 
 ```
 Lint results for <wiki-root> (<page_count> pages):
 
-BROKEN LINKS (N):
-  1. [[foo]] referenced in [[bar]], [[baz]] — no file exists
-  2. ...
+ALREADY CLEANED (automatic):
+  - Deleted 2 empty pages: [[stub-a]], [[stub-b]]
+  - Fixed 3 broken links; linked 1 orphan ([[foo]] ← [[bar]])
+  - Added missing "Last updated" to [[quux]]
 
-FORMAT VIOLATIONS (N):
-  3. wiki/quux.md is missing the "Last updated" block
-  ...
-
-CONTRADICTIONS (N):
-  4. [[api-limits]] says "1000 req/min" but [[changelog-2026-05]] says
-     "5000 req/min". Newer source likely correct.
-
-OUTDATED FACTS (N):
-  5. [[jane-doe]] lists title "PM" but raw/PROJ-500.md dated 2026-06-15
-     names her "Senior PM".
-
-KNOWLEDGE GAPS (N):
-  6. [[event-loop]] is referenced 3x but has no page. Worth creating?
-
-ORPHAN PAGES (N):
-  7. wiki/deprecated-service.md — no inbound links. Delete or link?
-
-STALE PAGES (N):
-  8. wiki/onboarding.md last updated 2025-11-01 but raw/PROJ-800.md (2026-06)
-     covers the same topic. Refresh?
-
-UNSOURCED CLAIMS (N):
-  9. wiki/pricing.md has 3 unsourced statements.
+NEEDS YOUR CONFIRMATION:
+  1. CONFLICT — [[api-limits]] says "1000 req/min" but [[changelog-2026-05]]
+     says "5000". Newer source (raw/changelog-2026-05.md) likely current.
+     Proposed: update [[api-limits]] to 5000, cite the newer source.
+  2. OUTDATED — [[onboarding]] (2025-11) contradicted by raw/PROJ-800.md
+     (2026-06). Proposed: refresh the activation-metrics section.
+  3. SUPERSEDE — [[old-auth-design]] fully replaced by [[auth-v2]].
+     Proposed: mark [[old-auth-design]] "Superseded by [[auth-v2]]" with a
+     banner; tag it in index.md.
 ```
 
-### Phase 4 — Apply fixes
+Use `AskUserQuestion` (or a plain numbered prompt) to collect decisions in one
+pass. After approval, apply:
 
-For each finding, propose a concrete fix and ask the user:
+- **Conflicts / outdated**: rewrite the wiki page to reflect the current
+  source, cite it inline `(source: raw/<file>)`, bump `Last updated`. When two
+  sources genuinely disagree and the user hasn't picked a winner, note the
+  contradiction explicitly per the citation rules.
+- **Supersession / archival**: add the `Status` field + banner blockquote at
+  the top of the retired page (see
+  [../ingest/references/page-format.md](../ingest/references/page-format.md)
+  "Status field"). **Never edit `raw/`.** The banner is the first body line so
+  future reads route to the current page.
 
-- **Broken links / knowledge gaps**: create the page (with `TBD` stub) or
-  remove the brackets.
-- **Format violations**: add the missing block, using today's date for
-  `Last updated`.
-- **Contradictions**: rewrite the older/incorrect claim to defer to the
-  newer source, or note the contradiction explicitly.
-- **Outdated facts**: update the wiki page and bump `Last updated`.
-- **Orphan pages**: add inbound links from a naturally-related page, or
-  delete if the page is truly obsolete (user must confirm delete).
-- **Unsourced claims**: mark with `(source: needs verification)` and add
-  to a follow-up task list.
+### Phase 5 — Update index.md and log.md
 
-Ask before applying each category — don't batch. The user may want to
-skip whole categories.
+- **`wiki/index.md`**: drop deleted pages; retag archived/superseded pages,
+  e.g. `[[old-auth-design]] — *(superseded by [[auth-v2]])*`.
+- **`wiki/log.md`**: append ONE entry (newest at top), header
+  `## <YYYY-MM-DD> (lint)`, bullets covering deletions, archives/supersessions,
+  conflict resolutions, and structural fixes, with wiki-links to affected
+  pages. `log.md` is append-only — never edit past entries. See the log format
+  in [../ingest/references/page-format.md](../ingest/references/page-format.md).
 
-### Phase 5 — Commit
+### Phase 6 — Grouped commit + push
+
+Commit per category so history is readable, then push once. Stage only the
+paths each commit touches:
 
 ```bash
-git -C "${WIKI_ROOT}" add wiki
-git -C "${WIKI_ROOT}" commit -m "lint: <one-line summary>"
+# one commit per non-empty category (skip categories with no changes):
+git -C "${WIKI_ROOT}" add <deleted+empty paths> \
+  && git -C "${WIKI_ROOT}" commit -m "lint: remove N empty/orphan pages"
+git -C "${WIKI_ROOT}" add <archived page paths> \
+  && git -C "${WIKI_ROOT}" commit -m "lint: archive M superseded pages"
+git -C "${WIKI_ROOT}" add <conflict-fix paths> \
+  && git -C "${WIKI_ROOT}" commit -m "lint: resolve K conflicts / outdated facts"
+git -C "${WIKI_ROOT}" add wiki/index.md wiki/log.md \
+  && git -C "${WIKI_ROOT}" commit -m "lint: update index + log"
+
+# then push all commits in one shot (gated on auto_push):
+${WIKI_PY} "${SKILL_DIR}/../ingest/scripts/ingest.py" \
+  --wiki-root "${WIKI_ROOT}" --push-only
 ```
 
-Where the one-line summary names the categories fixed, e.g.
-`lint: fix 3 broken links, refresh 2 stale pages`.
+Committing is gated on `auto_commit` and pushing on `auto_push` in
+`.wikirc.json` (both default to the user's config). `--push-only` reuses
+ingest's `git_push` — push failures warn but never fail the lint; local commits
+are always preserved. Credential resolution is delegated to Git (SSH key,
+macOS Keychain, `git-credential-store`).
+
+If `auto_commit` is false, leave the changes staged and tell the user.
 
 ## `lint.py` options
 
 ```
-python3 lint.py --wiki-root PATH [--stale-days DAYS] [--sources]
+${WIKI_PY} lint.py --wiki-root PATH [--stale-days DAYS] [--sources]
 ```
 
 - `--stale-days DAYS` — Threshold in days for stale detection (default 90).
-- `--sources` — Also include raw/ scan metadata for the semantic pass
-  (list of raw file mtimes and titles).
+- `--sources` — Also include raw/ scan metadata for the semantic pass.
 
 ## Design notes
 
-- The linter never modifies files. All writes happen from the semantic pass
-  through your `Write`/`StrReplace` tools with user approval.
-- `index.md` and `log.md` are exempt from the orphan check — they're
-  intentionally unreferenced.
-- The stale detection uses filesystem mtime of `raw/` files vs the
-  `Last updated:` line in each wiki page. It's a heuristic — always confirm
-  with the user before rewriting.
-- Contradictions and outdated facts are semantic — the linter cannot detect
-  them. It only surfaces the pages you should look at.
+- The linter never modifies files. All writes happen in Phases 2/4/5 through
+  your editing tools. `raw/` is never touched by any phase.
+- `index.md`, `log.md`, `README` are exempt from the orphan check; so are
+  `Archived`/`Superseded` pages (intentionally retired).
+- Stale detection is a heuristic (raw/ mtime vs the `Last updated:` line) — use
+  it to decide which pages to read in Phase 3, then confirm real conflicts with
+  the user before rewriting.
+- Contradictions and outdated facts are semantic — `lint.py` only surfaces the
+  pages to look at; you make the call and the user confirms.
+- Archival is by **status banner**, not deletion — historical pages stay in git
+  and in `index.md` (tagged), but readers are always redirected to the current
+  page.

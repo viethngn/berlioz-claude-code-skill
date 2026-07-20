@@ -2,8 +2,12 @@
 """Deterministic wiki linter — stdlib only.
 
 Scans wiki/*.md and emits a JSON report of:
-    orphans, broken_links, missing_pages, format_violations,
-    stale_pages, unsourced_claims, edges (wiki-link graph)
+    orphans, broken_links, missing_pages, format_violations, empty_pages,
+    stale_pages, unsourced_claims, status_pages, missing_sources,
+    edges (wiki-link graph)
+
+Pages carrying `**Status**: Archived` or `**Status**: Superseded by [[...]]`
+are excluded from the orphan and stale checks (intentionally retired).
 
 Usage:
     python3 lint.py --wiki-root PATH [--stale-days DAYS] [--sources]
@@ -27,6 +31,22 @@ H1_RE = re.compile(r"^#\s+.+", re.MULTILINE)
 REQUIRED_FIELDS = ("Summary", "Sources", "Last updated")
 EXEMPT_ORPHANS = {"index", "log", "README", "readme"}
 NEEDS_VERIFICATION_RE = re.compile(r"\(?source:\s*needs verification\)?", re.IGNORECASE)
+# A raw/ path token inside a Sources entry — stops at backtick, comma, quote,
+# whitespace, or closing bracket/paren so multi-path lines split correctly.
+PATH_TOKEN_RE = re.compile(r"raw/[^\s`,'\"\)\]]+")
+
+# Body length (non-whitespace chars, after the --- separator) below which a page
+# is treated as empty/stub.
+EMPTY_BODY_CHARS = 40
+# Placeholder phrases that mark a page as an unfilled stub regardless of length.
+STUB_MARKERS = (
+    "placeholder — add content",
+    "placeholder - add content",
+    "tbd — mentioned in",
+    "tbd - mentioned in",
+)
+# Status values that retire a page from orphan/stale nagging.
+RETIRED_STATUSES = ("archived", "superseded")
 
 
 def load_page(path: Path) -> dict:
@@ -71,6 +91,36 @@ def parse_sources(text: str) -> List[str]:
     return entries
 
 
+def parse_status(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """Return (status, superseded_by_slug) from an optional **Status**: line.
+
+    Absent field → (None, None), treated as Active. Recognizes:
+        **Status**: Active
+        **Status**: Archived
+        **Status**: Superseded by [[current-page]]
+    """
+    m = re.search(r"\*\*Status\*\*\s*:\s*(.+)", text)
+    if not m:
+        return None, None
+    value = m.group(1).strip()
+    lowered = value.lower()
+    if lowered.startswith("superseded"):
+        link = WIKI_LINK_RE.search(value)
+        return "superseded", (link.group(1).strip() if link else None)
+    if lowered.startswith("archived"):
+        return "archived", None
+    if lowered.startswith("active"):
+        return "active", None
+    # Unknown value — surface it as-is so the semantic pass can inspect it.
+    return lowered.split()[0] if lowered else None, None
+
+
+def page_body(text: str) -> str:
+    """Return the page body after the first `---` separator (or whole text)."""
+    parts = text.split("\n---", 1)
+    return parts[1] if len(parts) == 2 else text
+
+
 def slug_from_path(path: Path) -> str:
     return path.stem
 
@@ -98,11 +148,41 @@ def inbound_counts(edges: Dict[str, List[str]]) -> Dict[str, int]:
     return counts
 
 
-def find_orphans(pages: List[dict], inbound: Dict[str, int]) -> List[str]:
+def find_status_pages(pages: List[dict]) -> List[dict]:
+    """Report pages carrying an explicit **Status** field."""
+    out: List[dict] = []
+    for page in pages:
+        status, superseded_by = parse_status(page["text"])
+        if status is None:
+            continue
+        out.append(
+            {
+                "page": slug_from_path(page["path"]),
+                "status": status,
+                "superseded_by": superseded_by,
+            }
+        )
+    return out
+
+
+def retired_slugs(pages: List[dict]) -> set:
+    """Slugs of pages whose Status retires them from orphan/stale nagging."""
+    retired = set()
+    for page in pages:
+        status, _ = parse_status(page["text"])
+        if status in RETIRED_STATUSES:
+            retired.add(slug_from_path(page["path"]))
+    return retired
+
+
+def find_orphans(
+    pages: List[dict], inbound: Dict[str, int], retired: Optional[set] = None
+) -> List[str]:
+    retired = retired or set()
     orphans = []
     for page in pages:
         slug = slug_from_path(page["path"])
-        if slug in EXEMPT_ORPHANS:
+        if slug in EXEMPT_ORPHANS or slug in retired:
             continue
         if inbound.get(slug, 0) == 0:
             orphans.append(slug)
@@ -141,11 +221,61 @@ def find_format_violations(pages: List[dict]) -> List[dict]:
     return violations
 
 
+def find_empty_pages(pages: List[dict]) -> List[dict]:
+    """Flag pages with an empty/stub body (too short, or a placeholder marker)."""
+    empty: List[dict] = []
+    for page in pages:
+        slug = slug_from_path(page["path"])
+        if slug in EXEMPT_ORPHANS:
+            continue
+        body = page_body(page["text"])
+        lowered = body.lower()
+        marker = next((m for m in STUB_MARKERS if m in lowered), None)
+        non_ws = re.sub(r"\s+", "", body)
+        if marker:
+            empty.append(
+                {"page": slug, "reason": "stub placeholder", "char_count": len(non_ws)}
+            )
+        elif len(non_ws) < EMPTY_BODY_CHARS:
+            empty.append(
+                {"page": slug, "reason": "body too short", "char_count": len(non_ws)}
+            )
+    return empty
+
+
+def find_missing_sources(pages: List[dict], raw_dir: Path) -> List[dict]:
+    """Flag Sources entries pointing at raw/ paths that don't exist on disk.
+
+    A single Sources line may list several paths (comma- and/or backtick-
+    separated), e.g. `raw/a.md`, `raw/b.md` — extract each path token
+    individually and check it, rather than treating the whole line as one path.
+    """
+    wiki_root = raw_dir.parent
+    out: List[dict] = []
+    for page in pages:
+        missing: List[str] = []
+        for entry in parse_sources(page["text"]):
+            for candidate in PATH_TOKEN_RE.findall(entry):
+                candidate = candidate.strip()
+                # Only check entries that look like a raw/ path.
+                if not candidate.startswith("raw/"):
+                    continue
+                if not (wiki_root / candidate).exists():
+                    missing.append(candidate)
+        if missing:
+            out.append(
+                {"page": slug_from_path(page["path"]), "missing": sorted(set(missing))}
+            )
+    return out
+
+
 def find_stale(
     pages: List[dict],
     raw_dir: Path,
     stale_days: int,
+    retired: Optional[set] = None,
 ) -> List[dict]:
+    retired = retired or set()
     now = datetime.now(timezone.utc)
     stale: List[dict] = []
     raw_files: List[dict] = []
@@ -164,6 +294,9 @@ def find_stale(
 
     for page in pages:
         text = page["text"]
+        slug = slug_from_path(page["path"])
+        if slug in retired:
+            continue
         last_updated = parse_last_updated(text)
         if last_updated is None:
             continue
@@ -171,7 +304,6 @@ def find_stale(
         if age_days < stale_days:
             continue
 
-        slug = slug_from_path(page["path"])
         related_raws: List[str] = []
         for rf in raw_files:
             if rf["mtime"] <= last_updated:
@@ -279,11 +411,15 @@ def main() -> int:
 
     edges = build_edges(pages)
     inbound = inbound_counts(edges)
-    orphans = find_orphans(pages, inbound)
+    retired = retired_slugs(pages)
+    orphans = find_orphans(pages, inbound, retired)
     broken, missing = find_broken_links(pages, edges)
     format_violations = find_format_violations(pages)
-    stale = find_stale(pages, raw_dir, args.stale_days)
+    stale = find_stale(pages, raw_dir, args.stale_days, retired)
     unsourced = find_unsourced(pages)
+    empty_pages = find_empty_pages(pages)
+    status_pages = find_status_pages(pages)
+    missing_sources = find_missing_sources(pages, raw_dir)
 
     report = {
         "wiki_root": str(wiki_root),
@@ -296,8 +432,11 @@ def main() -> int:
         "broken_links": broken,
         "missing_pages": dict(sorted(missing.items())),
         "format_violations": format_violations,
+        "empty_pages": empty_pages,
         "stale_pages": stale,
         "unsourced_claims": unsourced,
+        "status_pages": status_pages,
+        "missing_sources": missing_sources,
     }
 
     if args.sources:

@@ -43,6 +43,41 @@ Fields:
   `(source: <raw-filename>)`.
 - **Related pages**: 2-8 wiki-links, sorted alphabetically.
 
+## Status field (optional — for archiving)
+
+Pages are `Active` by default and carry **no** `Status` line. When a page's
+knowledge is retired or replaced, add an optional `**Status**:` line immediately
+after the H1, plus a banner blockquote as the first body line so any reader is
+redirected to the current information:
+
+```markdown
+# Old Concept
+
+> **⚠️ Superseded** — see [[new-concept]] for current information. Kept for historical reference.
+
+**Status**: Superseded by [[new-concept]]
+
+**Summary**: ...
+```
+
+- Values: `Active` (or omit the line), `Archived` (retired, no direct
+  replacement), or `Superseded by [[current-page]]`.
+- The `Status` line is **optional** — its absence is never a format violation.
+- `/lint` excludes `Archived` / `Superseded` pages from orphan and stale checks,
+  so intentionally-retired pages stop being nagged.
+- In `wiki/index.md`, tag such pages, e.g.
+  `[[old-concept]] — *(superseded by [[new-concept]])*`.
+
+### Archiving vs. deleting
+
+- **Never edit `raw/`.** It is the immutable source record. Archival happens only
+  in `wiki/`.
+- Prefer **superseding by banner + status** over deleting a page that has
+  historical value — the banner guarantees future reads (human or Claude) land
+  on the current page.
+- Genuinely empty or duplicate pages with no historical value are deleted by
+  `/lint` (git keeps the history).
+
 ## Filename conventions
 
 - Lowercase, hyphen-separated: `machine-learning.md`, not `Machine Learning.md`
@@ -130,11 +165,14 @@ Append-only. Newest entry at the top:
 
 Each entry has:
 
-- ISO date header (`## YYYY-MM-DD`)
-- Bullet list of what was ingested and what changed
+- ISO date header (`## YYYY-MM-DD`) — add a suffix for non-ingest operations,
+  e.g. `## 2026-07-20 (lint)`
+- Bullet list of what was ingested/changed (or, for lint, what was cleaned:
+  pages deleted, archived/superseded, conflicts resolved, fixes applied)
 - Wiki-links to the affected pages
 
-Never edit past entries — treat `log.md` as append-only history.
+`log.md` records **every ingest and lint operation**. Both `/ingest` and `/lint`
+append an entry. Never edit past entries — treat `log.md` as append-only history.
 
 ## Anti-patterns to avoid
 

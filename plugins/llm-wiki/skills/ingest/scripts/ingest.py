@@ -495,6 +495,32 @@ def _cmd_commit_only(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_push_only(args: argparse.Namespace) -> int:
+    """Push already-made commits to the remote (used by /lint's grouped commits).
+
+    Commits are created separately (e.g. one per category); this pushes them all
+    in one shot, gated on auto_push. Push failures warn but never raise.
+    """
+    wiki_root = args.wiki_root.resolve()
+    if not is_git_repo(wiki_root):
+        print(f"ERROR: {wiki_root} is not a git repository", file=sys.stderr)
+        return 1
+
+    try:
+        cfg = load_config(wiki_root)
+    except ConfigError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+    result: dict = {"pushed": None}
+    if cfg.auto_push:
+        result["pushed"] = git_push(wiki_root, cfg)
+    else:
+        result["note"] = "auto_push is false — nothing pushed"
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def _cmd_ingest(args: argparse.Namespace) -> int:
     wiki_root = args.wiki_root.resolve()
 
@@ -655,12 +681,20 @@ def main() -> int:
     )
 
     parser.add_argument("--commit-only", action="store_true", help="Only run the git commit step")
+    parser.add_argument(
+        "--push-only",
+        action="store_true",
+        help="Only push already-made commits to the remote (gated on auto_push)",
+    )
     parser.add_argument("--slug", help="Slug for --commit-only")
     parser.add_argument("--message", help="Override commit message")
     parser.add_argument("--new-images", type=int, default=0, help="For --commit-only")
     parser.add_argument("--changed-images", type=int, default=0, help="For --commit-only")
 
     args = parser.parse_args()
+
+    if args.push_only:
+        return _cmd_push_only(args)
 
     if args.commit_only:
         if not args.slug:

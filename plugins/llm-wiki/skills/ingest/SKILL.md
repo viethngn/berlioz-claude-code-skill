@@ -48,8 +48,8 @@ Before running any script, verify:
 ## Phase 0 — Decide: single or bulk?
 
 Before running anything, classify the source. `ingest.py` will do this
-automatically from arguments, but you should still tell the user which
-path it will take so scope is confirmed.
+automatically from arguments; state which path it took as an FYI, then
+proceed — no confirmation needed.
 
 ### Detection rules (implemented in `ingest.py`)
 
@@ -75,18 +75,19 @@ page" and "space" resolves to single (the `/pages/` segment wins).
 Ambiguous bare tokens (e.g., "FOO" — could be a space key or a slug) must
 be disambiguated by asking the user or by requiring an explicit flag.
 
-### Scope confirmation for bulk
+### Scope note for bulk
 
 Bulk mode with full per-item wiki synthesis is expensive (Claude tokens
-and wall time). Before running a bulk job, tell the user:
+and wall time). State the detected scope as an FYI and proceed — do not
+pause for confirmation:
 
-> This will discover every page in space **FOO**, prefetch the raw content
-> and images (rate-limited, resumable), and then I will synthesize wiki
-> pages for each item in batches of N. For a large space this can take
-> hours and touch every wiki category. Continue?
+> Ingesting space **FOO**: discovering every page, prefetching raw content
+> and images (rate-limited, resumable), then synthesizing wiki pages and
+> committing + pushing one commit per item. For a large space this can take
+> hours and touch every wiki category.
 
-If they say yes, proceed. If they'd rather scope down, offer `--cql`
-with a `label=…` or `updated > …` filter.
+If the user wants to scope down, they can re-run with `--cql`
+(`label=…` or `updated > …`) — but that's their call, not a blocking prompt.
 
 ## Resolving the Python interpreter
 
@@ -112,20 +113,27 @@ containing this file. `${WIKI_ROOT}` is the wiki directory (contains
 
 ### Phase 1 — Detect and fetch the source
 
+Fetch with `--no-commit` so the raw files are staged but not yet committed —
+this lets Phase 4 land a **single** commit covering both raw and the wiki
+pages you synthesize in Phase 3 (one commit, one push, right after the whole
+ingest completes):
+
 ```bash
 ${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
   --wiki-root "${WIKI_ROOT}" \
-  --source "<Confluence URL | Jira key | local file path>"
+  --source "<Confluence URL | Jira key | local file path>" \
+  --no-commit
 ```
 
 The orchestrator prints a JSON summary. Parse it to know which files were
 created and how many images were described.
 
-### Phase 2 — Review takeaways with the user
+### Phase 2 — Report takeaways (non-blocking)
 
 After the orchestrator finishes, read the newly written `raw/<slug>.md`
-and any image description files under `raw/images/<slug>/`. Then tell the
-user:
+and any image description files under `raw/images/<slug>/`. Print a short
+summary for the user's awareness, then **proceed directly to Phase 3** —
+do not wait for confirmation:
 
 > I ingested **[title]** from [source-type]. Key takeaways:
 >
@@ -133,12 +141,15 @@ user:
 >
 > Images: [N new, M changed, K unchanged, described via nano-banana-pro]
 >
-> Ready to update the wiki? I'll create/update these pages:
+> Updating the wiki now:
 > - [[proposed-page-1]] — [one-line reason]
 > - [[proposed-page-2]] — [one-line reason]
 > - Update [[existing-page]] with [what changes]
 
-Wait for the user's confirmation or corrections before writing wiki pages.
+This summary is informational. Ingest is fully automatic: fetch →
+synthesize → commit → push runs end-to-end without pausing. (The user can
+still interrupt or correct after the fact — the commit history and diff are
+always reviewable, and unwanted changes can be reverted.)
 
 ### Phase 3 — Update wiki pages
 
@@ -152,10 +163,17 @@ For each page you touch:
 - Append an entry to `wiki/log.md` with the date, source name, and what
   changed.
 
-### Phase 4 — Commit (and optionally push) to git
+### Phase 4 — Commit and push (raw + wiki together)
 
-`ingest.py` handles this when `auto_commit=true` (the default). Or call
-`ingest.py --commit-only --slug ...`. Commit message format:
+After synthesis, run one `--commit-only` to commit the staged raw files
+**and** the wiki pages in a single commit, then push:
+
+```bash
+${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
+  --wiki-root "${WIKI_ROOT}" --commit-only --slug "<slug>"
+```
+
+Commit message format:
 
 ```
 ingest: <slug> (N new, M changed images)
@@ -165,6 +183,9 @@ If `auto_push: true` in `.wikirc.json`, `ingest.py` pushes to the configured
 remote after the commit. Push failures warn but do not fail the ingest — the
 local commit is always preserved. Credential resolution is delegated to Git
 (SSH key, macOS Keychain, `git-credential-store`).
+
+Skip this phase only when Phase 1 reported `status="unchanged"` (nothing was
+staged, so there's nothing to commit or push).
 
 ## Slack workflow
 
@@ -220,10 +241,11 @@ messages were skipped and backfill the earlier range explicitly with
 `--before <first-fetched-date> --limit 0` before continuing. Prefer leaving
 `--limit` unset (no cap) for whole-channel ingest so this never happens.
 
-### Phase 2 — Review takeaways with the user
+### Phase 2 — Report takeaways (non-blocking)
 
-Read `raw/<slug>.md`. Summarize the key discussion points, decisions, or topics.
-Wait for confirmation before writing wiki pages.
+Read `raw/<slug>.md`. Print a short summary of the key discussion points,
+decisions, or topics for the user's awareness, then **proceed directly to
+Phase 3** — do not wait for confirmation.
 
 ### Phase 3 — Update wiki pages + commit
 
@@ -246,7 +268,8 @@ If `auto_push: true`, the push happens automatically after the commit.
 ## Bulk workflow
 
 Bulk runs in three phases: **discovery**, **prefetch** (long-running, no
-Claude needed), and **synthesis** (Claude-in-the-loop, batched).
+Claude needed), and **synthesis** (Claude-in-the-loop, one commit + push
+per item, no pauses).
 
 ### Bulk Phase 1 — Discover + prefetch
 
@@ -285,7 +308,7 @@ ${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
 `--resume` implies `--retry-failed`, so previously-failed items get
 another attempt.
 
-### Bulk Phase 2 — Confirm scope with the user
+### Bulk Phase 2 — Status report (non-blocking)
 
 After prefetch completes, print the queue counts:
 
@@ -293,16 +316,17 @@ After prefetch completes, print the queue counts:
 ${WIKI_PY} "${SKILL_DIR}/scripts/queue_admin.py" --wiki-root "${WIKI_ROOT}" show <job-id>
 ```
 
-Tell the user:
+Report the counts as an FYI, then proceed automatically to synthesis — do
+not pause for confirmation:
 
 > Prefetch complete for job **<job-id>**: N pages fetched, M unchanged,
-> K failed. Now I'll synthesize wiki pages in batches of B. After each
-> batch I'll commit and pause for your OK. Continue?
+> K failed. Synthesizing wiki pages now, committing + pushing one commit
+> per item.
 
-### Bulk Phase 3 — Synthesis loop (Claude in the loop)
+### Bulk Phase 3 — Synthesis loop (automatic, one commit per item)
 
 For each item with `raw_status in {done, unchanged}` and
-`wiki_status == pending`:
+`wiki_status == pending`, run this end-to-end without pausing:
 
 1. Read `raw/<slug>.md` and every `raw/images/<slug>/*.md`.
 2. Follow the single-item **Phase 3** (update wiki pages, index.md,
@@ -316,11 +340,20 @@ For each item with `raw_status in {done, unchanged}` and
       mark <job-id> --ref <ref> --wiki-done
     ```
 
-4. Every `--batch` items (default 5): `git commit -m "ingest: <job-id>
-   [items X-Y]"` and ask the user whether to continue with the next batch.
+4. Commit **and push** this item immediately via `ingest.py --commit-only`
+   (this is what triggers `git_push` when `auto_push: true` — never use a
+   bare `git commit`, which would skip the push):
 
-If the user asks to skip an item (e.g., a draft page), mark it with
-`--wiki-skipped`.
+    ```bash
+    ${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
+      --wiki-root "${WIKI_ROOT}" --commit-only --slug "<slug>" \
+      --message "ingest: <slug> (bulk <job-id>)"
+    ```
+
+5. Continue automatically to the next item. Do not ask whether to continue.
+
+If a specific item is clearly a draft or otherwise unwanted, mark it with
+`--wiki-skipped` and move on.
 
 ### Bulk Phase 4 — Final report
 
