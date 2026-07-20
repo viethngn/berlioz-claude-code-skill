@@ -53,6 +53,28 @@ if command -v uv >/dev/null 2>&1; then
     uv pip install -r "${REQ_FILE}" --system || true
 fi
 
+VENV_PATH="${LLMWIKI_VENV:-${HOME}/.llm-wiki-venv}"
+VENV_USED=0
+
+if [ "${install_ok}" -eq 0 ]; then
+  echo ""
+  echo "--- Trying: venv at ${VENV_PATH}"
+  if "${PY_BIN}" -m venv "${VENV_PATH}" 2>&1 && \
+     "${VENV_PATH}/bin/pip" install --quiet --upgrade pip 2>&1 && \
+     "${VENV_PATH}/bin/pip" install -r "${REQ_FILE}" 2>&1; then
+    echo "--- Success: venv at ${VENV_PATH}"
+    install_ok=1
+    VENV_USED=1
+    echo ""
+    echo "==> Venv created at ${VENV_PATH}"
+    echo "==> Set LLMWIKI_VENV=${VENV_PATH} to override the default location."
+    # Export so check-setup.sh validates the right interpreter
+    export PYTHON="${VENV_PATH}/bin/python3"
+  else
+    echo "--- Failed:  venv at ${VENV_PATH} (will try next)"
+  fi
+fi
+
 if [ "${install_ok}" -eq 0 ]; then
   try_install "pip install --user" \
     "${PY_BIN}" -m pip install --user -r "${REQ_FILE}" || true

@@ -5,7 +5,15 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY_BIN="${PYTHON:-python3}"
+# Resolve interpreter: explicit PYTHON env var → default venv → system python3
+PY_BIN="${PYTHON:-}"
+if [ -z "${PY_BIN}" ]; then
+  _VENV_PATH="${LLMWIKI_VENV:-${HOME}/.llm-wiki-venv}"
+  if [ -x "${_VENV_PATH}/bin/python3" ]; then
+    PY_BIN="${_VENV_PATH}/bin/python3"
+  fi
+fi
+PY_BIN="${PY_BIN:-python3}"
 
 status=0
 ok()   { printf "  \033[32mOK\033[0m %s\n" "$1"; }
@@ -82,6 +90,29 @@ if [ -n "${CONFIG_PATH}" ]; then
     fi
     if grep -q "example.com" "${CONFIG_PATH}" 2>/dev/null; then
       warn "still points at example.com URLs — replace with your real endpoints"
+    fi
+    # auto_push + git.remote sanity
+    _AUTO_PUSH="$("${PY_BIN}" -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(str(d.get('auto_push',False)).lower())
+" "${CONFIG_PATH}" 2>/dev/null || echo "false")"
+    if [ "${_AUTO_PUSH}" = "true" ]; then
+      _GIT_REMOTE="$("${PY_BIN}" -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+print((d.get('git') or {}).get('remote','origin'))
+" "${CONFIG_PATH}" 2>/dev/null || echo "origin")"
+      warn "auto_push=true — make sure 'git remote ${_GIT_REMOTE}' is configured (run: git remote -v)"
+    fi
+    # slack.token placeholder check
+    _SLACK_TOKEN="$("${PY_BIN}" -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+print((d.get('slack') or {}).get('token',''))
+" "${CONFIG_PATH}" 2>/dev/null || echo "")"
+    if echo "${_SLACK_TOKEN}" | grep -qE "REPLACE_ME|xoxp-REPLACE"; then
+      warn "slack.token looks like a placeholder — fill in your User OAuth token for Slack ingest"
     fi
   fi
 fi

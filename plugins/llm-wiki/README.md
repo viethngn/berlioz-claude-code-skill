@@ -2,15 +2,14 @@
 
 Three skills for maintaining a personal LLM knowledge wiki, backed by git.
 
-- **`/ingest`** — Pull content from a Confluence page, Jira issue, or local file
-  (Markdown, HTML, PDF, DOCX, image), **or** bulk-ingest a whole Confluence
-  space / Confluence CQL query / Jira JQL query. The skill auto-detects single
-  vs bulk from the source shape or an explicit `--space` / `--cql` / `--jql` /
-  `--resume` flag. Extracts embedded images, describes them via a
-  nano-banana-pro-compatible endpoint **only when they change**, and updates
-  the wiki. Bulk mode uses a resumable job queue with rate limiting and a
-  circuit breaker so a whole-space run can be paused and resumed. Commits raw
-  + wiki to git so the next ingest can diff against the last committed state.
+- **`/ingest`** — Pull content from a Confluence page, Jira issue, local file
+  (Markdown, HTML, PDF, DOCX, image), **or** Slack channel / thread / search
+  results, **or** bulk-ingest a whole Confluence space / CQL query / JQL query.
+  The skill auto-detects single vs bulk from the source shape or explicit flags.
+  Extracts embedded images, describes them via a nano-banana-pro-compatible
+  vision endpoint **only when they change**, and updates the wiki. Bulk mode
+  uses a resumable job queue with rate limiting and a circuit breaker. Commits
+  raw + wiki to git and optionally pushes to remote.
 - **`/lint`** — Audit the wiki for knowledge gaps, contradictions, orphaned
   pages, broken `[[wiki-links]]`, format violations, and stale facts. Emits a
   numbered report with suggested fixes and applies them with your approval.
@@ -40,9 +39,21 @@ bash /absolute/path/to/berlioz-claude-code-skill/plugins/llm-wiki/install.sh
 
 The installer tries, in order:
 
-1. `uv pip install -r requirements.txt --system` (if `uv` is available)
-2. `python3 -m pip install --user -r requirements.txt`
-3. `python3 -m pip install -r requirements.txt`
+1. `uv pip install --system` (if `uv` is available — fastest)
+2. **virtualenv at `~/.llm-wiki-venv`** (recommended on Homebrew / PEP 668 systems)
+3. `pip install --user`
+4. `pip install` (system-wide, last resort)
+
+On macOS with Homebrew Python (Python 3.12+), option 2 runs automatically and
+creates a dedicated venv. You don't need `uv` or `--break-system-packages`.
+
+To use a custom venv location:
+```bash
+LLMWIKI_VENV=/your/custom/path bash install.sh
+```
+
+After installation, `check-setup.sh` auto-detects `~/.llm-wiki-venv` as the
+Python source. Override with `LLMWIKI_VENV` or `PYTHON` env vars.
 
 If your machine has no direct PyPI access, see
 [skills/ingest/references/setup.md](skills/ingest/references/setup.md) for
@@ -70,7 +81,7 @@ install commands with the correct absolute paths.
 ### 5. Fill in `.wikirc.json`
 
 Copy `.wikirc.example.json` to `.wikirc.json` and fill in your endpoints and
-Personal Access Tokens.
+tokens. The file is git-ignored — never committed.
 
 ```json
 {
@@ -78,11 +89,16 @@ Personal Access Tokens.
   "raw_dir": "raw",
   "wiki_dir": "wiki",
   "auto_commit": true,
+  "auto_push": false,
+  "git": {
+    "remote": "origin",
+    "branch": ""
+  },
   "atlassian": {
     "confluence_base_url": "https://your-confluence.example.com",
     "jira_base_url": "https://your-jira.example.com",
-    "confluence_pat": "YOUR_CONFLUENCE_TOKEN_OR_EMPTY",
-    "jira_pat": "YOUR_JIRA_TOKEN_OR_EMPTY",
+    "confluence_pat": "YOUR_CONFLUENCE_PAT_OR_EMPTY",
+    "jira_pat": "YOUR_JIRA_PAT_OR_EMPTY",
     "verify_ssl": true,
     "rate_limit_rps": 2,
     "burst": 5,
@@ -98,18 +114,44 @@ Personal Access Tokens.
     "burst": 2,
     "max_retries": 3,
     "retry_base_delay_seconds": 2
+  },
+  "slack": {
+    "token": "xoxp-YOUR_USER_OAUTH_TOKEN",
+    "verify_ssl": true,
+    "rate_limit_rps": 1,
+    "burst": 3,
+    "max_retries": 5,
+    "retry_base_delay_seconds": 2
   }
 }
 ```
 
-Rate-limit knobs are optional. Defaults are conservative (2 rps for
-Atlassian, 1 rps for nano-banana) so a first-time bulk run won't get
-anyone rate-banned. Every HTTP call flows through `rate_limiter.py`, which
-respects `Retry-After` on 429/503 and falls back to exponential backoff
-with jitter.
+**`auto_push`** — set to `true` to push to the configured `git.remote` after
+every commit. Push failures warn but never fail the ingest; the local commit is
+always preserved. Credential resolution is delegated to Git — set up an SSH key
+or `git credential-osxkeychain` (macOS) / `git-credential-store` once and it
+just works. No token goes in `.wikirc.json`.
 
-`.wikirc.json` is git-ignored by default. Only `.wikirc.example.json` is
-committed.
+**`slack.token`** — a Slack User OAuth Token (`xoxp-…`). See
+[How to get a Slack token](#how-to-get-a-slack-token) below.
+
+Rate-limit knobs are optional. Defaults are conservative so a first-time bulk
+run won't get anyone rate-banned. Every HTTP call flows through `rate_limiter.py`,
+which respects `Retry-After` on 429/503 and uses exponential backoff with jitter.
+
+#### How to get a Slack token
+
+1. Go to **https://api.slack.com/apps** → **Create New App** → **From scratch**.
+2. Name it (e.g. `llm-wiki`), select your workspace.
+3. Under **OAuth & Permissions** → **User Token Scopes**, add:
+   `channels:history`, `channels:read`, `groups:history`, `groups:read`,
+   `im:history`, `mpim:history`, `search:read`, `users:read`.
+4. Click **Install App to Workspace** → authorise.
+5. Copy the **User OAuth Token** (starts with `xoxp-`).
+6. Paste it into `.wikirc.json` under `slack.token`.
+
+A User token (not a Bot token) is required so `search.messages` can reach
+private channels you have access to.
 
 ## Usage
 
@@ -156,6 +198,26 @@ disconnect), continue where it left off:
 > /ingest --resume conf-space-foo-20260703-005211
 
 `queue_admin.py list` prints every known job id and its counts.
+
+### Ingest a Slack channel (new messages since last ingest)
+
+> /ingest --slack-channel general
+
+Fetches all messages since the last `fetched_until` timestamp. The slug encodes
+the actual message date range (e.g. `slack-general-20260715-20260720`). Re-running
+before new messages arrive returns "unchanged" — nothing is committed.
+
+### Ingest a Slack channel with a date window
+
+> /ingest --slack-channel general --after 2026-07-01 --before 2026-07-20
+
+### Ingest a specific Slack thread
+
+> /ingest --slack-channel general --thread-ts 1234567890.123456
+
+### Ingest Slack search results
+
+> /ingest --slack-search "topic:decision after:2026-07-01"
 
 ### Lint the wiki
 

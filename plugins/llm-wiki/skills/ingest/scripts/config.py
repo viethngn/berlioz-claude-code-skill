@@ -25,6 +25,11 @@ DEFAULT_CONFIG = {
     "raw_dir": "raw",
     "wiki_dir": "wiki",
     "auto_commit": True,
+    "auto_push": False,
+    "git": {
+        "remote": "origin",
+        "branch": "",
+    },
     "atlassian": {
         "confluence_base_url": "",
         "jira_base_url": "",
@@ -44,6 +49,14 @@ DEFAULT_CONFIG = {
         "rate_limit_rps": 1,
         "burst": 2,
         "max_retries": 3,
+        "retry_base_delay_seconds": 2,
+    },
+    "slack": {
+        "token": "",
+        "verify_ssl": True,
+        "rate_limit_rps": 1,
+        "burst": 3,
+        "max_retries": 5,
         "retry_base_delay_seconds": 2,
     },
 }
@@ -70,6 +83,16 @@ class Config:
     @property
     def auto_commit(self) -> bool:
         return bool(self.data.get("auto_commit", True))
+
+    @property
+    def auto_push(self) -> bool:
+        return bool(self.data.get("auto_push", False))
+
+    def git_remote(self) -> str:
+        return (self.data.get("git") or {}).get("remote", "origin")
+
+    def git_branch(self) -> str:
+        return (self.data.get("git") or {}).get("branch", "")
 
     @property
     def atlassian(self) -> dict:
@@ -106,6 +129,16 @@ class Config:
     def nano_banana_verify_ssl(self) -> bool:
         return bool(self.nano_banana.get("verify_ssl", True))
 
+    @property
+    def slack(self) -> dict:
+        return dict(self.data.get("slack") or {})
+
+    def slack_token(self) -> str:
+        return self.slack.get("token") or ""
+
+    def slack_verify_ssl(self) -> bool:
+        return bool(self.slack.get("verify_ssl", True))
+
     def redacted(self) -> dict:
         clone = json.loads(json.dumps(self.data))
 
@@ -121,6 +154,8 @@ class Config:
         redact(atl, ["confluence_pat", "jira_pat"])
         nb = clone.setdefault("nano_banana", {})
         redact(nb, ["api_key"])
+        sl = clone.setdefault("slack", {})
+        redact(sl, ["token"])
         clone["_config_path"] = str(self.path)
         clone["_wiki_root"] = str(self.wiki_root)
         return clone

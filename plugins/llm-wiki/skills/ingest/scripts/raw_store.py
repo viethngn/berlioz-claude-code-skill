@@ -102,6 +102,18 @@ def read_previous_content_sha(raw_dir: Path, slug: str) -> Optional[str]:
     return data.get("content_sha256")
 
 
+def read_previous_source_metadata(raw_dir: Path, slug: str) -> Optional[dict]:
+    """Return the full metadata dict from a previous source.json, if any."""
+    src_path = Path(raw_dir) / f"{slug}.source.json"
+    if not src_path.exists():
+        return None
+    try:
+        with src_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 def wiki_state_dir(wiki_root: Path) -> Path:
     return Path(wiki_root) / ".wiki-state"
 

@@ -32,7 +32,7 @@ from markdownify import markdownify
 
 from config import ConfigError, apply_ssl_env, load_config
 from rate_limiter import RateLimitFailure, get_limiter
-from raw_store import write_raw_if_changed
+from raw_store import read_previous_source_metadata, write_raw_if_changed
 
 
 ISSUE_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
@@ -61,12 +61,14 @@ def extract_issue_key(url_or_key: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def fetch_issue(base_url: str, pat: str, key: str, verify: bool, limiter=None) -> dict:
+def _jira_get(base_url: str, pat: str, key: str, fields_param: str, verify: bool, limiter) -> dict:
     url = f"{base_url}/rest/api/2/issue/{key}"
-    params = {"expand": "renderedFields"}
     headers = {"Authorization": f"Bearer {pat}", "Accept": "application/json"}
-    if limiter is None:
-        limiter = get_limiter("atlassian", None)
+    params: dict = {}
+    if fields_param.startswith("expand="):
+        params["expand"] = fields_param[len("expand="):]
+    else:
+        params["fields"] = fields_param
     try:
         resp = limiter.request(
             "GET", url, headers=headers, params=params, verify=verify, timeout=60
@@ -87,6 +89,18 @@ def fetch_issue(base_url: str, pat: str, key: str, verify: bool, limiter=None) -
         )
     resp.raise_for_status()
     return resp.json()
+
+
+def fetch_issue_updated(base_url: str, pat: str, key: str, verify: bool, limiter) -> Optional[str]:
+    """Cheap pre-check: return the issue's `updated` timestamp only."""
+    data = _jira_get(base_url, pat, key, "updated,summary", verify, limiter)
+    return (data.get("fields") or {}).get("updated")
+
+
+def fetch_issue(base_url: str, pat: str, key: str, verify: bool, limiter=None) -> dict:
+    if limiter is None:
+        limiter = get_limiter("atlassian", None)
+    return _jira_get(base_url, pat, key, "expand=renderedFields", verify, limiter)
 
 
 def _get(d: dict, path: list, default=None):
@@ -214,6 +228,7 @@ def main() -> int:
     parser.add_argument("--wiki-root", type=Path, required=True)
     parser.add_argument("--key", help="Jira issue key like PROJ-123")
     parser.add_argument("--url", help="Jira issue URL")
+    parser.add_argument("--force", action="store_true", help="Skip updated_at pre-check and re-fetch")
     args = parser.parse_args()
 
     if not args.key and not args.url:
@@ -243,6 +258,45 @@ def main() -> int:
 
     verify = cfg.atlassian_verify_ssl()
     limiter = get_limiter("atlassian", cfg.atlassian)
+
+    # --- updated_at pre-check: one cheap API call before fetching the full issue ---
+    if not args.force:
+        current_updated = fetch_issue_updated(base_url, pat, key, verify, limiter)
+        if current_updated is not None:
+            # Derive the candidate slug from the key so we can look up prior metadata.
+            # The full slug requires the summary, which we don't have yet, so we scan
+            # raw/ for any .source.json whose "key" matches this issue key.
+            prior_slug: Optional[str] = None
+            prior_meta: Optional[dict] = None
+            raw_dir = cfg.raw_dir
+            for src_file in sorted(Path(raw_dir).glob(f"{key}-*.source.json")):
+                try:
+                    with src_file.open("r", encoding="utf-8") as f:
+                        candidate = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if candidate.get("key") == key:
+                    prior_slug = src_file.stem.replace(".source", "")
+                    prior_meta = candidate
+                    break
+            if prior_meta is not None:
+                stored_updated = prior_meta.get("updated_at", "")
+                if stored_updated and stored_updated == current_updated:
+                    summary_title = prior_meta.get("title", key)
+                    summary = {
+                        "slug": prior_slug,
+                        "title": summary_title,
+                        "raw_md": str(Path(raw_dir) / f"{prior_slug}.md"),
+                        "source_json": str(Path(raw_dir) / f"{prior_slug}.source.json"),
+                        "image_hints": prior_meta.get("image_hints", []),
+                        "status": "unchanged",
+                        "content_sha256": prior_meta.get("content_sha256", ""),
+                        "updated_at": current_updated,
+                        "note": f"updated_at unchanged ({current_updated}). Pass --force to re-fetch.",
+                    }
+                    print(json.dumps(summary, indent=2, ensure_ascii=False))
+                    return 0
+
     issue = fetch_issue(base_url, pat, key, verify, limiter=limiter)
 
     title, filename_slug, markdown = build_markdown(issue)

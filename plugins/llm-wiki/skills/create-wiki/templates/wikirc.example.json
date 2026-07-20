@@ -3,6 +3,11 @@
   "raw_dir": "raw",
   "wiki_dir": "wiki",
   "auto_commit": true,
+  "auto_push": false,
+  "git": {
+    "remote": "origin",
+    "branch": ""
+  },
   "atlassian": {
     "confluence_base_url": "https://your-confluence.example.com",
     "jira_base_url": "https://your-jira.example.com",
@@ -22,6 +27,14 @@
     "rate_limit_rps": 1,
     "burst": 2,
     "max_retries": 3,
+    "retry_base_delay_seconds": 2
+  },
+  "slack": {
+    "token": "xoxp-REPLACE_ME",
+    "verify_ssl": true,
+    "rate_limit_rps": 1,
+    "burst": 3,
+    "max_retries": 5,
     "retry_base_delay_seconds": 2
   }
 }

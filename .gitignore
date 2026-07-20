@@ -1,0 +1,11 @@
+# Python bytecode caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtualenvs
+.venv/
+venv/
+
+# OS cruft
+.DS_Store

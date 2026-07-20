@@ -129,21 +129,23 @@ def run_script(script_name: str, args: list[str]) -> dict:
         return {"stdout": stdout}
 
 
-def dispatch_fetch(source_type: str, source: str, wiki_root: Path) -> dict:
+def dispatch_fetch(source_type: str, source: str, wiki_root: Path, force: bool = False) -> dict:
     if source_type == "confluence":
+        extra = ["--force"] if force else []
         return run_script(
             "fetch_confluence.py",
-            ["--wiki-root", str(wiki_root), "--url", source],
+            ["--wiki-root", str(wiki_root), "--url", source, *extra],
         )
     if source_type == "jira":
+        extra = ["--force"] if force else []
         if JIRA_KEY_RE.match(source):
             return run_script(
                 "fetch_jira.py",
-                ["--wiki-root", str(wiki_root), "--key", source],
+                ["--wiki-root", str(wiki_root), "--key", source, *extra],
             )
         return run_script(
             "fetch_jira.py",
-            ["--wiki-root", str(wiki_root), "--url", source],
+            ["--wiki-root", str(wiki_root), "--url", source, *extra],
         )
     if source_type == "local":
         return run_script(
@@ -192,6 +194,39 @@ def git_commit(wiki_root: Path, message: str) -> Optional[str]:
         check=True,
     )
     return show.stdout.strip()
+
+
+def git_push(wiki_root: Path, cfg) -> Optional[str]:
+    """Push to configured remote. Returns "pushed" or None on skip/failure.
+
+    Skips silently when no remote is configured. Warns but does not raise on
+    push failure so the local commit is always preserved.
+    """
+    remote = cfg.git_remote()
+    branch = cfg.git_branch()
+
+    check = subprocess.run(
+        ["git", "-C", str(wiki_root), "remote"],
+        capture_output=True,
+        text=True,
+    )
+    remotes = [r for r in check.stdout.strip().splitlines() if r]
+    if remote not in remotes:
+        return None  # no remote configured — skip silently
+
+    cmd = ["git", "-C", str(wiki_root), "push", remote]
+    if branch:
+        cmd.append(branch)
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return "pushed"
+    except subprocess.CalledProcessError as e:
+        print(
+            f"WARNING: git push to '{remote}' failed: {e.stderr.strip() or e}",
+            file=sys.stderr,
+        )
+        return None
 
 
 def _looks_like_placeholder(value: str) -> bool:
@@ -443,11 +478,20 @@ def _cmd_commit_only(args: argparse.Namespace) -> int:
     if not is_git_repo(wiki_root):
         print(f"ERROR: {wiki_root} is not a git repository", file=sys.stderr)
         return 1
+
+    try:
+        cfg = load_config(wiki_root)
+    except ConfigError:
+        cfg = None  # type: ignore[assignment]
+
     message = args.message or (
         f"ingest: {args.slug} ({args.new_images} new, {args.changed_images} changed images)"
     )
     commit = git_commit(wiki_root, message)
-    print(json.dumps({"commit": commit, "message": message}, indent=2))
+    result: dict = {"commit": commit, "message": message}
+    if commit and cfg is not None and cfg.auto_push:
+        result["pushed"] = git_push(wiki_root, cfg)
+    print(json.dumps(result, indent=2))
     return 0
 
 
@@ -471,7 +515,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
         return 1
 
     source_type = detect_source_type(args.source, wiki_root)
-    fetch_summary = dispatch_fetch(source_type, args.source, wiki_root)
+    fetch_summary = dispatch_fetch(source_type, args.source, wiki_root, force=args.force)
     slug = fetch_summary.get("slug")
     if not slug:
         print(f"ERROR: fetcher for {source_type} did not report a slug", file=sys.stderr)
@@ -534,6 +578,8 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
         )
         commit_hash = git_commit(wiki_root, message)
         result["committed"] = {"commit": commit_hash, "message": message}
+        if commit_hash and cfg.auto_push:
+            result["pushed"] = git_push(wiki_root, cfg)
     else:
         result["committed"] = None
         result["note"] = (

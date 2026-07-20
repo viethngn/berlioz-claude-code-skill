@@ -66,6 +66,9 @@ path it will take so scope is confirmed.
 | `--cql "…"` | Bulk Confluence CQL |
 | `--jql "…"` | Bulk Jira JQL |
 | `--resume <job-id>` | Resume a prior bulk job |
+| `--slack-channel CHANNEL` or `--channel CHANNEL` with `fetch_slack.py` | Slack channel |
+| `--slack-search "QUERY"` or `--search "QUERY"` with `fetch_slack.py` | Slack search results |
+| `--slack-thread CHANNEL THREAD_TS` or `--channel`+`--thread-ts` | Slack thread |
 
 Explicit flags win over URL heuristics. A URL that matches both "single
 page" and "space" resolves to single (the `/pages/` segment wins).
@@ -85,6 +88,22 @@ and wall time). Before running a bulk job, tell the user:
 If they say yes, proceed. If they'd rather scope down, offer `--cql`
 with a `label=…` or `updated > …` filter.
 
+## Resolving the Python interpreter
+
+Before running any script, resolve the correct Python binary. The llm-wiki
+deps live in a dedicated venv (`~/.llm-wiki-venv` by default):
+
+```bash
+_LLMWIKI_VENV="${LLMWIKI_VENV:-${HOME}/.llm-wiki-venv}"
+if [ -x "${_LLMWIKI_VENV}/bin/python3" ]; then
+  WIKI_PY="${_LLMWIKI_VENV}/bin/python3"
+else
+  WIKI_PY="${PYTHON:-python3}"
+fi
+```
+
+Use `${WIKI_PY}` instead of `python3` in all script invocations below.
+
 ## Single-item workflow
 
 Follow these phases in order. `${SKILL_DIR}` refers to the directory
@@ -94,7 +113,7 @@ containing this file. `${WIKI_ROOT}` is the wiki directory (contains
 ### Phase 1 — Detect and fetch the source
 
 ```bash
-python3 "${SKILL_DIR}/scripts/ingest.py" \
+${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
   --wiki-root "${WIKI_ROOT}" \
   --source "<Confluence URL | Jira key | local file path>"
 ```
@@ -133,7 +152,7 @@ For each page you touch:
 - Append an entry to `wiki/log.md` with the date, source name, and what
   changed.
 
-### Phase 4 — Commit to git
+### Phase 4 — Commit (and optionally push) to git
 
 `ingest.py` handles this when `auto_commit=true` (the default). Or call
 `ingest.py --commit-only --slug ...`. Commit message format:
@@ -141,6 +160,88 @@ For each page you touch:
 ```
 ingest: <slug> (N new, M changed images)
 ```
+
+If `auto_push: true` in `.wikirc.json`, `ingest.py` pushes to the configured
+remote after the commit. Push failures warn but do not fail the ingest — the
+local commit is always preserved. Credential resolution is delegated to Git
+(SSH key, macOS Keychain, `git-credential-store`).
+
+## Slack workflow
+
+Slack content is fetched entirely by `fetch_slack.py` via the Slack Web API —
+zero Claude token usage at fetch time. Claude only does wiki synthesis, same
+as any other source.
+
+**Diff strategy**: each run produces a slug encoding the **exact message date
+range** (e.g. `slack-general-20260701-20260720`). Re-running the same slug
+triggers the SHA-256 content-diff gate — if nothing changed, it returns
+`"unchanged"` without writing anything or committing. Without `--after`, the
+script auto-increments from the last `fetched_until` timestamp, so a plain
+`/ingest --slack-channel general` always fetches only new messages.
+
+### Phase 1 — Run fetch_slack.py
+
+```bash
+# Channel (new messages since last fetch by default):
+${WIKI_PY} "${SKILL_DIR}/scripts/fetch_slack.py" \
+  --wiki-root "${WIKI_ROOT}" \
+  --channel "general"
+
+# Explicit date window:
+${WIKI_PY} "${SKILL_DIR}/scripts/fetch_slack.py" \
+  --wiki-root "${WIKI_ROOT}" \
+  --channel "general" --after 2026-07-01 --before 2026-07-20
+
+# Single thread:
+${WIKI_PY} "${SKILL_DIR}/scripts/fetch_slack.py" \
+  --wiki-root "${WIKI_ROOT}" \
+  --channel "general" --thread-ts "1234567890.123456"
+
+# Search:
+${WIKI_PY} "${SKILL_DIR}/scripts/fetch_slack.py" \
+  --wiki-root "${WIKI_ROOT}" \
+  --search "topic:decision after:2026-07-01"
+```
+
+Parse the JSON summary: `{"slug", "status", "title", "message_count", "date_range"}`.
+
+If `status == "unchanged"` → no new messages since last fetch. Tell the user and
+skip synthesis. Nothing to commit.
+
+**Whole-channel ingest**: by default there is no message cap — the script
+paginates the entire window (respecting Slack's Retry-After on 429 via the
+shared rate limiter). Pass `--limit N` only as a safety cap. If a positive
+`--limit` is hit, the script keeps the **newest** N messages, sets
+`"truncated": true` in the JSON, and prints a `WARNING:` to stderr. The
+incremental watermark then advances to the newest message fetched, so the
+skipped older messages fall **below** the watermark — a plain incremental re-run
+will not pick them up. When you see `truncated`, you must tell the user older
+messages were skipped and backfill the earlier range explicitly with
+`--before <first-fetched-date> --limit 0` before continuing. Prefer leaving
+`--limit` unset (no cap) for whole-channel ingest so this never happens.
+
+### Phase 2 — Review takeaways with the user
+
+Read `raw/<slug>.md`. Summarize the key discussion points, decisions, or topics.
+Wait for confirmation before writing wiki pages.
+
+### Phase 3 — Update wiki pages + commit
+
+Follow the standard wiki-update rules (page template, `[[wiki-links]]`,
+citations, `wiki/index.md`, `wiki/log.md`). Commit message format:
+
+```
+ingest: <slug> (<N> messages, <date-range>)
+```
+
+Use `--commit-only` to commit after synthesis:
+
+```bash
+${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
+  --wiki-root "${WIKI_ROOT}" --commit-only --slug "<slug>"
+```
+
+If `auto_push: true`, the push happens automatically after the commit.
 
 ## Bulk workflow
 
@@ -154,7 +255,7 @@ Run the orchestrator with a bulk source. It will invoke `discover.py`
 each item, downloading images, describing new/changed images).
 
 ```bash
-python3 "${SKILL_DIR}/scripts/ingest.py" \
+${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
   --wiki-root "${WIKI_ROOT}" \
   --space FOO
 # or:
@@ -176,7 +277,7 @@ or `unchanged`). Pass `--replace` to discard the old queue and start fresh.
 consecutive item failures), the queue is safe on disk. Resume with:
 
 ```bash
-python3 "${SKILL_DIR}/scripts/ingest.py" \
+${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
   --wiki-root "${WIKI_ROOT}" \
   --resume "<job-id>"
 ```
@@ -189,7 +290,7 @@ another attempt.
 After prefetch completes, print the queue counts:
 
 ```bash
-python3 "${SKILL_DIR}/scripts/queue_admin.py" --wiki-root "${WIKI_ROOT}" show <job-id>
+${WIKI_PY} "${SKILL_DIR}/scripts/queue_admin.py" --wiki-root "${WIKI_ROOT}" show <job-id>
 ```
 
 Tell the user:
@@ -211,7 +312,7 @@ For each item with `raw_status in {done, unchanged}` and
 3. Mark the item done:
 
     ```bash
-    python3 "${SKILL_DIR}/scripts/queue_admin.py" --wiki-root "${WIKI_ROOT}" \
+    ${WIKI_PY} "${SKILL_DIR}/scripts/queue_admin.py" --wiki-root "${WIKI_ROOT}" \
       mark <job-id> --ref <ref> --wiki-done
     ```
 
@@ -224,7 +325,7 @@ If the user asks to skip an item (e.g., a draft page), mark it with
 ### Bulk Phase 4 — Final report
 
 ```bash
-python3 "${SKILL_DIR}/scripts/queue_admin.py" --wiki-root "${WIKI_ROOT}" show <job-id>
+${WIKI_PY} "${SKILL_DIR}/scripts/queue_admin.py" --wiki-root "${WIKI_ROOT}" show <job-id>
 ```
 
 Tell the user how many items are done, skipped, and (if any) still

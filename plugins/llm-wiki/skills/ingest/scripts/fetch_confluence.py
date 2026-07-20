@@ -34,7 +34,7 @@ from markdownify import markdownify
 
 from config import ConfigError, apply_ssl_env, load_config
 from rate_limiter import RateLimitFailure, get_limiter
-from raw_store import write_raw_if_changed
+from raw_store import read_previous_source_metadata, write_raw_if_changed
 
 
 _slug_re = re.compile(r"[^\w\-]+", re.UNICODE)
@@ -66,15 +66,12 @@ def extract_page_id(url_or_id: str) -> Optional[str]:
     return None
 
 
-def fetch_page(base_url: str, pat: str, page_id: str, verify: bool, limiter=None) -> dict:
+def _api_get(base_url: str, pat: str, page_id: str, expand: str, verify: bool, limiter) -> dict:
     url = f"{base_url}/rest/api/content/{page_id}"
-    params = {"expand": "body.storage,version,space,ancestors"}
     headers = {"Authorization": f"Bearer {pat}", "Accept": "application/json"}
-    if limiter is None:
-        limiter = get_limiter("atlassian", None)
     try:
         resp = limiter.request(
-            "GET", url, headers=headers, params=params, verify=verify, timeout=60
+            "GET", url, headers=headers, params={"expand": expand}, verify=verify, timeout=60
         )
     except RateLimitFailure as e:
         raise SystemExit(f"ERROR: {e}")
@@ -92,6 +89,17 @@ def fetch_page(base_url: str, pat: str, page_id: str, verify: bool, limiter=None
         )
     resp.raise_for_status()
     return resp.json()
+
+
+def fetch_page_version(base_url: str, pat: str, page_id: str, verify: bool, limiter) -> dict:
+    """Cheap pre-check: fetch only title + version (no body)."""
+    return _api_get(base_url, pat, page_id, "version", verify, limiter)
+
+
+def fetch_page(base_url: str, pat: str, page_id: str, verify: bool, limiter=None) -> dict:
+    if limiter is None:
+        limiter = get_limiter("atlassian", None)
+    return _api_get(base_url, pat, page_id, "body.storage,version,space,ancestors", verify, limiter)
 
 
 def normalize_storage(
@@ -152,6 +160,7 @@ def main() -> int:
     parser.add_argument("--wiki-root", type=Path, required=True)
     parser.add_argument("--url", help="Confluence page URL")
     parser.add_argument("--page-id", help="Confluence page ID (numeric)")
+    parser.add_argument("--force", action="store_true", help="Skip version pre-check and re-fetch")
     args = parser.parse_args()
 
     if not args.url and not args.page_id:
@@ -190,6 +199,33 @@ def main() -> int:
 
     verify = cfg.atlassian_verify_ssl()
     limiter = get_limiter("atlassian", cfg.atlassian)
+
+    # --- Version pre-check: one cheap API call before fetching the full body ---
+    if not args.force:
+        version_data = fetch_page_version(base_url, pat, page_id, verify, limiter)
+        current_version = (version_data.get("version") or {}).get("number")
+        # Determine what slug would be used to find any prior source.json.
+        # We need at least the title for slugification; it's available here.
+        tentative_title = version_data.get("title") or f"Confluence Page {page_id}"
+        tentative_slug = slugify(tentative_title)
+        prior_meta = read_previous_source_metadata(cfg.raw_dir, tentative_slug)
+        if prior_meta is not None and current_version is not None:
+            stored_version = prior_meta.get("version_number")
+            if stored_version is not None and int(current_version) == int(stored_version):
+                summary = {
+                    "slug": tentative_slug,
+                    "title": tentative_title,
+                    "raw_md": str(cfg.raw_dir / f"{tentative_slug}.md"),
+                    "source_json": str(cfg.raw_dir / f"{tentative_slug}.source.json"),
+                    "image_hints": prior_meta.get("image_hints", []),
+                    "status": "unchanged",
+                    "content_sha256": prior_meta.get("content_sha256", ""),
+                    "version_number": current_version,
+                    "note": f"Version {current_version} unchanged since last ingest. Pass --force to re-fetch.",
+                }
+                print(json.dumps(summary, indent=2, ensure_ascii=False))
+                return 0
+
     page = fetch_page(base_url, pat, page_id, verify, limiter=limiter)
 
     title = page.get("title") or f"Confluence Page {page_id}"
