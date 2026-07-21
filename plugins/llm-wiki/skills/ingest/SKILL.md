@@ -2,9 +2,9 @@
 name: ingest
 description: |
   Ingests one or many sources — a Confluence page URL, a Jira issue URL or
-  key, a local file (Markdown, plain text, HTML, PDF, DOCX, or an image),
-  a whole Confluence space, a Confluence CQL query, or a Jira JQL query —
-  into an LLM wiki. The skill auto-detects single-item vs bulk from the
+  key, a local file (Markdown, plain text, HTML, PDF, DOCX, XLSX, CSV, PPTX,
+  or an image), a whole Confluence space, a Confluence CQL query, or a Jira
+  JQL query — into an LLM wiki. The skill auto-detects single-item vs bulk from the
   source shape or explicit flags. It fetches content, extracts embedded
   images, describes only new-or-changed images via a nano-banana-pro-
   compatible vision endpoint, writes raw sources + wiki pages, and commits
@@ -378,8 +378,16 @@ failed. Offer to `/ingest --resume <job-id>` for failures.
   - `raw/<slug>.md` — Markdown-converted source content
   - `raw/<slug>.source.json` — stable metadata:
     `{ "type", "url" or "path", "title", "content_sha256", "source_sha256"
-    (local only), "image_hints", "version_number" (Confluence), "updated_at"
-    (Jira) }`. **No wall-clock timestamps.**
+    (local only), "original_filename"/"original_path" (local only),
+    "image_hints", "version_number" (Confluence), "updated_at" (Jira) }`.
+    For local files `path` is the **relative** in-wiki copy
+    (`raw/<slug><ext>`), never an external absolute path. **No wall-clock
+    timestamps.**
+  - `raw/<slug>.<ext>` — for **local** ingests, the original file copied into
+    the wiki (same stem as the `.md`). Documents/spreadsheets/presentations are
+    **committed** (wiki stays self-contained + diffable); image/video/audio
+    originals are **git-ignored** (kept local). `source_sha256` hashes this
+    copy, so diffs survive the external original moving or being deleted.
   - `raw/images/<slug>/<n>.<ext>` — downloaded image bytes. **Git-ignored,
     kept local only** (large binaries; re-downloaded fresh each ingest).
   - `raw/images/<slug>/<n>.md` — nano-banana-pro description. **Committed** —
@@ -397,13 +405,17 @@ failed. Offer to `/ingest --resume <job-id>` for failures.
   - Image **byte files** under `raw/images/**/*.{png,jpg,jpeg,gif,webp,bmp}`
     are ignored too — they're re-downloaded each ingest, so only their
     `.md` descriptions and `.manifest.json` need to persist in git.
+  - Copied-in **media** originals at the raw root
+    (`raw/*.{png,jpg,…,mp4,mov,mp3,…}`) are ignored — local only. Copied-in
+    **documents/spreadsheets/presentations** are NOT ignored (committed).
   - All git-ignored via the template `.gitignore`.
 - **Content diff gate (Layer 1)**: each fetcher computes a SHA-256 over the
   rendered Markdown. If it matches the previous `content_sha256`, the
   fetcher returns `status="unchanged"` and does not rewrite `raw/<slug>.md`
   or `raw/<slug>.source.json`. `fetch_local.py` also fast-paths on
-  `source_sha256` (the raw file bytes) to avoid re-parsing PDFs/DOCX. In
-  bulk mode, unchanged items skip the image and description steps.
+  `source_sha256` (the SHA of the copied-in `raw/<slug><ext>`, not the external
+  original) to avoid re-parsing PDFs/DOCX. In bulk mode, unchanged items skip
+  the image and description steps.
 - **Orchestrator gate (Layer 2)**: when the fetcher reports `unchanged`,
   `ingest.py` skips image download, image description, and the git commit.
   Only `.wiki-state/last-fetched.json` is updated. Pass `--force` to
@@ -459,8 +471,11 @@ All scripts respond to `--help` with their full argument list.
   do not create an empty raw file.
 - **Jira ticket not found or 403**: surface the API status code to the
   user and suggest checking the PAT.
-- **Local file type unsupported** (e.g. `.xlsx`): skill exits with a list
-  of supported types. Suggest exporting to PDF or Markdown.
+- **Local file type unsupported** (e.g. legacy binary `.xls`/`.ppt`/`.doc`):
+  the original is still copied into `raw/` and versioned; the `.md` is a
+  placeholder telling you to synthesize wiki content directly from the
+  source file. Suggest exporting to `.xlsx`/`.pptx`/`.docx`/`.pdf`/`.md` for
+  native parsing.
 - **Image URL is authenticated** (Confluence attachment): the fetcher
   passes the Confluence PAT when downloading images from the same host.
 - **`nano_banana.api_key` empty or placeholder**: image description is

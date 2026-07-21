@@ -24,6 +24,8 @@ PIP_NAMES: Mapping[str, str] = {
     "bs4": "beautifulsoup4",
     "pypdf": "pypdf",
     "docx": "python-docx",
+    "openpyxl": "openpyxl",
+    "pptx": "python-pptx",
     "google.genai": "google-genai",
     "PIL": "pillow",
 }

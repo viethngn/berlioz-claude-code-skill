@@ -56,6 +56,8 @@ check_pkg markdownify       "markdownify"
 check_pkg bs4               "beautifulsoup4"
 check_pkg pypdf             "pypdf"
 check_pkg docx              "python-docx"
+check_pkg openpyxl          "openpyxl"
+check_pkg pptx              "python-pptx"
 check_pkg google.genai      "google-genai"
 check_pkg PIL               "pillow"
 

@@ -7,6 +7,9 @@ Supported formats:
     .html / .htm     - markdownify
     .pdf             - pypdf text extraction
     .docx            - python-docx paragraphs + tables
+    .xlsx            - openpyxl sheets as tables
+    .csv             - stdlib csv as a single table
+    .pptx            - python-pptx slide text + tables
     .png/.jpg/.webp/.gif - the file IS the source (goes straight to raw/images/)
 
 Usage:
@@ -16,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import re
@@ -48,6 +52,29 @@ def slugify(name: str) -> str:
     lowered = ascii_only.lower().strip()
     dashed = _slug_re.sub("-", lowered).strip("-")
     return dashed or "untitled"
+
+
+def sanitize_cell(value) -> str:
+    """Stringify a table cell (openpyxl values can be None/int/float/datetime)."""
+    text = "" if value is None else str(value)
+    return text.replace("\n", " ").replace("|", "\\|").strip()
+
+
+def render_table(rows: list[list[str]]) -> list[str]:
+    """Render rows of sanitized cell strings as a GitHub-flavored Markdown table.
+
+    Rows are padded to the widest row's length so jagged input (e.g. CSV rows
+    with missing trailing fields) doesn't misalign columns.
+    """
+    if not rows:
+        return []
+    width = max(len(r) for r in rows)
+    padded = [r + [""] * (width - len(r)) for r in rows]
+    col_widths = [max(len(c) for c in col) for col in zip(*padded)]
+    header = "| " + " | ".join(padded[0]) + " |"
+    sep = "|" + "|".join("-" * (w + 2) for w in col_widths) + "|"
+    body_rows = ["| " + " | ".join(r) + " |" for r in padded[1:]]
+    return [header, sep, *body_rows]
 
 
 def parse_md(path: Path) -> tuple[str, list[Path]]:
@@ -198,6 +225,120 @@ def parse_docx(path: Path, images_dir: Path) -> tuple[str, list[Path]]:
     return body, saved_images
 
 
+def parse_xlsx(path: Path, images_dir: Path) -> tuple[str, list[Path]]:
+    require(["openpyxl"])
+    import openpyxl
+
+    wb = openpyxl.load_workbook(str(path), data_only=True)
+    parts: list[str] = []
+
+    for ws in wb.worksheets:
+        parts.append(f"## {ws.title}")
+        rows = [
+            [sanitize_cell(c) for c in row] for row in ws.iter_rows(values_only=True)
+        ]
+        # Some sheets are blank section dividers — render the heading only.
+        if any(cell for row in rows for cell in row):
+            parts.append("")
+            parts.extend(render_table(rows))
+        parts.append("")
+
+    saved_images: list[Path] = []
+    idx = 0
+    with zipfile.ZipFile(path) as z:
+        media_entries = sorted(n for n in z.namelist() if n.startswith("xl/media/"))
+        for name in media_entries:
+            ext = Path(name).suffix.lower() or ".png"
+            if ext not in IMAGE_EXTS:
+                continue
+            data = z.read(name)
+            images_dir.mkdir(parents=True, exist_ok=True)
+            image_path = images_dir / f"{idx}{ext}"
+            image_path.write_bytes(data)
+            saved_images.append(image_path)
+            idx += 1
+
+    title = path.stem.replace("-", " ").replace("_", " ").title()
+    body = f"# {title}\n\n" + "\n".join(parts).strip() + "\n"
+    return body, saved_images
+
+
+def parse_csv(path: Path, images_dir: Path) -> tuple[str, list[Path]]:
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+        sample = f.read(4096)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        rows = [[sanitize_cell(c) for c in row] for row in csv.reader(f, dialect)]
+
+    title = path.stem.replace("-", " ").replace("_", " ").title()
+    table = render_table(rows)
+    body = f"# {title}\n\n" + "\n".join(table).strip() + "\n"
+    return body, []
+
+
+def parse_pptx(path: Path, images_dir: Path) -> tuple[str, list[Path]]:
+    require(["pptx"])
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    prs = Presentation(str(path))
+    parts: list[str] = []
+    saved_images: list[Path] = []
+    idx = 0
+
+    for slide_num, slide in enumerate(prs.slides, start=1):
+        title_shape = slide.shapes.title
+        title_text = ""
+        if title_shape is not None and title_shape.has_text_frame:
+            title_text = title_shape.text_frame.text.strip()
+        title_id = title_shape.shape_id if title_shape is not None else None
+
+        heading = f"## Slide {slide_num}" + (f": {title_text}" if title_text else "")
+        parts.append(heading)
+        parts.append("")
+
+        for shape in slide.shapes:
+            if shape.shape_id == title_id:
+                continue  # already used as the slide heading
+            if shape.has_table:
+                rows = [
+                    [sanitize_cell(cell.text) for cell in row.cells]
+                    for row in shape.table.rows
+                ]
+                parts.extend(render_table(rows))
+                parts.append("")
+            elif shape.has_text_frame:
+                text = shape.text_frame.text.strip()
+                for line in text.splitlines():
+                    line = line.strip()
+                    if line:
+                        parts.append(f"- {line}")
+                if text:
+                    parts.append("")
+            elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                try:
+                    image = shape.image
+                except ValueError:
+                    # Linked (not embedded) image, or a picture placeholder
+                    # with no image part yet — nothing to extract.
+                    continue
+                ext = f".{image.ext}" if image.ext else ".png"
+                if ext not in IMAGE_EXTS:
+                    ext = ".png"
+                images_dir.mkdir(parents=True, exist_ok=True)
+                image_path = images_dir / f"{idx}{ext}"
+                image_path.write_bytes(image.blob)
+                saved_images.append(image_path)
+                idx += 1
+
+    title = path.stem.replace("-", " ").replace("_", " ").title()
+    body = f"# {title}\n\n" + "\n".join(parts).strip() + "\n"
+    return body, saved_images
+
+
 def parse_image(
     path: Path, slug: str, raw_dir: Path
 ) -> tuple[str, list[Path]]:
@@ -226,7 +367,13 @@ PARSERS = {
     ".htm": ("html", parse_html),
     ".pdf": ("pdf", parse_pdf),
     ".docx": ("docx", parse_docx),
+    ".xlsx": ("xlsx", parse_xlsx),
+    ".csv": ("csv", parse_csv),
+    ".pptx": ("pptx", parse_pptx),
 }
+
+# Parsers that take (path, images_dir) and may extract embedded images.
+IMAGE_CAPABLE_KINDS = {"pdf", "docx", "xlsx", "pptx"}
 
 
 def hash_source_file(path: Path) -> str:
@@ -246,6 +393,24 @@ def read_previous_source_sha(raw_dir: Path, slug: str) -> Optional[str]:
             return json.load(f).get("source_sha256")
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def copy_into_raw(source: Path, raw_dir: Path, slug: str, ext: str) -> Path:
+    """Copy the original file into raw/<slug><ext> and return the copy's path.
+
+    This makes the wiki self-contained: the diff check (source_sha256) and any
+    re-parse read the copy, not the external original — so a moved or deleted
+    original never breaks re-ingest, and a fresh clone owns its sources.
+
+    Idempotent: if `source` already IS the copy (re-ingesting the in-raw file),
+    the copy is skipped. `ext` is lowercased for a stable filename.
+    """
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    dest = raw_dir / f"{slug}{ext.lower()}"
+    if source.resolve() == dest.resolve():
+        return dest  # already the copy — nothing to do
+    shutil.copyfile(source, dest)
+    return dest
 
 
 def main() -> int:
@@ -271,12 +436,35 @@ def main() -> int:
     raw_dir = cfg.raw_dir
     raw_dir.mkdir(parents=True, exist_ok=True)
     images_dir = raw_dir / "images" / slug
+    original_filename = source.name
+    original_path = str(source)
 
-    source_sha = hash_source_file(source)
+    # Copy the original into raw/ so the wiki owns its source and the diff check
+    # never depends on the external file. Two extensions are exempt from the
+    # root copy:
+    #   - Images: they have a dedicated home (raw/images/<slug>/) via parse_image.
+    #   - Markdown: the rendered raw/<slug>.md IS the faithful in-wiki copy, so a
+    #     separate raw/<slug>.md copy would collide with write_raw_if_changed's
+    #     own output. (.txt renders to .md, so no collision — it's still copied.)
+    is_image = ext in IMAGE_EXTS
+    is_markdown = ext in {".md", ".markdown"}
+    if is_image:
+        parse_source = source
+        rel_path = None  # set after parse_image copies it
+    elif is_markdown:
+        parse_source = source
+        rel_path = f"{raw_dir.name}/{slug}.md"  # the rendered file is the copy
+    else:
+        parse_source = copy_into_raw(source, raw_dir, slug, ext)
+        rel_path = f"{raw_dir.name}/{parse_source.name}"
+
+    # Hash the copied-in file (or the image original) — the diff baseline is the
+    # artifact the wiki owns, not the external path.
+    source_sha = hash_source_file(parse_source)
     prior_sha = read_previous_source_sha(raw_dir, slug)
 
     if prior_sha == source_sha:
-        # Fast-path: the local file's bytes haven't changed since last ingest.
+        # Fast-path: the source bytes haven't changed since last ingest.
         # Don't re-parse (PDF/DOCX parsing is expensive), don't rewrite anything.
         md_path = raw_dir / f"{slug}.md"
         src_path = raw_dir / f"{slug}.source.json"
@@ -301,30 +489,40 @@ def main() -> int:
     saved_images: list[Path] = []
     image_hints: list = []
 
-    if ext in IMAGE_EXTS:
-        markdown, saved_images = parse_image(source, slug, raw_dir)
+    if is_image:
+        markdown, saved_images = parse_image(parse_source, slug, raw_dir)
         kind = "image"
+        # parse_image copied the bytes into raw/images/<slug>/0<ext>.
+        rel_path = f"{raw_dir.name}/images/{slug}/{saved_images[0].name}"
     elif ext in PARSERS:
         kind, parser_fn = PARSERS[ext]
-        if kind in {"pdf", "docx"}:
-            markdown, saved_images = parser_fn(source, images_dir)
+        if kind in IMAGE_CAPABLE_KINDS or kind == "csv":
+            markdown, saved_images = parser_fn(parse_source, images_dir)
         elif kind == "html":
-            markdown, image_hints = parser_fn(source)
+            markdown, image_hints = parser_fn(parse_source)
         else:
-            markdown, _ = parser_fn(source)
+            markdown, _ = parser_fn(parse_source)
     else:
-        supported = sorted(set(list(PARSERS.keys()) + sorted(IMAGE_EXTS)))
-        print(
-            f"ERROR: unsupported extension {ext}. Supported: {', '.join(supported)}",
-            file=sys.stderr,
+        # No parser for this extension (e.g. legacy binary .xls/.ppt/.doc). The
+        # original is still copied into raw/ and versioned; Claude synthesizes
+        # the .md from it. Emit a minimal placeholder body so the raw artifact
+        # is self-describing.
+        kind = ext.lstrip(".") or "file"
+        title = source.stem.replace("-", " ").replace("_", " ").title()
+        markdown = (
+            f"# {title}\n\n"
+            f"_Original file: `{rel_path}` "
+            f"({original_filename}). No text extractor for `{ext}` — "
+            f"synthesize wiki content directly from the source file._\n"
         )
-        return 1
 
     metadata = {
         "type": "local",
         "kind": kind,
-        "path": str(source),
-        "filename": source.name,
+        "path": rel_path,
+        "filename": original_filename,
+        "original_filename": original_filename,
+        "original_path": original_path,
         "source_sha256": source_sha,
         "image_hints": image_hints,
     }

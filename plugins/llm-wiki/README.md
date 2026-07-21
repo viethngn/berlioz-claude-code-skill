@@ -3,8 +3,9 @@
 Three skills for maintaining a personal LLM knowledge wiki, backed by git.
 
 - **`/ingest`** — Pull content from a Confluence page, Jira issue, local file
-  (Markdown, HTML, PDF, DOCX, image), **or** Slack channel / thread / search
-  results, **or** bulk-ingest a whole Confluence space / CQL query / JQL query.
+  (Markdown, HTML, PDF, DOCX, XLSX, CSV, PPTX, image — all parsed natively, no
+  model dependency), **or** Slack channel / thread / search results, **or**
+  bulk-ingest a whole Confluence space / CQL query / JQL query.
   The skill auto-detects single vs bulk from the source shape or explicit flags.
   Extracts embedded images, describes them via a nano-banana-pro-compatible
   vision endpoint **only when they change**, and updates the wiki. Bulk mode
@@ -176,6 +177,21 @@ private channels you have access to.
 > /ingest ~/Documents/spec.pdf
 >
 > /ingest ~/Downloads/notes.docx
+>
+> /ingest ~/Downloads/budget.xlsx
+>
+> /ingest ~/Downloads/deck.pptx
+
+`.pdf`, `.docx`, `.xlsx`, `.csv`, and `.pptx` are all parsed **natively** —
+text, tables, and embedded images are extracted deterministically, with no AI
+model in the loop. (Legacy binary `.xls`/`.ppt`/`.doc` have no native parser
+and fall back to model-assisted synthesis.)
+
+The original file is **copied into `raw/<slug>.<ext>`** so the wiki owns its
+source: the diff check hashes that copy (not the external path), so re-ingest
+keeps working even if the original moves or is deleted. Documents, spreadsheets,
+and presentations are committed; image/video/audio originals are copied but
+git-ignored (kept local).
 
 ### Bulk-ingest a whole Confluence space
 
@@ -354,7 +370,8 @@ my-wiki/
 ├── CLAUDE.md                 # wiki system prompt
 ├── raw/                      # immutable ingested sources
 │   ├── <slug>.md             # rendered Markdown
-│   ├── <slug>.source.json    # stable metadata: URL/path, title, content_sha256, image_hints (NO fetched_at)
+│   ├── <slug>.source.json    # stable metadata: rel path, title, content_sha256, source_sha256, image_hints (NO fetched_at)
+│   ├── <slug>.<ext>          # local ingests: original copied in. Docs/sheets/decks COMMITTED; media git-ignored
 │   └── images/<slug>/
 │       ├── .manifest.json    # COMMITTED — sha256 + source_url per image (SHA baseline for diffs and dedup)
 │       ├── <n>.<ext>         # git-ignored, LOCAL ONLY — image bytes, re-downloaded each ingest
@@ -376,7 +393,7 @@ my-wiki/
 - [skills/ingest/references/atlassian-api.md](skills/ingest/references/atlassian-api.md) —
   Confluence and Jira REST endpoints, PAT auth, storage-format tips.
 - [skills/ingest/references/local-files.md](skills/ingest/references/local-files.md) —
-  Per-format parsing notes (PDF, DOCX, HTML, images).
+  Per-format parsing notes (PDF, DOCX, XLSX, CSV, PPTX, HTML, images).
 - [skills/ingest/references/page-format.md](skills/ingest/references/page-format.md) —
   Wiki page template and citation rules.
 

@@ -14,6 +14,29 @@ raw/images/**/*.gif
 raw/images/**/*.webp
 raw/images/**/*.bmp
 
+# Copied-in local ORIGINALS that are media — kept local only, never committed.
+# Documents (.pdf/.docx/.txt/.md/.rtf/.html), spreadsheets (.xlsx/.xls/.csv/
+# .tsv/.ods) and presentations (.pptx/.ppt/.odp) are NOT listed here, so they
+# are committed and the wiki stays self-contained.
+raw/*.png
+raw/*.jpg
+raw/*.jpeg
+raw/*.gif
+raw/*.webp
+raw/*.bmp
+raw/*.svg
+raw/*.tiff
+raw/*.mp4
+raw/*.mov
+raw/*.avi
+raw/*.mkv
+raw/*.webm
+raw/*.mp3
+raw/*.wav
+raw/*.m4a
+raw/*.flac
+raw/*.ogg
+
 # OS junk
 .DS_Store
 Thumbs.db
