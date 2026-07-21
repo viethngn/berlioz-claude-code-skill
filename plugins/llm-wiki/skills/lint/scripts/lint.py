@@ -4,10 +4,19 @@
 Scans wiki/*.md and emits a JSON report of:
     orphans, broken_links, missing_pages, format_violations, empty_pages,
     stale_pages, unsourced_claims, status_pages, missing_sources,
-    edges (wiki-link graph)
+    empty_raw, edges (wiki-link graph)
 
 Pages carrying `**Status**: Archived` or `**Status**: Superseded by [[...]]`
 are excluded from the orphan and stale checks (intentionally retired).
+
+Pages under `wiki/archive/` are the primary archival namespace: they are NOT
+collected as active pages (so they're never re-flagged as orphan/stale), but
+their slugs ARE resolvable link targets so references into the archive don't
+read as broken links.
+
+`empty_raw` lists raw source files (`raw/<slug>.md`) whose body is empty/stub
+AND which no wiki page cites — safe-to-prune candidates. The linter only
+REPORTS them; the /lint skill deletes them after user confirmation.
 
 Usage:
     python3 lint.py --wiki-root PATH [--stale-days DAYS] [--sources]
@@ -47,6 +56,10 @@ STUB_MARKERS = (
 )
 # Status values that retire a page from orphan/stale nagging.
 RETIRED_STATUSES = ("archived", "superseded")
+# Subdirectory under wiki/ holding archived pages. Files here are NOT linted as
+# active pages, but their slugs are valid link targets (references into the
+# archive are not broken links).
+ARCHIVE_SUBDIR = "archive"
 
 
 def load_page(path: Path) -> dict:
@@ -121,6 +134,21 @@ def page_body(text: str) -> str:
     return parts[1] if len(parts) == 2 else text
 
 
+def body_after_h1(text: str) -> str:
+    """Return the text after the first H1 line (`# ...`).
+
+    Raw source files have no `---` front-matter separator — they're just an H1
+    title followed by the body — so `page_body` (which keys off `---`) would
+    count the title. This strips only the first H1 line and returns the rest,
+    which is what "empty body" means for a raw container page.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("# "):
+            return "\n".join(lines[i + 1:])
+    return text
+
+
 def slug_from_path(path: Path) -> str:
     return path.stem
 
@@ -192,8 +220,19 @@ def find_orphans(
 def find_broken_links(
     pages: List[dict],
     edges: Dict[str, List[str]],
+    archived: Optional[set] = None,
 ) -> Tuple[List[dict], Dict[str, List[str]]]:
+    """Report `[[link]]` targets that resolve to no page.
+
+    Archived pages (under `wiki/archive/`) are not in `pages`, but a link to
+    one is legitimate — so their slugs are added to the `existing` set. Both a
+    bare slug (`[[old-page]]`) and an `archive/`-prefixed slug
+    (`[[archive/old-page]]`) resolve.
+    """
+    archived = archived or set()
     existing = {slug_from_path(p["path"]) for p in pages}
+    existing |= archived
+    existing |= {f"{ARCHIVE_SUBDIR}/{s}" for s in archived}
     broken: List[dict] = []
     missing: Dict[str, List[str]] = {}
     for slug, targets in edges.items():
@@ -267,6 +306,101 @@ def find_missing_sources(pages: List[dict], raw_dir: Path) -> List[dict]:
                 {"page": slug_from_path(page["path"]), "missing": sorted(set(missing))}
             )
     return out
+
+
+def cited_raw_slugs(pages: List[dict]) -> set:
+    """Return the set of raw slugs that ANY wiki page depends on.
+
+    A raw file is "cited" if `raw/<slug>.md` (or an image under
+    `raw/images/<slug>/`) is referenced anywhere in a page's text — the Sources
+    block, an inline image link, or prose. We scan the whole page text (not just
+    Sources) so inline references also protect a raw from pruning.
+
+    Tokens are matched exactly and normalized to the slug: `raw/foo.md` →
+    `foo`, `raw/images/foo/0.png` → `foo`. Exact-token extraction avoids
+    Jira slug-prefix collisions (`proj-12` vs `proj-123`).
+    """
+    cited: set = set()
+    for page in pages:
+        for token in PATH_TOKEN_RE.findall(page["text"]):
+            token = token.strip()
+            if not token.startswith("raw/"):
+                continue
+            rest = token[len("raw/"):]
+            if rest.startswith("images/"):
+                # raw/images/<slug>/<file> → slug is the first path segment
+                parts = rest[len("images/"):].split("/", 1)
+                slug = parts[0]
+            else:
+                # raw/<slug>.md (or .source.json) → strip a trailing extension
+                first = rest.split("/", 1)[0]
+                slug = re.sub(r"\.(md|source\.json|json)$", "", first)
+            if slug:
+                cited.add(slug)
+    return cited
+
+
+def find_empty_raw(raw_dir: Path, cited: set) -> List[dict]:
+    """Report raw/<slug>.md files that are empty/stub AND uncited — prunable.
+
+    Uses the same empty/stub heuristic as `find_empty_pages` (body after the H1
+    below `EMPTY_BODY_CHARS` non-whitespace chars, or a `STUB_MARKERS` phrase).
+    A raw is only reported if its slug is NOT in `cited`, so no wiki citation is
+    ever broken. Each entry lists the companion files to delete atomically:
+    the `.md`, its `.source.json`, and (flagged) any `raw/images/<slug>/` dir.
+
+    The linter only reports; the /lint skill deletes after user confirmation.
+    """
+    if not raw_dir.exists():
+        return []
+    wiki_root = raw_dir.parent
+    raw_name = raw_dir.name
+    out: List[dict] = []
+    for p in sorted(raw_dir.glob("*.md")):
+        if not p.is_file():
+            continue
+        slug = p.stem
+        if slug in cited:
+            continue
+        text = p.read_text(encoding="utf-8", errors="replace")
+        body = body_after_h1(text)
+        lowered = body.lower()
+        marker = next((m for m in STUB_MARKERS if m in lowered), None)
+        non_ws = re.sub(r"\s+", "", body)
+        if marker:
+            reason = "stub placeholder"
+        elif len(non_ws) < EMPTY_BODY_CHARS:
+            reason = "body too short"
+        else:
+            continue
+
+        source_json = raw_dir / f"{slug}.source.json"
+        images_dir = raw_dir / "images" / slug
+        companions = [f"{raw_name}/{p.name}"]
+        if source_json.exists():
+            companions.append(f"{raw_name}/{source_json.name}")
+        out.append(
+            {
+                "slug": slug,
+                "reason": reason,
+                "char_count": len(non_ws),
+                "companions": companions,
+                "has_images_dir": images_dir.is_dir(),
+            }
+        )
+    return out
+
+
+def archived_slugs(wiki_dir: Path) -> set:
+    """Slugs of pages living under `wiki/archive/` (the archival namespace).
+
+    These are not linted as active pages, but their slugs remain valid link
+    targets so references into the archive don't read as broken links.
+    """
+    archive_dir = wiki_dir / ARCHIVE_SUBDIR
+    if not archive_dir.exists():
+        return set()
+    return {p.stem for p in archive_dir.glob("*.md") if p.is_file()}
 
 
 def find_stale(
@@ -409,23 +543,27 @@ def main() -> int:
     page_paths = collect_pages(wiki_dir)
     pages = [load_page(p) for p in page_paths]
 
+    archived = archived_slugs(wiki_dir)
     edges = build_edges(pages)
     inbound = inbound_counts(edges)
     retired = retired_slugs(pages)
     orphans = find_orphans(pages, inbound, retired)
-    broken, missing = find_broken_links(pages, edges)
+    broken, missing = find_broken_links(pages, edges, archived)
     format_violations = find_format_violations(pages)
     stale = find_stale(pages, raw_dir, args.stale_days, retired)
     unsourced = find_unsourced(pages)
     empty_pages = find_empty_pages(pages)
     status_pages = find_status_pages(pages)
     missing_sources = find_missing_sources(pages, raw_dir)
+    cited = cited_raw_slugs(pages)
+    empty_raw = find_empty_raw(raw_dir, cited)
 
     report = {
         "wiki_root": str(wiki_root),
         "wiki_dir": str(wiki_dir),
         "raw_dir": str(raw_dir),
         "page_count": len(pages),
+        "archived_count": len(archived),
         "edges": edges,
         "inbound_counts": inbound,
         "orphans": orphans,
@@ -437,6 +575,7 @@ def main() -> int:
         "unsourced_claims": unsourced,
         "status_pages": status_pages,
         "missing_sources": missing_sources,
+        "empty_raw": empty_raw,
     }
 
     if args.sources:

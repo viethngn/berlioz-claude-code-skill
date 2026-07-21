@@ -108,14 +108,20 @@ keeps the knowledge base clean so future reads always surface the latest
 information:
 
 - **Automatic structural cleanup** (no approval): delete empty/stub pages, fix
-  broken `[[links]]`, link or archive orphans, fix format violations and
-  broken `Sources` paths.
-- **Conflicts verified with the user**: contradictions and outdated facts are
-  collected into ONE report; the user confirms the resolutions before they're
-  applied.
-- **Archive, don't delete, retired knowledge**: mark outdated pages
-  `Superseded by [[current-page]]` (or `Archived`) with a banner — never touch
-  `raw/`. Retag them in `index.md`.
+  broken `[[links]]`, triage orphans (integrate valuable ones back into the
+  graph, delete duplicates, archive the rest), fix format violations and broken
+  `Sources` paths.
+- **Conflicts + raw deletions verified with the user**: contradictions,
+  outdated facts, and empty non-contributing `raw/` files proposed for deletion
+  are collected into ONE report; the user confirms before they're applied.
+- **Archive retired pages by moving them to `wiki/archive/`**: the page leaves
+  active lint scope but stays in git and linkable (references to it don't
+  break); list it under an `## Archive` section of `index.md`. (The older
+  in-place `Superseded`/`Archived` banner is still supported.)
+- **Prune empty raw sources (gated)**: title-only raw container pages that no
+  wiki page cites may be deleted (with their `.source.json` + any images dir)
+  after the user confirms. `raw/` file contents are never edited; non-empty or
+  cited raws are never deleted.
 - **Logs**: append a `## <date> (lint)` entry to `wiki/log.md`, and update
   `index.md`.
 - **Commit + push**: grouped commits per category, then push (via
@@ -123,7 +129,10 @@ information:
 
 ## Rules
 
-- Never modify anything in the `raw/` folder
+- Never edit the *contents* of anything in the `raw/` folder. The only
+  exception: `/lint` may **delete** an empty, uncited raw file after the user
+  confirms — it never modifies a raw file's content or removes a
+  non-empty/cited one.
 - Always update `wiki/index.md` and `wiki/log.md` after changes
 - Keep page names lowercase with hyphens (e.g. `machine-learning.md`)
 - Write in clear, plain language

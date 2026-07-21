@@ -43,7 +43,12 @@ Fields:
   `(source: <raw-filename>)`.
 - **Related pages**: 2-8 wiki-links, sorted alphabetically.
 
-## Status field (optional — for archiving)
+## Status field (optional — legacy in-place archiving)
+
+> The primary way `/lint` archives a retired page is now to **move it into
+> `wiki/archive/`** (see "Archiving vs. deleting" below). The `**Status**`
+> banner described here is still parsed and supported for backward-compat and
+> for cases where you want to keep a page in place while flagging it.
 
 Pages are `Active` by default and carry **no** `Status` line. When a page's
 knowledge is retired or replaced, add an optional `**Status**:` line immediately
@@ -70,13 +75,21 @@ redirected to the current information:
 
 ### Archiving vs. deleting
 
-- **Never edit `raw/`.** It is the immutable source record. Archival happens only
-  in `wiki/`.
-- Prefer **superseding by banner + status** over deleting a page that has
-  historical value — the banner guarantees future reads (human or Claude) land
-  on the current page.
-- Genuinely empty or duplicate pages with no historical value are deleted by
-  `/lint` (git keeps the history).
+- **Never edit `raw/` file contents.** A raw file is the immutable record of
+  what a source said. `/lint` may **delete** an empty, uncited raw container
+  page (title-only, no body, cited by no wiki page) — but only after user
+  confirmation, and it never edits or deletes a raw that still carries content
+  or is cited.
+- **Archive a retired wiki page by moving it to `wiki/archive/`** (`/lint` uses
+  `git mv`). Archived pages leave active lint scope (no more orphan/stale
+  nagging) but stay in git and remain valid `[[link]]` targets — a reference to
+  an archived page is not a broken link. Tag them under an `## Archive` section
+  of `index.md`.
+- The in-place `**Status**` banner is still supported (backward-compat), but the
+  folder move is the primary mechanism and is preferred over deleting a page
+  that has historical value.
+- Genuinely empty or duplicate wiki pages with no historical value are deleted
+  by `/lint` (git keeps the history).
 
 ## Filename conventions
 

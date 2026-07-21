@@ -129,10 +129,15 @@ def _bootstrap(
     skipped: list[str] = []
     warnings: list[str] = []
 
-    # Ensure top-level directories
-    for d in ("raw", "wiki", "templates", ".claude"):
+    # Ensure top-level directories. `wiki/archive/` is the archival namespace:
+    # /lint moves retired pages there (they leave active lint scope but stay
+    # linkable). Seed a .gitkeep so the empty dir is tracked from the start.
+    for d in ("raw", "wiki", "wiki/archive", "templates", ".claude"):
         (target / d).mkdir(parents=True, exist_ok=True)
         created.append(d + "/")
+    gitkeep = target / "wiki" / "archive" / ".gitkeep"
+    if not gitkeep.exists():
+        gitkeep.write_text("", encoding="utf-8")
 
     context = {
         "title": title,

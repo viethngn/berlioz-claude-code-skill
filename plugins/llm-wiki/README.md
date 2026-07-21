@@ -10,12 +10,15 @@ Three skills for maintaining a personal LLM knowledge wiki, backed by git.
   vision endpoint **only when they change**, and updates the wiki. Bulk mode
   uses a resumable job queue with rate limiting and a circuit breaker. Commits
   raw + wiki to git and optionally pushes to remote.
-- **`/lint`** — Thoroughly clean the wiki. Auto-removes empty/orphaned pages,
-  fixes broken `[[wiki-links]]` and format violations, and archives outdated
-  knowledge with a status banner (never touching `raw/`) so reads always surface
-  the latest info. Contradictions and outdated facts are batched into one report
-  you confirm before applying. Updates `index.md`, appends a `log.md` entry, then
-  commits (grouped by category) and pushes.
+- **`/lint`** — Thoroughly clean the wiki. Auto-removes empty pages, triages
+  orphans (integrate valuable ones back into the graph, delete duplicates,
+  archive the rest), fixes broken `[[wiki-links]]` and format violations, and
+  archives outdated knowledge by **moving it to `wiki/archive/`** so reads
+  always surface the latest info. Contradictions, outdated facts, **and the
+  deletion of empty non-contributing `raw/` source files** are batched into one
+  report you confirm before applying (`raw/` contents are never edited). Updates
+  `index.md`, appends a `log.md` entry, then commits (grouped by category) and
+  pushes.
 - **`/create-wiki`** — Bootstrap a fresh LLM wiki: folder layout, `CLAUDE.md`
   system prompt, page template, git repo, `.wikirc.json` config, and marketplace
   pinning so `/ingest` and `/lint` are auto-discovered on next session.
@@ -305,24 +308,28 @@ top-level `queue.py` would shadow the stdlib `queue` module (which
 
 Runs [lint.py](skills/lint/scripts/lint.py) to build a JSON report of orphaned
 pages, broken links, missing concept pages, format violations, empty/stub
-pages, stale pages, unsourced claims, `Status`-tagged pages, and `Sources`
-paths that no longer exist in `raw/`. Then Claude:
+pages, stale pages, unsourced claims, `Status`-tagged pages, `Sources` paths
+that no longer exist in `raw/`, and `empty_raw` (empty, uncited raw source
+files). Then Claude:
 
 1. **Auto-cleans structure** (no approval): deletes empty pages, fixes broken
-   links, links or archives orphans, repairs format violations.
-2. **Verifies conflicts with you**: contradictions and outdated facts are
-   gathered into a single report; you approve the resolutions before they apply.
-3. **Archives, never deletes, retired knowledge**: outdated pages get a
-   `**Status**: Superseded by [[...]]` (or `Archived`) field plus a top-of-page
-   banner, so `raw/` stays immutable and every read is routed to the current
-   page. Archived pages are excluded from future orphan/stale checks and tagged
-   in `index.md`.
-4. **Maintains logs**: appends a `## <date> (lint)` entry to `wiki/log.md` and
+   links, triages orphans (integrate / delete / archive), repairs format
+   violations.
+2. **Verifies conflicts + raw deletions with you**: contradictions, outdated
+   facts, and any empty-raw prune candidates are gathered into a single report;
+   you approve before they apply.
+3. **Archives retired pages by moving them to `wiki/archive/`**: the page
+   leaves active lint scope but stays in git and linkable (references to it
+   aren't broken), and is tagged under an `## Archive` section of `index.md`.
+   Every read is routed to the current page.
+4. **Prunes empty raw sources (gated)**: title-only container pages that no
+   wiki page cites are deleted with their `.source.json` (+ any images dir),
+   only after you confirm. `raw/` file *contents* are never edited; non-empty
+   and cited raws are never deleted.
+5. **Maintains logs**: appends a `## <date> (lint)` entry to `wiki/log.md` and
    updates `index.md`.
-5. **Commits + pushes**: one commit per category, then `ingest.py --push-only`
+6. **Commits + pushes**: one commit per category, then `ingest.py --push-only`
    pushes them all (gated on `auto_push`).
-
-`raw/` is never modified by lint.
 
 ### `/create-wiki`
 
@@ -355,7 +362,9 @@ my-wiki/
 ├── wiki/                     # Claude-maintained pages
 │   ├── index.md
 │   ├── log.md
-│   └── <page>.md
+│   ├── <page>.md
+│   └── archive/              # retired pages moved here by /lint (out of active scope, still linkable)
+│       └── <old-page>.md
 └── templates/
     └── page.md
 ```
