@@ -184,6 +184,12 @@ remote after the commit. Push failures warn but do not fail the ingest — the
 local commit is always preserved. Credential resolution is delegated to Git
 (SSH key, macOS Keychain, `git-credential-store`).
 
+The commit stages `raw` + `wiki` wholesale (`git add raw wiki`), which honors
+`.gitignore`: the downloaded image **byte files** (`raw/images/<slug>/<n>.<ext>`)
+are ignored and stay local, while each `<n>.md` description and the per-slug
+`.manifest.json` are committed. No special flag or code path is needed — git
+skips the ignored bytes automatically.
+
 Skip this phase only when Phase 1 reported `status="unchanged"` (nothing was
 staged, so there's nothing to commit or push).
 
@@ -374,18 +380,24 @@ failed. Offer to `/ingest --resume <job-id>` for failures.
     `{ "type", "url" or "path", "title", "content_sha256", "source_sha256"
     (local only), "image_hints", "version_number" (Confluence), "updated_at"
     (Jira) }`. **No wall-clock timestamps.**
-  - `raw/images/<slug>/<n>.<ext>` — downloaded image bytes
-  - `raw/images/<slug>/<n>.md` — nano-banana-pro description
+  - `raw/images/<slug>/<n>.<ext>` — downloaded image bytes. **Git-ignored,
+    kept local only** (large binaries; re-downloaded fresh each ingest).
+  - `raw/images/<slug>/<n>.md` — nano-banana-pro description. **Committed** —
+    the cached description so unchanged images are never re-described.
   - `raw/images/<slug>/.manifest.json` — per-image `{ sha256, source_url,
     description_file, described_at }`; the source of truth for image diffs
-    and URL-based dedup
+    and URL-based dedup. **Committed** — it is the SHA baseline every future
+    ingest diffs against, so it must be in git even though the bytes are not.
 - **Bulk queue layout**: `.wiki-state/bulk-jobs/<job-id>/queue.json` holds
   the queue for one bulk job. Git-ignored. Never referenced by wiki pages.
-- **Volatile state lives outside git**:
+- **Volatile / local-only state lives outside git**:
   - `.wiki-state/last-fetched.json` at the wiki root records the timestamp
     and status of the most recent single-item fetch per slug.
   - `.wiki-state/bulk-jobs/` holds bulk job queues.
-  - Both git-ignored via the template `.gitignore`.
+  - Image **byte files** under `raw/images/**/*.{png,jpg,jpeg,gif,webp,bmp}`
+    are ignored too — they're re-downloaded each ingest, so only their
+    `.md` descriptions and `.manifest.json` need to persist in git.
+  - All git-ignored via the template `.gitignore`.
 - **Content diff gate (Layer 1)**: each fetcher computes a SHA-256 over the
   rendered Markdown. If it matches the previous `content_sha256`, the
   fetcher returns `status="unchanged"` and does not rewrite `raw/<slug>.md`

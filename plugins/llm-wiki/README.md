@@ -349,9 +349,9 @@ my-wiki/
 │   ├── <slug>.md             # rendered Markdown
 │   ├── <slug>.source.json    # stable metadata: URL/path, title, content_sha256, image_hints (NO fetched_at)
 │   └── images/<slug>/
-│       ├── .manifest.json    # sha256 + source_url per image (source of truth for diffs and dedup)
-│       ├── <n>.<ext>         # downloaded image bytes
-│       └── <n>.md            # nano-banana-pro description
+│       ├── .manifest.json    # COMMITTED — sha256 + source_url per image (SHA baseline for diffs and dedup)
+│       ├── <n>.<ext>         # git-ignored, LOCAL ONLY — image bytes, re-downloaded each ingest
+│       └── <n>.md            # COMMITTED — nano-banana-pro description (cache; avoids re-describing)
 ├── wiki/                     # Claude-maintained pages
 │   ├── index.md
 │   ├── log.md

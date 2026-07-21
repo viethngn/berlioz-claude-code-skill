@@ -4,6 +4,16 @@
 # Volatile per-machine state written by /ingest (last-fetched timestamps etc)
 .wiki-state/
 
+# Downloaded image BYTES — large binaries, kept local only. Descriptions
+# (<n>.md) and .manifest.json ARE committed so future ingests can diff
+# against the stored SHA and reuse descriptions instead of re-describing.
+raw/images/**/*.png
+raw/images/**/*.jpg
+raw/images/**/*.jpeg
+raw/images/**/*.gif
+raw/images/**/*.webp
+raw/images/**/*.bmp
+
 # OS junk
 .DS_Store
 Thumbs.db
