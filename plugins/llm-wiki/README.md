@@ -20,14 +20,25 @@ Three skills for maintaining a personal LLM knowledge wiki, backed by git.
   report you confirm before applying (`raw/` contents are never edited). Updates
   `index.md`, appends a `log.md` entry, then commits (grouped by category) and
   pushes.
-- **`/create-wiki`** — Bootstrap a fresh LLM wiki: folder layout, `CLAUDE.md`
-  system prompt, page template, git repo, `.wikirc.json` config, and marketplace
-  pinning so `/ingest` and `/lint` are auto-discovered on next session.
+- **`/create-wiki`** — Bootstrap a fresh LLM wiki in one run: folder layout,
+  `CLAUDE.md` system prompt, page template, git repo, and marketplace pinning so
+  `/ingest` and `/lint` are auto-discovered on next session. Also **installs +
+  verifies the Python dependencies automatically** (idempotent) and creates a
+  ready-to-edit `.wikirc.json` — the only thing left is filling in your
+  credentials.
 
 Vendor-neutral: no hardcoded URLs or product names. Every endpoint comes from
 your `.wikirc.json`.
 
 ## One-time setup
+
+> **Fastest path — just run `/create-wiki`.** After adding the marketplace and
+> installing the plugin (step 1 below), asking Claude to create a wiki runs the
+> whole first-time setup for you: it scaffolds the repo, **installs and verifies
+> the Python dependencies automatically** (only if missing), and creates a
+> ready-to-edit `.wikirc.json`. The only thing left is filling in your
+> credentials. Steps 2–3 below are the **manual/CI equivalent** — you don't need
+> to run them by hand when you use `/create-wiki`.
 
 ### 1. Add the marketplace and install the plugin
 
@@ -36,9 +47,10 @@ your `.wikirc.json`.
 /plugin install llm-wiki@berlioz-claude-code-skill
 ```
 
-### 2. Install Python dependencies
+### 2. Install Python dependencies (automatic via `/create-wiki`)
 
-Requires Python 3.10+ and `git` on your PATH.
+Requires Python 3.10+ and `git` on your PATH. `/create-wiki` runs this for you;
+run it by hand only for CI or when managing deps manually:
 
 ```bash
 bash /absolute/path/to/berlioz-claude-code-skill/plugins/llm-wiki/install.sh
@@ -66,7 +78,7 @@ If your machine has no direct PyPI access, see
 [skills/ingest/references/setup.md](skills/ingest/references/setup.md) for
 offline-install patterns (private mirror, offline wheels, `pip.conf`).
 
-### 3. Verify the install
+### 3. Verify the install (automatic via `/create-wiki`)
 
 ```bash
 bash /absolute/path/to/berlioz-claude-code-skill/plugins/llm-wiki/check-setup.sh
@@ -74,6 +86,8 @@ bash /absolute/path/to/berlioz-claude-code-skill/plugins/llm-wiki/check-setup.sh
 
 Reports Python version, imports each dep, and checks for `git`. Optionally
 pass a `.wikirc.json` path as an argument to validate the config file too.
+`/create-wiki` runs this automatically; run it by hand only to re-check an
+existing setup.
 
 ### 4. Bootstrap a wiki (if you don't have one yet)
 
@@ -81,14 +95,19 @@ Ask Claude:
 
 > Create a new LLM wiki in `~/my-wiki`.
 
-The `/create-wiki` skill will lay out the folders, drop in `CLAUDE.md` and a
-starter `.wikirc.example.json`, run `git init`, and print the marketplace
-install commands with the correct absolute paths.
+The `/create-wiki` skill lays out the folders, drops in `CLAUDE.md` and a
+starter `.wikirc.example.json`, runs `git init`, **installs + verifies the
+Python dependencies** (skipped if already present), and creates a ready-to-edit
+`.wikirc.json` — then prints the marketplace install commands with the correct
+absolute paths.
 
 ### 5. Fill in `.wikirc.json`
 
-Copy `.wikirc.example.json` to `.wikirc.json` and fill in your endpoints and
-tokens. The file is git-ignored — never committed.
+`/create-wiki` already created `.wikirc.json` for you (from the example, with
+placeholders) — just open it and fill in your endpoints and tokens. (If you're
+setting up by hand instead, copy `.wikirc.example.json` to `.wikirc.json`
+yourself.) The file is git-ignored — never committed. Each integration is
+optional; leave one empty and that source type is simply skipped.
 
 ```json
 {
@@ -352,8 +371,13 @@ files). Then Claude:
 Runs [bootstrap.py](skills/create-wiki/scripts/bootstrap.py) to lay out the
 directory structure, copy templates (`CLAUDE.md`, `index.md`, `log.md`, page
 template, `.wikirc.example.json`, `.gitignore`, `.claude/settings.json`), and
-initialize git. Then prints marketplace install commands and a numbered
-"Next steps" checklist.
+initialize git. It then performs first-time setup end-to-end: creates a
+ready-to-edit `.wikirc.json`, and checks the Python dependencies via
+`check-setup.sh`, installing them via `install.sh` **only if missing** and
+re-verifying — all resolved relative to the installed plugin, so it works on
+any machine. Finally it prints marketplace install commands and the remaining
+manual step (fill in `.wikirc.json` credentials). Pass `--skip-deps` to skip the
+automatic dependency install/verify for CI or air-gapped setups.
 
 ## File layout of an LLM wiki
 
