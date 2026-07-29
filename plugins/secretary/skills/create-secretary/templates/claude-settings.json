@@ -1,0 +1,21 @@
+{
+  "marketplaces": [
+    { "source": "{{ marketplace_path }}" }
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/due_soon.py", "--within-days", "{{ within_days }}"],
+            "timeout": 10,
+            "statusMessage": "Loading tasks due today..."
+          }
+        ]
+      }
+    ]
+  }
+}

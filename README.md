@@ -39,6 +39,21 @@ Maintain a personal LLM knowledge wiki, backed by git.
 
 See [plugins/llm-wiki/README.md](plugins/llm-wiki/README.md) for the one-time setup steps.
 
+### `secretary`
+
+A personal task/todo secretary: create and track todos, deadlines, and
+subtasks in a git-committed local file store; link tasks to `llm-wiki`
+pages via the same `[[wiki-link]]` syntax; surface a due-soon/overdue
+digest automatically at the start of every session; automatically checks
+Slack and Outlook for new action items before answering about the list,
+reconciling into existing tasks rather than duplicating them.
+
+**Skills:**
+- `create-secretary` — Turn a project into a secretary agent: scaffold `secretary/tasks/`, `secretary/archived/`, and `secretary/index/index.md`; merge secretary instructions into `CLAUDE.md` (or create one); wire up the `SessionStart` due-soon digest hook; ensure git is initialized.
+- `tasks` — Add, update, list/render (flat or tree), mark done, remove (archive), and add subtasks to todo items; auto-syncs Slack/Outlook first and reconciles synced items into existing tasks via a dedicated `upsert`. Every mutating action commits to git immediately.
+
+See [plugins/secretary/README.md](plugins/secretary/README.md) for the folder layout.
+
 ## Installation
 
 ```

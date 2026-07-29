@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "Ad Suite PM skills for Claude Code",
-    "version": "1.2.0"
+    "version": "1.4.0"
   },
   "plugins": [
     {
@@ -53,6 +53,16 @@
         "./skills/ingest",
         "./skills/lint",
         "./skills/create-wiki"
+      ]
+    },
+    {
+      "name": "secretary",
+      "description": "Personal secretary agent: create and track todos, deadlines, and subtasks in a git-committed local file store, link tasks to llm-wiki references, surface a due-soon/overdue digest at the start of every session, and automatically reconcile new action items from Slack and Outlook into existing tasks without duplicating them",
+      "source": "./plugins/secretary",
+      "strict": false,
+      "skills": [
+        "./skills/create-secretary",
+        "./skills/tasks"
       ]
     }
   ]

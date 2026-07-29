@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.4.0 - 2026-07-30
+
+### secretary
+
+- Fixed three bugs in the task-store engine:
+  - A newline in any frontmatter field (e.g. a title copied from a chat
+    message) corrupted the task file on write and made it unparseable on
+    the next read — `parse_task_file` would silently skip it, dropping the
+    task from every list/digest with only a stderr warning. `serialize_task`
+    now collapses embedded newlines to spaces before writing.
+  - `update_task` could never clear a field once set (`--due-date ""` was a
+    no-op) — an empty string now means "clear," matching how every CLI flag
+    already defaults to `None` for "leave alone."
+  - `list --status done|archived --format text` always rendered empty
+    because the renderer re-filtered rows to open statuses regardless of
+    what the caller asked for; it now renders exactly the rows it's given.
+- Added a reconciliation engine so synced tasks are never blindly
+  duplicated: two new fields (`sourceRef`, `sourceHash`) and
+  `upsert_from_source`/`tasks_cli.py upsert`, which match an incoming item
+  to its existing task by `sourceRef` and update it in place (no-op if
+  unchanged, and never resurrects an archived match) instead of creating a
+  second task. Sync commits are tagged `sync-add`/`sync-update` in git, so
+  `git log secretary/` is a readable change history.
+- Added a connector framework (`scripts/connectors/{base,slack,outlook}.py`)
+  and `scripts/sync.py`, folded into the existing `tasks` skill rather than
+  a new one — both Slack and Outlook are checked automatically, every time,
+  with no explicit "check Slack" request needed:
+  - **Slack** (working): primary path is the Slack MCP tools already
+    connected in-session (no token, no `llm-wiki` dependency); falls back
+    to reusing `llm-wiki`'s `fetch_slack.py` when a `.wikirc.json` with a
+    real token is present. Default window when unspecified: last 3 days,
+    all messages (read and unread).
+  - **Outlook** (stub, R-Musubi-aware): reads
+    `~/Library/Application Support/R-Musubi/settings.json` and reuses its
+    Outlook `url`/`token` the moment they're filled in there (R-Musubi
+    stores that connection as a plain url+token pair, not a private
+    keychain session); reports `not_configured` until then. Full Graph/
+    OAuth remains out of scope — the future `connect-outlook` skill.
+  - `secretary/sync.json` (optional, opt-in) configures channels/search,
+    the sync window, and `autoSyncOnStart`; the `SessionStart` hook now
+    also instructs an auto-sync at the start of every session when that
+    flag is set, even if nothing is currently overdue.
+  - Extraction (deciding what's an actionable item) and same-work-item
+    matching stay model judgment in the `tasks` skill, propose-then-confirm
+    before creating; only an exact `sourceRef` refresh of an already-known
+    item applies silently.
+
+## 1.3.0 - 2026-07-29
+
+### secretary
+
+- Added `secretary` plugin with two skills:
+  - `create-secretary` — Bootstrap an *existing* project into a secretary agent: scaffolds `secretary/tasks/` (active), `secretary/archived/` (done/removed), and `secretary/index/index.md` (a maintained listing of every task, mirroring `llm-wiki`'s `raw/`/`wiki/` split); creates a `CLAUDE.md` if absent, or merges a managed, idempotent block into an existing one; merges a `SessionStart` hook and this marketplace's pin into `.claude/settings.json` without touching unrelated keys; always ensures the project is git-initialized and makes one scoped scaffold commit
+  - `tasks` — CRUD + render for todos: add, update, mark done (moves to `archived/`), remove (archive, never hard-delete, with optional `--cascade` for subtasks), add subtasks via `--parent-id`, and render flat/tree views grouped Overdue → Due soon → Later. Every mutating action commits to git immediately, no batching, no confirmation prompt
+- Ships a `SessionStart` hook (`scripts/due_soon.py`, matcher `startup|resume`) that surfaces overdue and due-soon tasks as injected context at the start of every session — silent when nothing is due or the project was never bootstrapped
+- Stdlib-only Python throughout (no `requirements.txt`/`install.sh`); tasks use a flat, hand-parseable `key: value` frontmatter block (no YAML dependency), consistent with the repo's low-dependency norm outside `llm-wiki`
+- Task `refs` reuse `llm-wiki`'s `[[wiki-link]]` syntax; the `tasks` skill soft-verifies ref targets against a sibling `wiki/` directory when present (no dependency on the `llm-wiki` plugin's code)
+- Outlook/calendar integration is explicitly out of scope for this release — a future `connect-outlook` skill
+
 ## 1.2.0 - 2026-07-03
 
 ### llm-wiki
