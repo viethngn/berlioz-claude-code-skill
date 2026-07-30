@@ -21,6 +21,9 @@ secretary/index/index.md  -- maintained listing of every task, active and archiv
 - `tasks` — day-to-day CRUD: add, update, mark done, remove (archive), add
   subtasks, and render the list (flat/tree, filterable). Every mutating
   action commits to git immediately.
+- `connect-outlook` — one-time setup that installs `outlook-local-mcp`
+  directly from upstream and walks through the Microsoft device-code
+  sign-in. After this, `tasks` checks Outlook automatically like Slack.
 
 Task `refs` reuse the `[[wiki-link]]` syntax from the `llm-wiki` plugin —
 if a project also has a `wiki/` directory, a task's refs can point directly
@@ -51,14 +54,26 @@ has a real Slack token, `sync.py --slack-mode fetcher` reuses `llm-wiki`'s
 `fetch_slack.py` directly. Default window when unspecified: the last 3
 days, all messages (read and unread).
 
-**Outlook**: no OAuth is implemented in this plugin (see "Not included"
-below). Investigation found that R-Musubi (a separate macOS app) stores its
-own Outlook connection as a plain `{url, token}` pair in
-`~/Library/Application Support/R-Musubi/settings.json` — not a private
-keychain session — so the `outlook` connector reads that file and reuses it
-automatically *if* it's ever filled in there. Until then (or until
-`secretary/sync.json` sets `outlook.url`/`outlook.token` directly), Outlook
-reports `not_configured` and is skipped quietly.
+**Outlook**: real, via `outlook-local-mcp` (github.com/desek/outlook-local-mcp,
+MIT licensed) — a stdio MCP server exposing `mail`/`calendar`/`account`
+tools, authenticated with a Microsoft device-code sign-in. Run
+`/connect-outlook` once: it installs the binary directly from upstream
+(`go install github.com/desek/outlook-local-mcp/cmd/outlook-local-mcp@latest`,
+no Azure AD app registration needed) and walks through the one-time sign-in.
+This plugin ships its own `.mcp.json`, so the server registers and connects
+automatically once the plugin is enabled — see `scripts/outlook_mcp_server.py`.
+Until `/connect-outlook` has been run, Outlook reports `not_configured` and
+is skipped quietly, same as an unconfigured Slack.
+
+**Trust note**: this grants a real Microsoft Graph token to a small,
+unaffiliated third-party open-source binary running locally — a different
+trust posture than the fully-hosted Slack/Figma/Atlassian integrations.
+Access is **read-only by design** (`OUTLOOK_MCP_READ_ONLY=true`, mail
+management disabled, both hardcoded, not user-configurable) — it can read
+mail/calendar to derive todos but can't send, delete, or modify anything.
+The signed-in token cache lives at `~/.secretary/outlook/accounts.json`
+(outside any git working tree); `/connect-outlook` explains this before
+doing anything.
 
 **Config** (optional, `secretary/sync.json` — not created by bootstrap;
 the `tasks` skill offers to write it after a first successful sync):
@@ -67,16 +82,10 @@ the `tasks` skill offers to write it after a first successful sync):
   "autoSyncOnStart": true,
   "withinDays": 3,
   "slack": { "channels": ["general"], "search": null, "mode": "auto" },
-  "outlook": { "url": null, "token": null }
+  "outlook": { "enabled": true }
 }
 ```
 With `autoSyncOnStart: true`, the `SessionStart` hook also tells the agent
-to sync at the start of every session, not just when you ask.
-
-## Not included (yet)
-
-Outlook/calendar/mail **OAuth**. Investigated separately (a device-code
-flow against the open-source `github.com/desek/outlook-local-mcp`, MIT
-licensed, exposing `mail`/`calendar`/`account` MCP tools) but not built
-here — a natural candidate for a future `connect-outlook` skill. The
-`outlook` connector above is the seam that skill plugs into.
+to sync at the start of every session, not just when you ask. `outlook.enabled`
+is optional (defaults `true`) — set it `false` to pause Outlook checks
+without undoing the sign-in.

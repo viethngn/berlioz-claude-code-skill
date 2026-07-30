@@ -51,6 +51,7 @@ reconciling into existing tasks rather than duplicating them.
 **Skills:**
 - `create-secretary` — Turn a project into a secretary agent: scaffold `secretary/tasks/`, `secretary/archived/`, and `secretary/index/index.md`; merge secretary instructions into `CLAUDE.md` (or create one); wire up the `SessionStart` due-soon digest hook; ensure git is initialized.
 - `tasks` — Add, update, list/render (flat or tree), mark done, remove (archive), and add subtasks to todo items; auto-syncs Slack/Outlook first and reconciles synced items into existing tasks via a dedicated `upsert`. Every mutating action commits to git immediately.
+- `connect-outlook` — One-time setup: installs `outlook-local-mcp` (github.com/desek/outlook-local-mcp) directly from upstream and walks through the Microsoft device-code sign-in. Read-only by design.
 
 See [plugins/secretary/README.md](plugins/secretary/README.md) for the folder layout.
 

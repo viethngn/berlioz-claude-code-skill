@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "Ad Suite PM skills for Claude Code",
-    "version": "1.4.0"
+    "version": "1.5.0"
   },
   "plugins": [
     {
@@ -62,7 +62,8 @@
       "strict": false,
       "skills": [
         "./skills/create-secretary",
-        "./skills/tasks"
+        "./skills/tasks",
+        "./skills/connect-outlook"
       ]
     }
   ]

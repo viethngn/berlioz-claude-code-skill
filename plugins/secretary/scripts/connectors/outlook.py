@@ -1,102 +1,75 @@
 #!/usr/bin/env python3
-"""Outlook connector -- R-Musubi-aware stub.
+"""Outlook connector.
 
-Investigation finding: R-Musubi (a separate macOS app) does not hold a
-private/keychain-locked Outlook session -- it connects via a plain
-`{url, token}` pair per service, the same pattern it uses for Confluence/
-Jira/Figma, stored in its own settings file:
+Real connectivity via `outlook-local-mcp` (github.com/desek/outlook-local-mcp),
+installed directly from upstream by the `connect-outlook` skill and
+registered as a stdio MCP server through this plugin's own `.mcp.json`
+(`scripts/outlook_mcp_server.py` is the launch wrapper). There is no
+R-Musubi involvement anywhere in this design -- an earlier version of this
+connector reused a separate app's settings file, which turned out to be a
+dead end for Outlook specifically (that app never actually reads its own
+url/token fields for this integration) and added an unnecessary cross-app
+coupling besides.
 
-    ~/Library/Application Support/R-Musubi/settings.json
-    -> {"services": {"outlook": {"url": "...", "token": "...", "enabled": true}}}
-
-That means reuse is possible in principle: if the user has actually filled in
-Outlook's url+token there, this connector can call that same endpoint with no
-new auth code. As of this writing that entry is enabled but url/token are
-BOTH EMPTY (toggled on, never configured) -- so today this always reports
-"not_configured". The moment the user fills it in (in R-Musubi, or via
-`secretary/sync.json` override), this connector activates without any code
-change.
-
-Full Outlook/Graph OAuth (device-code flow, MSAL, token storage) remains
-explicitly out of scope -- that's the future `connect-outlook` skill. This
-stub is the seam it plugs into.
+This module never calls MCP tools itself -- it can't; that's the agent's
+job (base.py's docstring states the same constraint for every connector).
+It only decides `delegate` vs `not_configured` by checking local,
+cheap-to-read state (`outlook_setup.is_setup_complete()`), and building the
+instruction text the agent follows.
 """
 
 from __future__ import annotations
 
-import json
+import sys
 from pathlib import Path
 from typing import Optional
 
-DEFAULT_RMUSUBI_SETTINGS = Path.home() / "Library" / "Application Support" / "R-Musubi" / "settings.json"
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+sys.path.insert(0, str(SCRIPT_DIR.parent))
 
-
-def _read_rmusubi_outlook(settings_path: Path) -> Optional[dict]:
-    if not settings_path.exists():
-        return None
-    try:
-        data = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-    return (data.get("services") or {}).get("outlook")
+from base import window_after  # noqa: E402
+import outlook_setup  # noqa: E402
 
 
 def plan(
     project_root: Path,
     *,
     within_days: int = 3,
-    url: Optional[str] = None,
-    token: Optional[str] = None,
-    rmusubi_settings_path: Optional[Path] = None,
+    accounts_path: Optional[Path] = None,
+    marker_path: Optional[Path] = None,
 ) -> dict:
-    """`url`/`token` let `secretary/sync.json` override R-Musubi's settings
-    directly (e.g. for users without R-Musubi installed). Never returns
-    credentials in the plan -- only whether they're present."""
-    if url and token:
-        return {
-            "source": "outlook",
-            "status": "delegate",
-            "mode": "agent",
-            "instruction": (
-                f"Fetch Outlook mail/calendar items due or received in the last {within_days} "
-                f"day(s) from {url} using the configured token, extract candidate todos, and "
-                "upsert them (source=outlook, source_ref=<message-or-event-id>)."
-            ),
-            "note": "using url/token from secretary/sync.json",
-        }
-
-    settings_path = rmusubi_settings_path or DEFAULT_RMUSUBI_SETTINGS
-    outlook_cfg = _read_rmusubi_outlook(settings_path)
-
-    if outlook_cfg is None:
+    """`accounts_path`/`marker_path` let tests point at a tmp dir instead of
+    the real `~/.secretary/outlook/` -- same testability idiom the Slack
+    connector uses for `fetch_slack_path`/`wiki_root`."""
+    if not outlook_setup.is_setup_complete(accounts_path=accounts_path, marker_path=marker_path):
         return {
             "source": "outlook",
             "status": "not_configured",
             "mode": "n/a",
-            "note": f"R-Musubi settings not found at {settings_path}, and no url/token override "
-                    "in secretary/sync.json -- run connect-outlook (future) or configure Outlook "
-                    "in R-Musubi / secretary/sync.json.",
+            "note": "Outlook isn't connected yet -- run /connect-outlook to install "
+                    "outlook-local-mcp and sign in.",
         }
 
-    rm_url = outlook_cfg.get("url") or ""
-    rm_token = outlook_cfg.get("token") or ""
-    if not rm_url or not rm_token:
-        return {
-            "source": "outlook",
-            "status": "not_configured",
-            "mode": "n/a",
-            "note": "Outlook is enabled in R-Musubi but url/token are not filled in there -- "
-                    "configure it in R-Musubi's settings, or run connect-outlook (future).",
-        }
-
+    after = window_after(within_days)
+    instruction = (
+        f"Use the Outlook MCP tools (`mail`, `calendar`) to check for items from {after} "
+        "to today. Call `mail` with `operation: \"list_messages\"` (or `search_messages` "
+        "with a KQL query for a targeted search) for that window, and `calendar` for the "
+        "same window -- call either tool with `operation: \"help\"` first if you're unsure "
+        "of exact verb names/args, since these can vary by outlook-local-mcp version. This "
+        "is READ-ONLY: do not call any send/delete/create/mark-read/move operation. For "
+        "each message/event you judge to be an actual action item, extract a candidate "
+        "todo and upsert it (source=outlook, source_ref=<message-or-event-id>). If the "
+        "Outlook MCP tools report no account/not connected despite this delegate status, "
+        "tell the user setup may have lapsed and to re-run /connect-outlook -- don't retry "
+        "in a loop."
+    )
     return {
         "source": "outlook",
         "status": "delegate",
         "mode": "agent",
-        "instruction": (
-            f"Fetch Outlook mail/calendar items due or received in the last {within_days} day(s) "
-            f"from {rm_url} (reusing R-Musubi's configured Outlook endpoint), extract candidate "
-            "todos, and upsert them (source=outlook, source_ref=<message-or-event-id>)."
-        ),
-        "note": "reusing R-Musubi's configured Outlook url/token",
+        "window": {"after": after, "before": "today"},
+        "instruction": instruction,
+        "note": None,
     }

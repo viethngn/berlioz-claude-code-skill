@@ -1,0 +1,7 @@
+{
+  "outlook": {
+    "type": "stdio",
+    "command": "python3",
+    "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/outlook_mcp_server.py"]
+  }
+}

@@ -41,14 +41,17 @@ python3 "${PLUGIN_ROOT}/scripts/sync.py" --tasks-root "${PROJECT_ROOT}"
 This always attempts **both** `slack` and `outlook` (never just one) and
 never writes anything itself — it returns, per source, one of:
 
-- `not_configured` — nothing to do (e.g. Outlook has no credentials yet,
-  or Slack has no channels configured). Skip silently; don't nag the user
-  about a source they haven't set up. Outlook stays `not_configured` until
-  a future `connect-outlook` skill (or R-Musubi's own Outlook `url`/`token`
-  in its settings) exists — do not attempt to build Outlook auth yourself.
-- `delegate` (Slack's usual state) — `instruction` tells you exactly which
-  MCP tool calls to make (`slack_read_channel`, `slack_search_public*`,
-  etc.) and the date window. Make those calls, then extract.
+- `not_configured` — nothing to do (e.g. Outlook hasn't been connected via
+  `/connect-outlook` yet, or Slack has no channels configured). Skip
+  silently; don't nag the user about a source they haven't set up. If the
+  user specifically asks why Outlook isn't syncing, point them at
+  `/connect-outlook` rather than trying to build/debug the connection
+  yourself.
+- `delegate` (both Slack's usual state and Outlook's once connected) —
+  `instruction` tells you exactly which MCP tool calls to make
+  (`slack_read_channel`/`slack_search_public*` for Slack;
+  `mail`/`calendar` for Outlook) and the date window. Make those calls,
+  then extract.
 - `ready` — `material` already has fetched content (the llm-wiki-fetcher
   fallback path); read it directly, no MCP calls needed.
 - `error` — report the `note` plainly; don't retry in a loop.

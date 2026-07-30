@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.5.0 - 2026-07-31
+
+### secretary
+
+- Real Outlook connectivity, replacing the stub from 1.4.0. Corrected
+  premise: the stub reused a separate app's (R-Musubi's) `{url, token}`
+  settings pair, which turned out to never actually be read for Outlook
+  specifically — R-Musubi itself spawns a bundled MCP server subprocess
+  and ignores that pair. This release drops all R-Musubi involvement and
+  installs the same underlying open-source project directly instead
+  — R-Musubi is not part of the design at all.
+- Added `connect-outlook`, a one-time setup skill: installs
+  `outlook-local-mcp` (`github.com/desek/outlook-local-mcp`, MIT licensed)
+  straight from upstream via `go install` (no Azure AD app registration
+  needed — the project supports a shared/well-known client id), confirms
+  it's connected, and walks through the interactive Microsoft device-code
+  sign-in (the agent calling the server's own `account` MCP tool live in
+  chat and relaying the code — Claude Code's own MCP OAuth handling only
+  covers HTTP/SSE servers, not this kind of stdio server)
+- The `secretary` plugin now ships its own `.mcp.json`, registering the
+  `outlook` stdio server automatically the moment the plugin is enabled —
+  no manual `claude mcp add` step. `scripts/outlook_mcp_server.py` is the
+  launch wrapper: resolves the installed binary, hardcodes read-only
+  security defaults (`OUTLOOK_MCP_READ_ONLY=true`,
+  `OUTLOOK_MCP_MAIL_MANAGE_ENABLED=false` — not user-configurable, since
+  this feature only ever needs to *read* mail/calendar to derive todos),
+  and `exec`s straight into it
+- The signed-in token cache lives at `~/.secretary/outlook/accounts.json`
+  — a fixed, user-home-scoped path outside any git working tree entirely,
+  since a Microsoft identity belongs to the person, not whichever project
+  they're in. `sync.json`'s Outlook config simplifies to a single optional
+  `enabled` flag (was `{url, token}`, which never did anything)
+- `connectors/outlook.py`'s `not_configured`/`delegate` decision stays a
+  cheap local file check (never a live `claude mcp` probe) so the
+  automatic per-session-start sync path stays fast
+- No new Python dependency — the OAuth/Graph work all happens inside the
+  separate Go binary over MCP stdio; `secretary` stays 100% stdlib
+
 ## 1.4.0 - 2026-07-30
 
 ### secretary

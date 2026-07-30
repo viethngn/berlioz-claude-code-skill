@@ -19,9 +19,12 @@ Config (optional, secretary/sync.json under --tasks-root):
       "autoSyncOnStart": true,
       "withinDays": 3,
       "slack": {"channels": ["general"], "search": null, "mode": "auto"},
-      "outlook": {"url": null, "token": null}
+      "outlook": {"enabled": true}
     }
-CLI flags override config; config overrides the built-in defaults.
+CLI flags override config; config overrides the built-in defaults. Outlook
+has no url/token config -- run /connect-outlook once to install and sign in
+to outlook-local-mcp; after that, this script only checks local state
+(see connectors/outlook.py) to decide delegate vs not_configured.
 """
 
 from __future__ import annotations
@@ -87,13 +90,15 @@ def run_slack(root: Path, cfg: dict, args) -> dict:
 
 def run_outlook(root: Path, cfg: dict, args) -> dict:
     outlook_cfg = cfg.get("outlook") or {}
-    result = outlook_connector.plan(
-        root,
-        within_days=args.within_days,
-        url=args.outlook_url or outlook_cfg.get("url"),
-        token=args.outlook_token or outlook_cfg.get("token"),
-        rmusubi_settings_path=Path(args.rmusubi_settings) if args.rmusubi_settings else None,
-    )
+    if not outlook_cfg.get("enabled", True):
+        return {
+            "source": "outlook",
+            "status": "not_configured",
+            "mode": "n/a",
+            "note": "outlook.enabled is false in secretary/sync.json",
+            "existing_source_refs": existing_source_refs(root, "outlook"),
+        }
+    result = outlook_connector.plan(root, within_days=args.within_days)
     result["existing_source_refs"] = existing_source_refs(root, "outlook")
     return result
 
@@ -109,9 +114,6 @@ def main() -> int:
     parser.add_argument("--channels", default=None, help="comma-separated Slack channel names/ids")
     parser.add_argument("--search", default=None, help="Slack search query")
     parser.add_argument("--slack-mode", choices=["auto", "mcp", "fetcher"], default=None)
-    parser.add_argument("--outlook-url", default=None)
-    parser.add_argument("--outlook-token", default=None)
-    parser.add_argument("--rmusubi-settings", default=None, help="override path to R-Musubi's settings.json")
     args = parser.parse_args()
 
     root = args.tasks_root.expanduser().resolve()

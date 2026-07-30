@@ -25,14 +25,14 @@ from — the key that prevents duplicates on re-sync), `sourceHash`,
 hand-edit these files mid-conversation and expect the index or git history
 to stay consistent.
 
-### Staying in sync (Slack now, Outlook once configured)
+### Staying in sync (Slack, Outlook once connected)
 Before answering anything about the task list, the `tasks` skill
 automatically checks **both** Slack and Outlook for new action items — you
 never need to ask "check Slack" explicitly. Slack works via the connected
-Slack MCP tools (or a local fetcher fallback); Outlook stays
-`not_configured` until it has credentials (a future `connect-outlook` skill,
-or Outlook's `url`/`token` filled in via R-Musubi's own settings). A source
-with nothing configured is skipped quietly, not treated as an error.
+Slack MCP tools (or a local fetcher fallback); Outlook works once
+`/connect-outlook` has been run (installs `outlook-local-mcp` and signs in)
+— until then it stays `not_configured`. A source with nothing configured
+is skipped quietly, not treated as an error.
 
 Synced items are **reconciled, never blindly duplicated**: each carries a
 `sourceRef`, and re-syncing the same message updates its existing task
