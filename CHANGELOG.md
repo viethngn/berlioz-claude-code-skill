@@ -1,5 +1,83 @@
 # Changelog
 
+## 1.6.0 - 2026-08-22
+
+### llm-wiki
+
+- `/ingest` now accepts **websites**. Any non-Atlassian `http(s)` URL is
+  fetched as a single page; a sitemap URL (or `--sitemap` / `--site`) bulk-ingests
+  a whole site through the existing resumable job queue. Public pages need no
+  credentials — nothing has to be added to `.wikirc.json`.
+- Content extraction uses `trafilatura` (new dependency) with a BeautifulSoup +
+  markdownify fallback, so a machine that can't install it still ingests pages,
+  just with noisier output. Which extractor ran is recorded as `extractor` in
+  `raw/<slug>.source.json`, so a switch shows up in the diff instead of silently
+  changing the rendered page.
+- Slugs are **URL-derived** (`web-<host>-<url-path>`), not title-derived: a
+  retitled page updates its existing raw file instead of quietly creating a
+  second one, and same-titled pages ("Overview", "FAQ") across one site don't
+  collide. Over 80 chars, the slug truncates and takes a short hash of the
+  normalized URL.
+- New diff gate in front of the existing two: a **conditional GET** replaying
+  the stored `ETag` / `Last-Modified`. An unchanged page costs one `304` with no
+  download, no parse, and no commit. Validators live in
+  `.wiki-state/last-fetched.json` under a `web:<slug>` key — outside git,
+  because some servers rotate weak ETags per request, and under a prefixed key
+  because `write_fetch_history` overwrites `data[<slug>]` wholesale. Keyed by
+  the **requested** URL (known before any HTTP call) with the resolved slug
+  recorded inside the entry, so a page that redirects (`http` → `https`, a
+  moved URL) still hits the cache on the original URL the next time. The
+  conditional headers are sent only when both raw files for the resolved slug
+  still exist on disk — deleting one no longer produces a false `unchanged`;
+  it's restored on the next ingest with no `--force` needed.
+- Bulk discovery finds a sitemap the way a crawler would: `Sitemap:` directives
+  in `robots.txt` first, then the standard `/sitemap.xml` locations. Sitemap
+  indexes (recursive, cycle-safe), gzipped sitemaps, and plain-text sitemaps all
+  parse. Scope a large site with `--include` / `--exclude` / `--since` (on
+  `<lastmod>`) / `--limit`; re-running the same URL reuses its queue, so a
+  periodic refresh is the same command again. Non-`http(s)` `<loc>` entries
+  (`mailto:`, `ftp:`, …) are dropped before they reach the queue.
+- A site with **no sitemap is never crawled blind**. Discovery returns
+  `status="needs_bounds"` and exits 0 so the skill asks the user for `--depth`
+  and `--max-pages` before anything is fetched. The crawler is breadth-first,
+  same-origin, HTML-only, and honors `Crawl-delay`.
+- `robots.txt` is **enforced per origin** on every bulk website path and
+  advisory for a single page the user named explicitly (warn, proceed). A
+  sitemap that lists URLs on another host (or a `<sitemapindex>` pointing at
+  one) is checked against *that host's own* robots.txt via a small
+  origin-keyed cache, not the entry-point host's rules — checking everything
+  against one parser would have applied the wrong site's policy to
+  cross-origin URLs. `--ignore-robots` and `web.respect_robots: false`
+  override it.
+- Web images are filtered in five stages before any vision call — content
+  subtree only, then form (`data:`/`.svg`/`.ico`), name/role pattern, declared
+  dimensions, and finally a post-download byte-size floor
+  (`web.min_image_bytes`). Survivors go through the normal describe-on-change
+  flow, so diagrams and screenshots are still captured while logos and spacers
+  cost nothing.
+- `web.extra_headers` (Cookie, Authorization) is scoped to the page's own
+  host: an image embedded from a third-party CDN receives only
+  `web.user_agent`, never the site's configured credentials. Fixed before it
+  shipped — the initial cut sent `extra_headers` to every image host
+  unconditionally.
+- `--since` / `--depth` / `--max-pages` / the site URL flags are validated
+  before any HTTP request, with a plain `ERROR:` on failure instead of a
+  traceback or (for `--since`) a silently-wrong lexicographic date comparison
+  (`"2026-06-15" < "2026-6-1"` as strings).
+- New `web` config section (all keys optional, all defaulted):
+  `user_agent`, `verify_ssl`, `rate_limit_rps`, `burst`, `max_retries`,
+  `retry_base_delay_seconds`, `timeout_seconds`, `respect_robots`,
+  `min_image_bytes`, `extra_headers`. `config.py` redacts `extra_headers`
+  values (that's where a `Cookie` or `Authorization` header goes) while keeping
+  the header names visible. Default `user_agent` is a neutral
+  `llm-wiki-ingest` string. Existing `.wikirc.json` files need no migration.
+- New: `scripts/fetch_web.py`, `scripts/web_discover.py`, `scripts/web_url.py`,
+  `references/web-pages.md`, `tests/smoke_web_ingest.py` (15 checks against a
+  multi-origin local mock covering extraction, the 304/redirect/missing-file
+  paths, nested/gzipped sitemaps, per-origin robots enforcement, credential
+  isolation, non-http(s) entry rejection, filters, input validation, the
+  `needs_bounds` handoff, and a bounded crawl).
+
 ## 1.5.0 - 2026-07-31
 
 ### secretary

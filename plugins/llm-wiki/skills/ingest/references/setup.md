@@ -61,6 +61,13 @@ Every wiki has a `.wikirc.json` at its root. Fields:
     "api_key": "REPLACE_ME",
     "vision_model": "gemini-3-pro",
     "verify_ssl": true
+  },
+  "web": {
+    "user_agent": "Mozilla/5.0 (compatible; llm-wiki-ingest/1.0)",
+    "verify_ssl": true,
+    "respect_robots": true,
+    "min_image_bytes": 8192,
+    "extra_headers": {}
   }
 }
 ```
@@ -84,6 +91,21 @@ Every wiki has a `.wikirc.json` at its root. Fields:
   (e.g. `gemini-3-pro`, `gemini-2.5-pro`). Not `-image-preview` — that model
   is for image generation, not description.
 - **`nano_banana.verify_ssl`** — Same semantics as `atlassian.verify_ssl`.
+- **`web.*`** — Website ingest. Every key has a default, so this whole block is
+  optional and public pages need no credentials at all.
+  - **`user_agent`** — Sent on every page and image request. Set it to a real
+    browser string if a site returns 403 to the default.
+  - **`respect_robots`** — When `true` (default), robots.txt is enforced on
+    bulk website ingest (`--site` / `--sitemap` / `--crawl`) and advisory for a
+    single explicitly-named page.
+  - **`min_image_bytes`** — Web images smaller than this are skipped as
+    decoration, so no vision call is spent on icons and spacers.
+  - **`extra_headers`** — Arbitrary headers, e.g.
+    `{"Cookie": "session=…"}` for a page behind a login. `config.py` redacts the
+    values when printing the config.
+  - **`rate_limit_rps`**, **`burst`**, **`max_retries`**,
+    **`retry_base_delay_seconds`**, **`timeout_seconds`** — same semantics as
+    the `atlassian` block. Defaults are deliberately polite (1 rps, burst 2).
 
 `.wikirc.json` is git-ignored by default. Only `.wikirc.example.json` (with
 placeholder values) is committed.
@@ -130,6 +152,14 @@ Copy `./wheels/` to the target machine and install offline:
 ```bash
 pip install --no-index --find-links ./wheels -r requirements.txt
 ```
+
+Note that `trafilatura` (website ingest) pulls in a handful of transitive
+dependencies — `lxml`, `charset-normalizer`, `courlan`, `htmldate`, `justext`.
+`pip download -r requirements.txt` collects them all, so nothing extra is
+needed, but expect more wheels than the line count of `requirements.txt`
+suggests. If `trafilatura` can't be installed at all, website ingest still
+works: `fetch_web.py` falls back to the BeautifulSoup + markdownify extractor
+already required by local-file ingest, with somewhat noisier output.
 
 ### `check-setup.sh` reports a missing package after `install.sh` succeeded
 

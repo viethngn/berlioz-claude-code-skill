@@ -1,15 +1,28 @@
 #!/usr/bin/env python3
-"""Enumerate a Confluence space, Confluence CQL query, or Jira JQL query and
+"""Enumerate a Confluence space / CQL query, a Jira JQL query, or a website and
 write a `.wiki-state/bulk-jobs/<id>/queue.json` for prefetch.py to consume.
 
 Usage:
     python3 discover.py --wiki-root PATH --space KEY
     python3 discover.py --wiki-root PATH --cql "space=FOO AND label=onboarding"
     python3 discover.py --wiki-root PATH --jql "project=PROJ AND updated > -30d"
+    python3 discover.py --wiki-root PATH --sitemap https://example.com/sitemap.xml
+    python3 discover.py --wiki-root PATH --site https://example.com
+    python3 discover.py --wiki-root PATH --crawl https://example.com --depth 2 --max-pages 100
 
 Options:
-    --replace    Overwrite an existing job with the same (kind, query)
-    --limit N    Cap the number of items (useful for testing)
+    --replace         Overwrite an existing job with the same (kind, query)
+    --limit N         Cap the number of items (useful for testing)
+    --include REGEX   Web only: keep URLs matching any pattern (repeatable)
+    --exclude REGEX   Web only: drop URLs matching any pattern (repeatable)
+    --since DATE      Web only: keep sitemap entries with lastmod >= YYYY-MM-DD
+    --ignore-robots   Web only: do not enforce robots.txt
+
+`--site` auto-discovers a sitemap (robots.txt Sitemap: directives first, then
+the standard /sitemap.xml locations). When no sitemap exists it prints
+`{"status": "needs_bounds", …}` and exits 0 rather than crawling blind — the
+caller is expected to ask the user for --depth and --max-pages and re-run with
+--crawl.
 
 Prints a JSON summary to stdout, including the assigned job_id.
 """
@@ -18,9 +31,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Iterable, List, Tuple
+from urllib.parse import urlparse
 
 from _deps import require
 
@@ -193,17 +209,178 @@ def enumerate_jira_jql(
     return items
 
 
+def _validate_web_args(args) -> None:
+    """Fail fast with a friendly message instead of a traceback.
+
+    Called once, before any HTTP request, so a typo in --since or a
+    schemeless --site never burns a request (or, for --since, silently
+    filters out most of the sitemap instead of erroring — string comparison
+    on an unvalidated date is a real footgun: "2026-06-15" < "2026-6-1"
+    lexicographically).
+    """
+    for flag, value in (("--site", args.site), ("--sitemap", args.sitemap), ("--crawl", args.crawl)):
+        if not value:
+            continue
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise SystemExit(
+                f"ERROR: {flag} {value!r} is not a valid http(s) URL "
+                "(missing scheme or host)."
+            )
+
+    if args.since:
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", args.since):
+            raise SystemExit(
+                f"ERROR: --since {args.since!r} must be YYYY-MM-DD (zero-padded), "
+                "e.g. --since 2026-06-01."
+            )
+        try:
+            date.fromisoformat(args.since)
+        except ValueError as e:
+            raise SystemExit(f"ERROR: --since {args.since!r} is not a valid date: {e}")
+
+    if args.crawl:
+        if args.depth is None or args.max_pages is None:
+            raise SystemExit(
+                "ERROR: --crawl requires explicit --depth and --max-pages bounds."
+            )
+        if args.depth < 0:
+            raise SystemExit(f"ERROR: --depth must be >= 0, got {args.depth}.")
+        if args.max_pages < 1:
+            raise SystemExit(f"ERROR: --max-pages must be >= 1, got {args.max_pages}.")
+
+
+def enumerate_web(args, cfg) -> List[Item]:
+    """Enumerate a website's pages via sitemap or bounded crawl.
+
+    Raises SystemExit(WebNeedsBounds) semantics via the caller: for --site with
+    no discoverable sitemap this returns None so main() can emit the
+    `needs_bounds` payload instead of guessing crawl limits.
+    """
+    _validate_web_args(args)
+    from web_discover import (  # imported here so Atlassian-only runs stay light
+        RobotsCache,
+        WebDiscoveryError,
+        apply_filters,
+        collect_sitemap_urls,
+        crawl,
+        find_sitemaps,
+        load_robots,
+    )
+    from web_url import normalize_url, origin_of
+
+    apply_ssl_env("web", cfg.web_verify_ssl())
+    limiter = get_limiter("web", cfg.web)
+    respect_robots = cfg.web_respect_robots() and not args.ignore_robots
+
+    target = normalize_url(args.sitemap or args.site or args.crawl)
+    robots = None
+    robots_cache = None
+    if respect_robots:
+        robots = load_robots(target, cfg, limiter)
+        if robots.disallow_all:
+            raise SystemExit(
+                "ERROR: robots.txt disallows automated access to this site. "
+                "Pass --ignore-robots if you have permission to ingest it anyway."
+            )
+        # Seed the cache with the entry-point origin's robots so it isn't
+        # fetched twice. A sitemap can list URLs on other origins, each
+        # checked against its own robots.txt lazily as they're encountered.
+        robots_cache = RobotsCache(cfg, limiter, seed=(origin_of(target), robots))
+
+    if args.crawl:
+        # Bounds and URL shape already validated by _validate_web_args above;
+        # the try/except is a backstop against crawl()'s own ValueError so a
+        # bad call from elsewhere can never surface as a raw traceback.
+        try:
+            entries = crawl(
+                target,
+                cfg,
+                limiter,
+                depth=args.depth,
+                max_pages=args.max_pages,
+                robots=robots,
+                respect_robots=respect_robots,
+            )
+        except ValueError as e:
+            raise SystemExit(f"ERROR: {e}")
+    else:
+        # A robots.txt URL isn't a sitemap — it's a pointer to them.
+        if args.sitemap and target.lower().endswith("/robots.txt"):
+            sitemaps = find_sitemaps(target, cfg, limiter, robots=robots)
+            if not sitemaps:
+                raise SystemExit(
+                    f"ERROR: {target} names no Sitemap: directive and no sitemap was "
+                    "found at the standard locations. Re-run with --crawl <url> "
+                    "--depth N --max-pages M."
+                )
+        elif args.sitemap:
+            sitemaps = [target]
+        else:
+            sitemaps = find_sitemaps(target, cfg, limiter, robots=robots)
+            if not sitemaps:
+                return None  # caller emits `needs_bounds`
+        try:
+            entries = collect_sitemap_urls(
+                sitemaps,
+                cfg,
+                limiter,
+                robots_cache=robots_cache if respect_robots else None,
+            )
+        except WebDiscoveryError as e:
+            raise SystemExit(f"ERROR: {e}")
+        if not entries and args.sitemap:
+            raise SystemExit(
+                f"ERROR: {target} yielded no page URLs. Check that it is a sitemap "
+                "(<urlset> or <sitemapindex>) and that its <loc> entries are pages."
+            )
+
+    try:
+        entries = apply_filters(
+            entries,
+            include=args.include or [],
+            exclude=args.exclude or [],
+            since=args.since,
+        )
+    except WebDiscoveryError as e:
+        raise SystemExit(f"ERROR: {e}")
+
+    # robots for the sitemap path is already enforced per-entry-origin inside
+    # collect_sitemap_urls; for --crawl, crawl() enforces it as it walks
+    # (same-origin only, so a single robots parser is correct there).
+
+    items: List[Item] = []
+    for entry in entries:
+        if args.limit and len(items) >= args.limit:
+            break
+        items.append(Item(ref=entry["loc"], title=""))
+    return items
+
+
 def determine_query(args) -> Tuple[str, str]:
-    picks = [bool(args.space), bool(args.cql), bool(args.jql)]
+    picks = [
+        bool(args.space),
+        bool(args.cql),
+        bool(args.jql),
+        bool(args.sitemap),
+        bool(args.site),
+        bool(args.crawl),
+    ]
     if sum(picks) != 1:
         raise SystemExit(
-            "ERROR: provide exactly one of --space, --cql, --jql"
+            "ERROR: provide exactly one of --space, --cql, --jql, --sitemap, --site, --crawl"
         )
     if args.space:
         return "confluence_space", args.space
     if args.cql:
         return "confluence_cql", args.cql
-    return "jira_jql", args.jql
+    if args.jql:
+        return "jira_jql", args.jql
+    if args.crawl:
+        return "web_crawl", args.crawl
+    # --sitemap and --site both resolve to a sitemap-driven job; keying the
+    # queue on the given URL means a re-run of the same command reuses it.
+    return "web_sitemap", (args.sitemap or args.site)
 
 
 def main() -> int:
@@ -212,6 +389,42 @@ def main() -> int:
     parser.add_argument("--space", help="Confluence space key")
     parser.add_argument("--cql", help="Confluence CQL query")
     parser.add_argument("--jql", help="Jira JQL query")
+    parser.add_argument("--sitemap", help="Sitemap URL (sitemap.xml, sitemap index, or .gz)")
+    parser.add_argument("--site", help="Site URL — auto-discover its sitemap")
+    parser.add_argument("--crawl", help="Site URL — crawl it (requires --depth and --max-pages)")
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=None,
+        help="Crawl only: how many link levels below the start URL to follow",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=None,
+        help="Crawl only: hard cap on the number of pages enumerated",
+    )
+    parser.add_argument(
+        "--include",
+        action="append",
+        default=[],
+        help="Web only: keep URLs matching this regex (repeatable)",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="Web only: drop URLs matching this regex (repeatable)",
+    )
+    parser.add_argument(
+        "--since",
+        help="Web only: keep sitemap entries whose <lastmod> is >= YYYY-MM-DD",
+    )
+    parser.add_argument(
+        "--ignore-robots",
+        action="store_true",
+        help="Web only: do not enforce robots.txt (use only with permission)",
+    )
     parser.add_argument(
         "--replace",
         action="store_true",
@@ -233,9 +446,14 @@ def main() -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
-    apply_ssl_env("atlassian", cfg.atlassian_verify_ssl())
-    limiter = get_limiter("atlassian", cfg.atlassian)
-    verify = cfg.atlassian_verify_ssl()
+    is_web = kind in {"web_sitemap", "web_crawl"}
+    if is_web:
+        limiter = None
+        verify = cfg.web_verify_ssl()
+    else:
+        apply_ssl_env("atlassian", cfg.atlassian_verify_ssl())
+        limiter = get_limiter("atlassian", cfg.atlassian)
+        verify = cfg.atlassian_verify_ssl()
 
     # Detect an existing job for the same (kind, query)
     existing = find_matching(cfg.wiki_root, kind, query)
@@ -262,7 +480,43 @@ def main() -> int:
         return 0
 
     # Enumerate
-    if kind == "confluence_space":
+    if is_web:
+        items = enumerate_web(args, cfg)
+        if items is None:
+            # No sitemap anywhere. Refuse to crawl blind — hand the decision
+            # back so the caller can ask the user for explicit bounds.
+            from web_discover import crawl_delay_for, load_robots
+            from web_url import origin_of
+
+            target = origin_of(args.site or "")
+            delay = None
+            try:
+                robots = load_robots(target, cfg, get_limiter("web", cfg.web))
+                delay = crawl_delay_for(robots, cfg.web_user_agent())
+            except Exception:  # noqa: BLE001 — advisory only
+                pass
+            print(
+                json.dumps(
+                    {
+                        "status": "needs_bounds",
+                        "kind": kind,
+                        "query": query,
+                        "site": target,
+                        "robots_crawl_delay": delay,
+                        "suggested": {"depth": 2, "max_pages": 100},
+                        "note": (
+                            f"No sitemap found for {target} (checked robots.txt Sitemap: "
+                            "directives and the standard /sitemap.xml locations). Ask the "
+                            "user for a crawl depth and a page cap, then re-run with "
+                            "--crawl <url> --depth N --max-pages M."
+                        ),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+    elif kind == "confluence_space":
         base = cfg.confluence_base_url()
         pat = cfg.confluence_pat()
         if not base or not pat:

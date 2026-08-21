@@ -36,5 +36,17 @@
     "burst": 3,
     "max_retries": 5,
     "retry_base_delay_seconds": 2
+  },
+  "web": {
+    "user_agent": "Mozilla/5.0 (compatible; llm-wiki-ingest/1.0)",
+    "verify_ssl": true,
+    "rate_limit_rps": 1,
+    "burst": 2,
+    "max_retries": 3,
+    "retry_base_delay_seconds": 2,
+    "timeout_seconds": 30,
+    "respect_robots": true,
+    "min_image_bytes": 8192,
+    "extra_headers": {}
   }
 }

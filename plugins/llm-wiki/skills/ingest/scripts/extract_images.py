@@ -20,7 +20,13 @@ copies.
 
 Uses the Confluence PAT when the image host matches
 atlassian.confluence_base_url (needed for authenticated attachment
-downloads), and similarly for Jira.
+downloads), and similarly for Jira. For `type: "web"` sources it uses the
+`web` rate limiter and always sends `web.user_agent`, but `web.extra_headers`
+(Cookie, Authorization, …) is sent **only** when the image's host matches the
+page's own host — an image embedded from a third-party CDN must never receive
+the credentials configured for the site being ingested. It also drops
+anything smaller than `web.min_image_bytes` — that floor is what filters out
+the icons and spacers whose dimensions weren't in the markup.
 
 Usage:
     python3 extract_images.py --wiki-root /path/to/wiki --source-json /path/to/raw/<slug>.source.json
@@ -69,11 +75,21 @@ def _matches_host(url: str, base_url: str) -> bool:
     return bool(u.netloc) and u.netloc == b.netloc
 
 
-def _headers_for(url: str, cfg) -> dict:
+def _headers_for(url: str, cfg, source_type: str = "", page_url: str = "") -> dict:
     if _matches_host(url, cfg.confluence_base_url()) and cfg.confluence_pat():
         return {"Authorization": f"Bearer {cfg.confluence_pat()}"}
     if _matches_host(url, cfg.jira_base_url()) and cfg.jira_pat():
         return {"Authorization": f"Bearer {cfg.jira_pat()}"}
+    if source_type == "web":
+        # User-Agent is always sent — a bare python-requests UA is 403'd by
+        # many CDNs, and it isn't a secret. web.extra_headers (Cookie,
+        # Authorization, …) is scoped to the *page's own* host: an image
+        # embedded from a third-party CDN must never receive the credentials
+        # configured for the site being ingested.
+        headers = {"User-Agent": cfg.web_user_agent()}
+        if _matches_host(url, page_url):
+            headers.update(cfg.web_extra_headers())
+        return headers
     return {}
 
 
@@ -150,15 +166,33 @@ def main() -> int:
         metadata = json.load(f)
 
     slug = args.slug or source_json.stem.replace(".source", "")
+    source_type = str(metadata.get("type") or "")
+    page_url = str(metadata.get("url") or "")
     image_hints = metadata.get("image_hints") or []
     images_dir = cfg.raw_dir / "images" / slug
     manifest = load_manifest(cfg.raw_dir, slug)
 
-    apply_ssl_env("atlassian", cfg.atlassian_verify_ssl())
-    verify = cfg.atlassian_verify_ssl()
-    limiter = get_limiter("atlassian", cfg.atlassian)
+    # Web images come from arbitrary hosts/CDNs, so they get their own limiter,
+    # SSL setting, and User-Agent rather than the Atlassian ones.
+    if source_type == "web":
+        apply_ssl_env("web", cfg.web_verify_ssl())
+        verify = cfg.web_verify_ssl()
+        limiter = get_limiter("web", cfg.web)
+        min_bytes = cfg.web_min_image_bytes()
+    else:
+        apply_ssl_env("atlassian", cfg.atlassian_verify_ssl())
+        verify = cfg.atlassian_verify_ssl()
+        limiter = get_limiter("atlassian", cfg.atlassian)
+        min_bytes = 0
 
-    counts = {"downloaded_new": 0, "overwritten": 0, "skipped_unchanged": 0, "skipped_alias": 0, "failed": 0}
+    counts = {
+        "downloaded_new": 0,
+        "overwritten": 0,
+        "skipped_unchanged": 0,
+        "skipped_alias": 0,
+        "skipped_small": 0,
+        "failed": 0,
+    }
     results: list[dict] = []
     manifest_dirty = False
 
@@ -169,11 +203,21 @@ def main() -> int:
         filename_hint = hint.get("filename", "") if isinstance(hint, dict) else ""
         ext = choose_extension(url, filename_hint)
 
-        headers = _headers_for(url, cfg)
+        headers = _headers_for(url, cfg, source_type, page_url)
         payload = download_to_memory(url, headers, verify, limiter=limiter)
         if payload is None:
             counts["failed"] += 1
             results.append({"url": url, "status": "failed"})
+            continue
+
+        # Byte-size floor for web images: markup rarely carries dimensions, so
+        # this is where the remaining icons and spacers get dropped. No manifest
+        # entry is written, so the description loop never sees them.
+        if min_bytes and len(payload) < min_bytes:
+            counts["skipped_small"] += 1
+            results.append(
+                {"url": url, "status": "skipped_small", "bytes": len(payload)}
+            )
             continue
 
         sha = hashlib.sha256(payload).hexdigest()

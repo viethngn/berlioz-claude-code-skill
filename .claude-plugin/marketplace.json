@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "Ad Suite PM skills for Claude Code",
-    "version": "1.5.0"
+    "version": "1.6.0"
   },
   "plugins": [
     {
@@ -46,7 +46,7 @@
     },
     {
       "name": "llm-wiki",
-      "description": "Ingest Confluence/Jira/local content into an LLM wiki, describe images via a nano-banana-pro-compatible endpoint on diff, lint the wiki, and bootstrap new wikis",
+      "description": "Ingest Confluence/Jira/Slack/local/website content into an LLM wiki — including bulk ingest of a whole Confluence space or a website sitemap — describe images via a nano-banana-pro-compatible endpoint on diff, lint the wiki, and bootstrap new wikis",
       "source": "./plugins/llm-wiki",
       "strict": false,
       "skills": [

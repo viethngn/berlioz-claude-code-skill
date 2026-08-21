@@ -22,6 +22,7 @@ PIP_NAMES: Mapping[str, str] = {
     "requests": "requests",
     "markdownify": "markdownify",
     "bs4": "beautifulsoup4",
+    "trafilatura": "trafilatura",
     "pypdf": "pypdf",
     "docx": "python-docx",
     "openpyxl": "openpyxl",

@@ -20,7 +20,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-VALID_KINDS = {"confluence_space", "confluence_cql", "jira_jql"}
+VALID_KINDS = {
+    "confluence_space",
+    "confluence_cql",
+    "jira_jql",
+    "web_sitemap",
+    "web_crawl",
+}
 VALID_RAW_STATUS = {"pending", "done", "unchanged", "failed"}
 VALID_WIKI_STATUS = {"pending", "done", "skipped"}
 
@@ -49,6 +55,8 @@ def make_job_id(kind: str, query: str) -> str:
         "confluence_space": "conf-space",
         "confluence_cql": "conf-cql",
         "jira_jql": "jira-jql",
+        "web_sitemap": "web-sitemap",
+        "web_crawl": "web-crawl",
     }.get(kind, "job")
     return f"{prefix}-{slug}-{stamp}"
 

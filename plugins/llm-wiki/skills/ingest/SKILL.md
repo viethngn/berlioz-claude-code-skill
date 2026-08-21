@@ -3,35 +3,38 @@ name: ingest
 description: |
   Ingests one or many sources — a Confluence page URL, a Jira issue URL or
   key, a local file (Markdown, plain text, HTML, PDF, DOCX, XLSX, CSV, PPTX,
-  or an image), a whole Confluence space, a Confluence CQL query, or a Jira
-  JQL query — into an LLM wiki. The skill auto-detects single-item vs bulk from the
-  source shape or explicit flags. It fetches content, extracts embedded
+  or an image), a Slack channel/thread/search, a public website page, a whole
+  Confluence space, a Confluence CQL query, a Jira JQL query, or a website
+  sitemap — into an LLM wiki. The skill auto-detects single-item vs bulk from
+  the source shape or explicit flags. It fetches content, extracts embedded
   images, describes only new-or-changed images via a nano-banana-pro-
   compatible vision endpoint, writes raw sources + wiki pages, and commits
   the result to git so the next ingest can diff against it.
 
   Bulk mode uses a resumable job queue with rate limiting and a circuit
-  breaker so a whole-space ingest can be paused (Ctrl-C) and resumed with
-  `/ingest --resume <job-id>` without re-fetching completed items.
+  breaker so a whole-space or whole-site ingest can be paused (Ctrl-C) and
+  resumed with `/ingest --resume <job-id>` without re-fetching completed items.
 
   Use this skill whenever the user wants to add, update, refresh, re-ingest,
   import, backfill, or batch-import content into their wiki. Trigger on
   phrases like: "ingest this Confluence page", "add this Jira ticket to the
   wiki", "pull this URL into the wiki", "ingest this PDF", "process this
   document", "refresh this source", "ingest the FOO space", "backfill space
-  FOO", "ingest all tickets matching this JQL", "resume the last bulk
-  ingest".
+  FOO", "ingest all tickets matching this JQL", "ingest this website", "scrape
+  these docs into the wiki", "ingest this sitemap", "crawl this site into the
+  wiki", "resume the last bulk ingest".
 
   Requires a per-wiki `.wikirc.json` file with Confluence, Jira, and
-  nano-banana endpoints and Personal Access Tokens. If the config is
-  missing or scripts cannot import their dependencies, direct the user to
-  references/setup.md before proceeding.
+  nano-banana endpoints and Personal Access Tokens. Public website ingest
+  needs no credentials. If the config is missing or scripts cannot import
+  their dependencies, direct the user to references/setup.md before proceeding.
 ---
 
 # Ingest — LLM Wiki
 
 One skill covering both single-item ingest and bulk ingest of whole
-Confluence spaces / CQL queries / Jira JQL queries. Auto-detects the mode.
+Confluence spaces / CQL queries / Jira JQL queries / websites. Auto-detects
+the mode.
 
 ## Prerequisites
 
@@ -62,9 +65,14 @@ proceed — no confirmation needed.
 | URL with `/display/<KEY>` (no page name) | Bulk Confluence space |
 | URL with `?spaceKey=<KEY>` and no `pageId` | Bulk Confluence space |
 | Existing local file path | Single local file |
+| URL ending `sitemap*.xml`, `*sitemap*.xml.gz`, or `/robots.txt` | Bulk website |
+| Any other `http(s)` URL | **Single web page** |
 | `--space FOO` | Bulk Confluence space |
 | `--cql "…"` | Bulk Confluence CQL |
 | `--jql "…"` | Bulk Jira JQL |
+| `--sitemap <url>` | Bulk website from an exact sitemap URL |
+| `--site <url>` | Bulk website, auto-discovering the sitemap |
+| `--crawl <url> --depth N --max-pages M` | Bulk website by crawling |
 | `--resume <job-id>` | Resume a prior bulk job |
 | `--slack-channel CHANNEL` or `--channel CHANNEL` with `fetch_slack.py` | Slack channel |
 | `--slack-search "QUERY"` or `--search "QUERY"` with `fetch_slack.py` | Slack search results |
@@ -74,6 +82,12 @@ Explicit flags win over URL heuristics. A URL that matches both "single
 page" and "space" resolves to single (the `/pages/` segment wins).
 Ambiguous bare tokens (e.g., "FOO" — could be a space key or a slug) must
 be disambiguated by asking the user or by requiring an explicit flag.
+
+A **bare site URL is always one page**, never a whole site — so
+`/ingest https://example.com/docs/intro` can't accidentally enumerate a
+domain. When the user's wording implies the whole site ("ingest their docs",
+"pull in this website"), use `--site <url>` explicitly rather than passing the
+URL as `--source`.
 
 ### Scope note for bulk
 
@@ -87,7 +101,13 @@ pause for confirmation:
 > hours and touch every wiki category.
 
 If the user wants to scope down, they can re-run with `--cql`
-(`label=…` or `updated > …`) — but that's their call, not a blocking prompt.
+(`label=…` or `updated > …`) — or, for a website, `--include` / `--exclude` /
+`--since` / `--limit` — but that's their call, not a blocking prompt.
+
+The one exception is a **sitemap-less website**: `discover.py` refuses to crawl
+without bounds and hands the decision back to you (see the bulk website
+workflow below). That prompt is required, because guessing a crawl depth on an
+unknown domain is not a safe default.
 
 ## Resolving the Python interpreter
 
@@ -271,6 +291,34 @@ ${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
 
 If `auto_push: true`, the push happens automatically after the commit.
 
+## Website workflow (single page)
+
+A public web page needs no credentials — nothing in `.wikirc.json` is
+required. It follows the **standard single-item workflow** above (Phase 1
+fetch with `--no-commit` → Phase 2 takeaways → Phase 3 wiki pages → Phase 4
+one commit): `ingest.py` routes any non-Atlassian `http(s)` URL to
+`fetch_web.py` automatically.
+
+```bash
+${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
+  --wiki-root "${WIKI_ROOT}" \
+  --source "https://example.com/docs/getting-started" \
+  --no-commit
+```
+
+Two things differ from Confluence:
+
+- **`extractor` in the JSON summary** is `trafilatura` (normal) or `bs4`
+  (fallback). If it says `bs4`, the page may include some navigation or
+  footer text — skim `raw/<slug>.md` before synthesizing so you don't cite
+  boilerplate as a fact.
+- **Slugs are URL-derived**, e.g. `web-docs-python-org-3-library-json`. Cite
+  them as-is; they're stable across page retitles.
+
+If the fetch fails with "no readable content extracted", the page is rendered
+client-side. Tell the user to save it from their browser (Save As → Web Page,
+Complete) and ingest the `.html` file, which goes through `fetch_local.py`.
+
 ## Bulk workflow
 
 Bulk runs in three phases: **discovery**, **prefetch** (long-running, no
@@ -290,6 +338,9 @@ ${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
 # or:
 #   --cql "space=FOO AND label=onboarding"
 #   --jql "project=PROJ AND updated > -30d"
+#   --sitemap https://example.com/sitemap.xml
+#   --site https://example.com
+#   --crawl https://example.com --depth 2 --max-pages 100
 #   --resume <job-id>
 ```
 
@@ -313,6 +364,52 @@ ${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
 
 `--resume` implies `--retry-failed`, so previously-failed items get
 another attempt.
+
+#### Bulk websites: sitemap first, crawl only with the user's bounds
+
+`--site <url>` looks for a sitemap in `robots.txt` first, then at the standard
+`/sitemap.xml` locations. Nested sitemap indexes and `.gz` sitemaps are
+followed automatically.
+
+**When no sitemap exists**, discovery stops and returns this instead of a
+`job_id` — it will not crawl on its own:
+
+```json
+{"status": "needs_bounds", "site": "https://example.com",
+ "robots_crawl_delay": null, "suggested": {"depth": 2, "max_pages": 100},
+ "note": "No sitemap found …"}
+```
+
+When you see `needs_bounds`, **use `AskUserQuestion`** to get a crawl depth and
+a page cap — offer the `suggested` values as the recommended option — then
+re-run:
+
+```bash
+${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
+  --wiki-root "${WIKI_ROOT}" \
+  --crawl "https://example.com" --depth 2 --max-pages 100
+```
+
+Do not invent bounds and do not fall back to `--depth 99`. If the user declines
+to pick, ingest the pages they actually care about individually instead.
+
+**Scoping a large sitemap.** These compose, and all of them beat crawling:
+
+| Flag | Use for |
+|------|---------|
+| `--include REGEX` | Only one section, e.g. `--include '/docs/'` (repeatable) |
+| `--exclude REGEX` | Drop noise, e.g. `--exclude '/blog/' --exclude '/tag/'` |
+| `--since YYYY-MM-DD` | Only pages whose `<lastmod>` is recent — the cheapest refresh |
+| `--limit N` | Hard cap, good for a trial run before committing to the full site |
+
+Re-running the same `--site` / `--sitemap` URL **reuses its queue**, so a
+periodic refresh is just the same command again; `prefetch.py` skips items
+already `done`/`unchanged` and the conditional-GET gate makes untouched pages
+nearly free. `--replace` starts fresh.
+
+**robots.txt is enforced on all bulk website paths** — disallowed URLs are
+dropped from the queue and reported. `--ignore-robots` overrides it; only pass
+it if the user confirms they have permission for that site.
 
 ### Bulk Phase 2 — Status report (non-blocking)
 
@@ -373,7 +470,9 @@ failed. Offer to `/ingest --resume <job-id>` for failures.
 ## Concrete rules
 
 - **Slug**: `slugify(title)` for Confluence, `KEY-123-<slug-of-summary>` for
-  Jira, filename stem for local files. Enforced by `ingest.py`.
+  Jira, filename stem for local files, `web-<host>-<url-path>` for web pages
+  (URL-derived, not title-derived, so a retitled page updates its existing raw
+  file instead of creating a second one). Enforced by `ingest.py`.
 - **Raw layout**:
   - `raw/<slug>.md` — Markdown-converted source content
   - `raw/<slug>.source.json` — stable metadata:
@@ -400,7 +499,10 @@ failed. Offer to `/ingest --resume <job-id>` for failures.
   the queue for one bulk job. Git-ignored. Never referenced by wiki pages.
 - **Volatile / local-only state lives outside git**:
   - `.wiki-state/last-fetched.json` at the wiki root records the timestamp
-    and status of the most recent single-item fetch per slug.
+    and status of the most recent single-item fetch per slug. For web sources
+    it also holds the `ETag` / `Last-Modified` validators under a separate
+    `web:<slug>` key (a prefixed key, because `write_fetch_history` overwrites
+    `data[<slug>]` wholesale).
   - `.wiki-state/bulk-jobs/` holds bulk job queues.
   - Image **byte files** under `raw/images/**/*.{png,jpg,jpeg,gif,webp,bmp}`
     are ignored too — they're re-downloaded each ingest, so only their
@@ -414,8 +516,14 @@ failed. Offer to `/ingest --resume <job-id>` for failures.
   fetcher returns `status="unchanged"` and does not rewrite `raw/<slug>.md`
   or `raw/<slug>.source.json`. `fetch_local.py` also fast-paths on
   `source_sha256` (the SHA of the copied-in `raw/<slug><ext>`, not the external
-  original) to avoid re-parsing PDFs/DOCX. In bulk mode, unchanged items skip
-  the image and description steps.
+  original) to avoid re-parsing PDFs/DOCX. `fetch_web.py` fast-paths on a
+  **conditional GET** (`If-None-Match` / `If-Modified-Since` from validators
+  stored under the *requested* URL's slug, resolving to the final slug after
+  redirects) — an HTTP 304 returns `unchanged` without downloading or parsing
+  the page at all. The conditional headers are only sent when both raw files
+  for the resolved slug still exist on disk, so a deleted raw file can never
+  be mistaken for "unchanged". In bulk mode, unchanged items skip the image
+  and description steps.
 - **Orchestrator gate (Layer 2)**: when the fetcher reports `unchanged`,
   `ingest.py` skips image download, image description, and the git commit.
   Only `.wiki-state/last-fetched.json` is updated. Pass `--force` to
@@ -428,15 +536,33 @@ failed. Offer to `/ingest --resume <job-id>` for failures.
 - **Image description gate (Layer 4)**: `image_manifest.py.classify()`
   returns `new` / `changed` / `unchanged`. Only `new` or `changed` images
   invoke `describe_image.py`.
-- **Rate limiting**: every HTTP call to Atlassian and nano-banana-pro goes
-  through `rate_limiter.py`. Config lives in `.wikirc.json` under
-  `atlassian.rate_limit_rps` / `.burst` / `.max_retries` /
-  `.retry_base_delay_seconds` (and the same keys under `nano_banana`).
-  Defaults: Atlassian 2 rps / burst 5, nano-banana 1 rps / burst 2. On
-  HTTP 429 or 503, the limiter respects `Retry-After` (seconds or
-  HTTP-date) and otherwise backs off exponentially with jitter. After
-  `max_retries` a request fails and (in bulk mode) the item's queue entry
+- **Web image filtering**: web pages are mostly chrome, so hints are collected
+  from the extracted content subtree only, then filtered by form (`data:`,
+  `.svg`, `.ico`), by name/role pattern
+  (`logo|icon|avatar|sprite|badge|pixel|tracking|spacer|favicon`), by declared
+  dimensions (<100px), and finally by byte size (`web.min_image_bytes`, default
+  8192, applied after download in `extract_images.py`). Max 20 hints per page.
+  Survivors go through Layers 3 and 4 exactly like Confluence attachments.
+- **Rate limiting**: every HTTP call to Atlassian, nano-banana-pro, Slack, and
+  the open web goes through `rate_limiter.py`. Config lives in `.wikirc.json`
+  under `atlassian.rate_limit_rps` / `.burst` / `.max_retries` /
+  `.retry_base_delay_seconds` (and the same keys under `nano_banana`, `slack`,
+  and `web`). Defaults: Atlassian 2 rps / burst 5, nano-banana 1 rps / burst 2,
+  web 1 rps / burst 2. On HTTP 429 or 503, the limiter respects `Retry-After`
+  (seconds or HTTP-date) and otherwise backs off exponentially with jitter.
+  After `max_retries` a request fails and (in bulk mode) the item's queue entry
   goes to `failed`.
+- **robots.txt**: advisory for a single explicitly-named page (warn, proceed),
+  **enforced** for every bulk website path (`--site` / `--sitemap` / `--crawl`).
+  `--ignore-robots` or `web.respect_robots: false` overrides it. A crawl also
+  honors `Crawl-delay`. **Enforced per-origin**: a sitemap entry (or a nested
+  `<sitemapindex>` sitemap) that points at a different host is checked against
+  *that host's own* robots.txt, cached per origin — never against the
+  entry-point host's rules.
+- **Credential scoping**: `web.extra_headers` (Cookie, Authorization, …) is
+  sent to the page itself, and to images only when the image's host matches
+  the page's own host. An image embedded from a third-party CDN never
+  receives them — only `web.user_agent` is sent cross-origin.
 - **Circuit breaker (bulk only)**: `prefetch.py` aborts if 5 consecutive
   items fail. The user resumes with `/ingest --resume <job-id>`.
 - **PAT auth**: `Authorization: Bearer <PAT>` for both Confluence and Jira
@@ -456,10 +582,13 @@ You can run scripts individually for debugging or non-standard flows.
 | `scripts/fetch_confluence.py --wiki-root <path> --url <url>` | Fetch one Confluence page |
 | `scripts/fetch_jira.py --wiki-root <path> --key <KEY-123>` | Fetch one Jira issue |
 | `scripts/fetch_local.py --wiki-root <path> --path <file>` | Ingest one local file |
+| `scripts/fetch_web.py --wiki-root <path> --url <url>` | Fetch one web page |
+| `scripts/web_discover.py` | Library: sitemap/robots discovery + bounded crawler (no CLI) |
+| `scripts/web_url.py` | Library: URL normalization + `web_slug()` (no CLI) |
 | `scripts/extract_images.py --wiki-root <p> --source-json <f>` | Download image_hints for a slug |
 | `scripts/image_manifest.py --wiki-root <p> --slug <s> status` | Print per-image diff status |
 | `scripts/describe_image.py --wiki-root <p> --image <p> --output <p>` | Describe one image |
-| `scripts/discover.py --wiki-root <p> --space/--cql/--jql <q>` | Enumerate items, write a job queue |
+| `scripts/discover.py --wiki-root <p> --space/--cql/--jql/--sitemap/--site/--crawl <q>` | Enumerate items, write a job queue |
 | `scripts/prefetch.py --wiki-root <p> --job-id <id>` | Bulk-fetch items in a queue, resumable |
 | `scripts/queue_admin.py --wiki-root <p> list \| show \| reset \| mark \| delete` | Inspect and manage job queues |
 
@@ -488,10 +617,13 @@ All scripts respond to `--help` with their full argument list.
   matches; skill reports `status="unchanged"`, skips image download /
   description / commit, and only updates `.wiki-state/last-fetched.json`.
   Pass `--force` to override.
-- **User manually deleted a file under `raw/`**: the diff gate still sees
-  the source as unchanged (source hash matches) and won't restore the
-  file. Advise the user to run with `--force` (single) or
-  `queue_admin.py reset` (bulk).
+- **User manually deleted a file under `raw/`**: for Confluence/Jira/local,
+  the diff gate still sees the source as unchanged (source hash matches) and
+  won't restore the file — advise `--force` (single) or `queue_admin.py
+  reset` (bulk). **Web sources self-heal**: `fetch_web.py` checks that both
+  `raw/<slug>.md` and `raw/<slug>.source.json` exist before trusting a
+  server's 304; if either is missing it omits the conditional headers, gets a
+  full 200, and rewrites them — no `--force` needed.
 - **Bulk: user Ctrl-C's during prefetch**: safe. The queue is
   checkpointed after every item. Resume with `/ingest --resume <job-id>`.
 - **Bulk: rate limit hit**: `rate_limiter.py` transparently retries with
@@ -500,6 +632,49 @@ All scripts respond to `--help` with their full argument list.
   consecutive failures. User backs off and resumes.
 - **Bulk: same query re-run**: `discover.py` detects the matching queue
   and reuses it (skips re-enumeration). Pass `--replace` to overwrite.
+- **Web page is JavaScript-rendered**: extraction yields nothing and
+  `fetch_web.py` exits with a message saying so. Tell the user to save the
+  rendered page from their browser (Save As → Web Page, Complete) and ingest
+  the local `.html` file — `fetch_local.py` handles it. Never write an empty
+  raw file.
+- **Web URL is not HTML** (PDF, DOCX, ZIP, image): rejected with a pointer to
+  local-file ingest. Suggest downloading it and running `/ingest <path>`, which
+  parses all of those natively.
+- **Web page returns 403 but loads in a browser**: the default User-Agent is
+  blocked. Tell the user to set `web.user_agent` to a browser string, or to add
+  the site's session cookie under `web.extra_headers` in `.wikirc.json`.
+- **Web page needs a login**: same fix — `web.extra_headers` accepts a `Cookie`
+  or `Authorization` header. `config.py` redacts the values when printing.
+  These headers are sent **only to the page's own host** — an image embedded
+  from a third-party CDN never receives them.
+- **Ingested URL redirects** (e.g. `http://` → `https://`, or a moved page):
+  the raw file is written under the *target's* slug. Re-ingesting the
+  original URL still hits the 304 cache — validators are recorded under both
+  the requested URL's slug and the resolved one.
+- **Bulk website: no sitemap found**: `discover.py` returns
+  `status="needs_bounds"` and exits 0. Ask the user for `--depth` and
+  `--max-pages` via `AskUserQuestion`, then re-run with `--crawl`. Do not guess
+  the bounds.
+- **Bulk website: robots.txt disallows everything** (including a robots.txt
+  that returns 401/403, which the standard reads as a blanket disallow):
+  discovery aborts with an explanatory error. Only re-run with
+  `--ignore-robots` if the user confirms they have permission.
+- **Sitemap lists a URL on a different host**: normal — a root sitemap
+  commonly lists a docs subdomain. That URL is checked against **its own**
+  host's robots.txt, not the entry-point host's.
+- **Sitemap contains a `mailto:`/`ftp:`/non-http `<loc>`**: dropped during
+  discovery with a warning; it never reaches the queue.
+- **Sitemap enumerates thousands of pages**: don't ingest them all by reflex.
+  Scope with `--include` / `--exclude` / `--since` / `--limit` and say what you
+  scoped to. Discovery hard-stops at 50,000 URLs.
+- **`--since`, `--depth`, `--max-pages`, or a site URL flag is malformed**:
+  `discover.py` validates all of these before making any HTTP request and
+  exits with a plain `ERROR:` message — never a traceback. Fix the value and
+  re-run; nothing was fetched.
+- **Web page's rendered Markdown changes on every ingest**: something volatile
+  is inside the extracted region (a CSRF token, a visitor counter, an ad slot).
+  Show the user `git diff raw/<slug>.md` — there's no per-source ignore
+  mechanism, so the practical answer is to stop re-ingesting that page.
 
 ## Reference docs
 
@@ -508,4 +683,5 @@ All scripts respond to `--help` with their full argument list.
 | [references/setup.md](references/setup.md) | User hits any dependency or config error, or is setting up for the first time |
 | [references/atlassian-api.md](references/atlassian-api.md) | Debugging Confluence/Jira fetches or CQL/JQL queries |
 | [references/local-files.md](references/local-files.md) | Debugging local file parsing or supporting a new format |
+| [references/web-pages.md](references/web-pages.md) | Debugging a web page fetch, sitemap discovery, a crawl, or web image filtering |
 | [references/page-format.md](references/page-format.md) | Wiki-update phase — page template and citation rules |

@@ -4,8 +4,9 @@ Three skills for maintaining a personal LLM knowledge wiki, backed by git.
 
 - **`/ingest`** — Pull content from a Confluence page, Jira issue, local file
   (Markdown, HTML, PDF, DOCX, XLSX, CSV, PPTX, image — all parsed natively, no
-  model dependency), **or** Slack channel / thread / search results, **or**
-  bulk-ingest a whole Confluence space / CQL query / JQL query.
+  model dependency), **or** Slack channel / thread / search results, **or** a
+  public website page, **or** bulk-ingest a whole Confluence space / CQL query /
+  JQL query / website sitemap.
   The skill auto-detects single vs bulk from the source shape or explicit flags.
   Extracts embedded images, describes them via a nano-banana-pro-compatible
   vision endpoint **only when they change**, and updates the wiki. Bulk mode
@@ -148,6 +149,18 @@ optional; leave one empty and that source type is simply skipped.
     "burst": 3,
     "max_retries": 5,
     "retry_base_delay_seconds": 2
+  },
+  "web": {
+    "user_agent": "Mozilla/5.0 (compatible; llm-wiki-ingest/1.0)",
+    "verify_ssl": true,
+    "rate_limit_rps": 1,
+    "burst": 2,
+    "max_retries": 3,
+    "retry_base_delay_seconds": 2,
+    "timeout_seconds": 30,
+    "respect_robots": true,
+    "min_image_bytes": 8192,
+    "extra_headers": {}
   }
 }
 ```
@@ -160,6 +173,18 @@ just works. No token goes in `.wikirc.json`.
 
 **`slack.token`** — a Slack User OAuth Token (`xoxp-…`). See
 [How to get a Slack token](#how-to-get-a-slack-token) below.
+
+**`web.*`** — website ingest. **Entirely optional** — every key has a default
+and public pages need no credentials, so you can leave this block out. Reach for
+it when a site returns `403` to the default User-Agent (set `user_agent` to a
+browser string), when a page is behind a login (put a `Cookie` or
+`Authorization` header in `extra_headers` — `config.py` redacts the values when
+printing), or when you want to loosen `min_image_bytes` so smaller diagrams get
+described. `extra_headers` reaches only the page's own host — an image embedded
+from a third-party CDN never receives them, even for images on the same page.
+`respect_robots` is `true` by default: robots.txt is **enforced** (per origin,
+so a sitemap entry on another host is checked against that host's own rules)
+on bulk website ingest, and advisory for a single page you name explicitly.
 
 Rate-limit knobs are optional. Defaults are conservative so a first-time bulk
 run won't get anyone rate-banned. Every HTTP call flows through `rate_limiter.py`,
@@ -211,6 +236,66 @@ source: the diff check hashes that copy (not the external path), so re-ingest
 keeps working even if the original moves or is deleted. Documents, spreadsheets,
 and presentations are committed; image/video/audio originals are copied but
 git-ignored (kept local).
+
+### Ingest a web page
+
+> /ingest https://docs.example.com/guides/getting-started
+
+No credentials needed for public pages. The HTML is extracted with
+[trafilatura](https://trafilatura.readthedocs.io/) (falling back to
+BeautifulSoup + markdownify), which strips navigation, sidebars, cookie
+banners, and related-article blocks so `raw/<slug>.md` is the article and
+nothing else.
+
+The slug comes from the **URL**, not the page title
+(`web-docs-example-com-guides-getting-started`), so a retitled page updates its
+existing raw file instead of creating a duplicate. Re-ingesting replays the
+stored `ETag` as `If-None-Match` — an unchanged page costs a single `304` and
+never gets re-parsed or re-committed.
+
+Images are filtered hard before any vision call: only images inside the
+extracted content survive, and logos, icons, spacers, SVGs, tracking pixels,
+and anything under `web.min_image_bytes` are dropped. Diagrams and screenshots
+go through the normal describe-on-change flow.
+
+A JavaScript-rendered page has nothing to extract from its HTML — save it from
+your browser (Save As → Web Page, Complete) and ingest the `.html` file instead.
+
+### Bulk-ingest a website
+
+> /ingest --site https://docs.example.com
+
+Finds the sitemap the way a crawler would: `Sitemap:` directives in
+`robots.txt` first, then `/sitemap.xml` and friends. Sitemap indexes and
+gzipped sitemaps are followed automatically. Then it's the same resumable
+queue as a Confluence space — prefetch every page, then synthesize wiki pages
+one commit at a time.
+
+Pass an exact sitemap URL if you have one (also auto-detected from `/ingest`
+with no flag):
+
+> /ingest --sitemap https://docs.example.com/sitemap_index.xml
+
+Scope a large site — these compose, and all of them beat crawling:
+
+> /ingest --site https://docs.example.com --include '/docs/' --exclude '/blog/'
+>
+> /ingest --site https://docs.example.com --since 2026-06-01
+>
+> /ingest --site https://docs.example.com --limit 10
+
+`--since` filters on the sitemap's `<lastmod>`, which makes a periodic refresh
+cheap. Re-running the same `--site` URL reuses its existing queue, so refreshing
+a site is just the same command again.
+
+**Sites with no sitemap** don't get crawled blind. Discovery stops and asks you
+for a depth and a page cap first:
+
+> /ingest --crawl https://example.com --depth 2 --max-pages 100
+
+The crawl is breadth-first, same-origin, HTML-only, and honors robots.txt
+including `Crawl-delay`. `robots.txt` is enforced on every bulk website path;
+`--ignore-robots` overrides it, for sites where you have permission.
 
 ### Bulk-ingest a whole Confluence space
 
@@ -272,7 +357,7 @@ before new messages arrive returns "unchanged" — nothing is committed.
 
 ### `/ingest`
 
-1. Detect source type (Confluence URL / Jira key / local file).
+1. Detect source type (Confluence URL / Jira key / local file / web URL).
 2. Fetch and convert to Markdown, then compare against `raw/<slug>.md` on disk.
 3. **Content diff gate.** If the freshly-rendered Markdown matches the previous
    `content_sha256`, mark the source `unchanged` and skip everything else —
@@ -299,21 +384,25 @@ before new messages arrive returns "unchanged" — nothing is committed.
 
 | Layer | Where | What it compares |
 |-------|-------|------------------|
+| 0. Conditional GET (web only) | `fetch_web.py` | Stored `ETag` / `Last-Modified` replayed as `If-None-Match` / `If-Modified-Since`; a 304 skips the download and parse entirely |
 | 1. Source-file gate (local only) | `fetch_local.py` | SHA-256 of the raw file bytes; skips parsing PDFs/DOCX when unchanged |
 | 2. Content-diff gate | `raw_store.write_raw_if_changed` | SHA-256 of the rendered Markdown; skips rewriting `raw/<slug>.md` + `raw/<slug>.source.json` when unchanged |
 | 3. Image dedup gate | `extract_images.py` | Manifest lookup by `source_url`, then by SHA-256; prevents duplicate files |
 | 4. Description gate | `image_manifest.py.classify()` | SHA-256 + presence of a description file; only new/changed images invoke nano-banana-pro |
 
-Pass `--force` to `ingest.py` to bypass gates 1 and 2 for a full refresh.
+Pass `--force` to `ingest.py` to bypass gates 0, 1 and 2 for a full refresh.
 
-**Bulk mode** (Confluence space / CQL / JQL / `--resume`) reuses the same
-per-item flow but routes it through three phases:
+**Bulk mode** (Confluence space / CQL / JQL / website / `--resume`) reuses the
+same per-item flow but routes it through three phases:
 
 1. **Discovery** — [`discover.py`](skills/ingest/scripts/discover.py)
-   paginates the space/query with the Atlassian rate limiter and writes
+   paginates the space/query with the Atlassian rate limiter, or (for a
+   website) enumerates the sitemap via
+   [`web_discover.py`](skills/ingest/scripts/web_discover.py), and writes
    `.wiki-state/bulk-jobs/<job-id>/queue.json`. If a queue for the same
    `(kind, query)` already exists, it's reused; pass `--replace` to
-   overwrite.
+   overwrite. For a website with no sitemap, discovery deliberately stops and
+   asks for explicit `--depth` / `--max-pages` bounds instead of crawling.
 2. **Prefetch** — [`prefetch.py`](skills/ingest/scripts/prefetch.py)
    iterates pending items, invoking the single-item fetchers via
    subprocess so the diff gates fire per page. Every item is checkpointed
@@ -418,6 +507,9 @@ my-wiki/
   Confluence and Jira REST endpoints, PAT auth, storage-format tips.
 - [skills/ingest/references/local-files.md](skills/ingest/references/local-files.md) —
   Per-format parsing notes (PDF, DOCX, XLSX, CSV, PPTX, HTML, images).
+- [skills/ingest/references/web-pages.md](skills/ingest/references/web-pages.md) —
+  Web extraction pipeline, slug scheme, sitemap/robots discovery, crawl bounds,
+  image filtering, and troubleshooting.
 - [skills/ingest/references/page-format.md](skills/ingest/references/page-format.md) —
   Wiki page template and citation rules.
 
@@ -429,3 +521,4 @@ my-wiki/
 - Access to your Confluence, Jira, and nano-banana-pro endpoints
 - Personal Access Tokens for Confluence and Jira (either optional if you don't
   use that source)
+- Nothing extra for website ingest — public pages need no credentials

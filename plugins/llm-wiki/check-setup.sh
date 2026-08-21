@@ -54,6 +54,7 @@ check_pkg() {
 check_pkg requests          "requests"
 check_pkg markdownify       "markdownify"
 check_pkg bs4               "beautifulsoup4"
+check_pkg trafilatura       "trafilatura"
 check_pkg pypdf             "pypdf"
 check_pkg docx              "python-docx"
 check_pkg openpyxl          "openpyxl"

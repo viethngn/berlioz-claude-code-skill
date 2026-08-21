@@ -2,9 +2,9 @@
 """Long-running, resumable bulk fetcher for a discovered job queue.
 
 For each pending / previously-failed item in the queue, this script:
-  1. Invokes the appropriate single-source fetcher (fetch_confluence.py or
-     fetch_jira.py) via subprocess so it inherits the diff gates and error
-     handling of the existing single-source flow.
+  1. Invokes the appropriate single-source fetcher (fetch_confluence.py,
+     fetch_jira.py, or fetch_web.py) via subprocess so it inherits the diff
+     gates and error handling of the existing single-source flow.
   2. Runs extract_images.py to download any image_hints (with the SHA-based
      dedup pass).
   3. Runs the image-diff loop from ingest.py against the resulting slug so
@@ -91,6 +91,19 @@ def _fetch_one(queue: Queue, item, wiki_root: Path) -> dict:
                 str(wiki_root),
                 "--key",
                 item.ref,
+            ],
+        )
+    if queue.kind in {"web_sitemap", "web_crawl"}:
+        # Robots was already enforced at discovery time for the whole job, so
+        # skip the per-page lookup — it would double the request count.
+        return _run_script(
+            "fetch_web.py",
+            [
+                "--wiki-root",
+                str(wiki_root),
+                "--url",
+                item.ref,
+                "--no-robots-check",
             ],
         )
     raise ValueError(f"unknown queue kind: {queue.kind}")

@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+DEFAULT_WEB_USER_AGENT = "Mozilla/5.0 (compatible; llm-wiki-ingest/1.0)"
+
 DEFAULT_CONFIG = {
     "wiki_root": ".",
     "raw_dir": "raw",
@@ -58,6 +60,18 @@ DEFAULT_CONFIG = {
         "burst": 3,
         "max_retries": 5,
         "retry_base_delay_seconds": 2,
+    },
+    "web": {
+        "user_agent": DEFAULT_WEB_USER_AGENT,
+        "verify_ssl": True,
+        "rate_limit_rps": 1,
+        "burst": 2,
+        "max_retries": 3,
+        "retry_base_delay_seconds": 2,
+        "timeout_seconds": 30,
+        "respect_robots": True,
+        "min_image_bytes": 8192,
+        "extra_headers": {},
     },
 }
 
@@ -139,6 +153,35 @@ class Config:
     def slack_verify_ssl(self) -> bool:
         return bool(self.slack.get("verify_ssl", True))
 
+    @property
+    def web(self) -> dict:
+        return dict(self.data.get("web") or {})
+
+    def web_user_agent(self) -> str:
+        return self.web.get("user_agent") or DEFAULT_WEB_USER_AGENT
+
+    def web_verify_ssl(self) -> bool:
+        return bool(self.web.get("verify_ssl", True))
+
+    def web_timeout(self) -> int:
+        return int(self.web.get("timeout_seconds") or 30)
+
+    def web_respect_robots(self) -> bool:
+        return bool(self.web.get("respect_robots", True))
+
+    def web_min_image_bytes(self) -> int:
+        return int(self.web.get("min_image_bytes") or 0)
+
+    def web_extra_headers(self) -> dict:
+        extra = self.web.get("extra_headers") or {}
+        if not isinstance(extra, dict):
+            return {}
+        return {str(k): str(v) for k, v in extra.items()}
+
+    def web_headers(self) -> dict:
+        """User-Agent plus any configured extra headers (cookies, auth, …)."""
+        return {"User-Agent": self.web_user_agent(), **self.web_extra_headers()}
+
     def redacted(self) -> dict:
         clone = json.loads(json.dumps(self.data))
 
@@ -156,6 +199,14 @@ class Config:
         redact(nb, ["api_key"])
         sl = clone.setdefault("slack", {})
         redact(sl, ["token"])
+        # web.extra_headers is where a Cookie / Authorization header would live —
+        # redact the values but keep the header names visible for debugging.
+        web = clone.setdefault("web", {})
+        extra = web.get("extra_headers")
+        if isinstance(extra, dict):
+            web["extra_headers"] = {
+                k: (f"<redacted {len(str(v))} chars>" if v else "") for k, v in extra.items()
+            }
         clone["_config_path"] = str(self.path)
         clone["_wiki_root"] = str(self.wiki_root)
         return clone

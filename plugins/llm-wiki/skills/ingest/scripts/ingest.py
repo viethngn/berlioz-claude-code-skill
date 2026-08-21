@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Orchestrate an ingest — single item OR bulk (Confluence space / CQL / JQL).
+"""Orchestrate an ingest — single item OR bulk (Confluence space / CQL / JQL / website).
 
 Single-item usage:
     python3 ingest.py --wiki-root PATH --source <URL-or-key-or-path>
@@ -9,11 +9,15 @@ Bulk usage:
     python3 ingest.py --wiki-root PATH --space FOO
     python3 ingest.py --wiki-root PATH --cql "space=FOO AND label=onboarding"
     python3 ingest.py --wiki-root PATH --jql "project=PROJ AND updated > -30d"
+    python3 ingest.py --wiki-root PATH --sitemap https://example.com/sitemap.xml
+    python3 ingest.py --wiki-root PATH --site https://example.com
+    python3 ingest.py --wiki-root PATH --crawl https://example.com --depth 2 --max-pages 100
     python3 ingest.py --wiki-root PATH --resume <job-id>
 
 Auto-detection: `--source` alone will pick single vs bulk based on URL
-shape. `.../pages/N` or `.../browse/KEY` → single; `.../spaces/KEY` without
-a page → bulk Confluence space.
+shape. `.../pages/N` or `.../browse/KEY` → single Confluence/Jira;
+`.../spaces/KEY` without a page → bulk Confluence space; a sitemap or
+robots.txt URL → bulk website; any other http(s) URL → single web page.
 
 Prints a JSON summary to stdout. Bulk mode also produces per-item JSON
 lines during the prefetch phase.
@@ -39,14 +43,21 @@ from raw_store import write_fetch_history
 SCRIPT_DIR = Path(__file__).resolve().parent
 JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
 CONFLUENCE_SPACE_URL_RE = re.compile(r"/spaces/([A-Za-z0-9._~-]+)(?:/|$)")
+# sitemap.xml, sitemap_index.xml, sitemap-1.xml.gz, /sitemaps/pages.xml, robots.txt
+SITEMAP_URL_RE = re.compile(r"(^|/)(robots\.txt|sitemap[^/]*\.xml(\.gz)?|[^/]*sitemap[^/]*\.xml(\.gz)?)$", re.I)
 
 
 def detect_bulk_from_url(source: str) -> Optional[Tuple[str, str]]:
-    """If the URL clearly points at a whole Confluence space, return
-    ('confluence_space', spaceKey). Otherwise return None.
+    """Classify a URL as a bulk source, or return None if it's a single item.
+
+    Returns ('confluence_space', spaceKey) for a whole Confluence space, or
+    ('web_sitemap', url) for a sitemap / robots.txt URL.
 
     URLs with `/pages/N` or `pageId=` are always single — this function
-    returns None for them.
+    returns None for them. A *bare* site URL is also single (one page); bulk
+    website ingest needs a sitemap-shaped URL or an explicit
+    --sitemap/--site/--crawl flag, so `/ingest https://example.com` never
+    accidentally enumerates a whole domain.
     """
     parsed = urlparse(source)
     if parsed.scheme not in {"http", "https"}:
@@ -56,6 +67,9 @@ def detect_bulk_from_url(source: str) -> Optional[Tuple[str, str]]:
 
     if re.search(r"/pages/\d+", path) or "pageId=" in query:
         return None
+
+    if SITEMAP_URL_RE.search(path):
+        return "web_sitemap", source
 
     m = CONFLUENCE_SPACE_URL_RE.search(path)
     if m:
@@ -73,8 +87,19 @@ def detect_bulk_from_url(source: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-def detect_source_type(source: str, wiki_root: Path) -> str:
-    """Return 'confluence' | 'jira' | 'local' for a single-item source.
+def _host_matches_configured(netloc: str, cfg) -> bool:
+    """True when a URL's host is the configured Confluence or Jira host."""
+    if cfg is None:
+        return False
+    netloc = netloc.lower()
+    for base in (cfg.confluence_base_url(), cfg.jira_base_url()):
+        if base and urlparse(base).netloc.lower() == netloc:
+            return True
+    return False
+
+
+def detect_source_type(source: str, wiki_root: Path, cfg=None) -> str:
+    """Return 'confluence' | 'jira' | 'web' | 'local' for a single-item source.
 
     Callers should first check `detect_bulk_from_url` and any explicit bulk
     flags; this function assumes the source is single-item.
@@ -95,10 +120,17 @@ def detect_source_type(source: str, wiki_root: Path) -> str:
             return "confluence"
         if "jira" in parsed.netloc.lower():
             return "jira"
-        raise SystemExit(
-            f"ERROR: could not decide if {source} is a Confluence or Jira URL. "
-            "Pass an exact URL like https://.../pages/12345/ or .../browse/PROJ-1."
-        )
+        # A URL on the *configured* Atlassian host that we couldn't parse is a
+        # malformed Atlassian URL, not a website. Scraping it anonymously would
+        # silently capture a login page, so keep erroring out.
+        if _host_matches_configured(parsed.netloc, cfg):
+            raise SystemExit(
+                f"ERROR: {source} is on your configured Atlassian host but has no "
+                "page ID or issue key. Pass an exact URL like "
+                "https://.../pages/12345/ or .../browse/PROJ-1."
+            )
+        # Any other http(s) URL is an ordinary web page.
+        return "web"
 
     # Not a URL — treat as a local path
     candidate = Path(source).expanduser()
@@ -145,6 +177,12 @@ def dispatch_fetch(source_type: str, source: str, wiki_root: Path, force: bool =
             )
         return run_script(
             "fetch_jira.py",
+            ["--wiki-root", str(wiki_root), "--url", source, *extra],
+        )
+    if source_type == "web":
+        extra = ["--force"] if force else []
+        return run_script(
+            "fetch_web.py",
             ["--wiki-root", str(wiki_root), "--url", source, *extra],
         )
     if source_type == "local":
@@ -395,14 +433,39 @@ def _cmd_bulk(
             discover_args += ["--cql", query]
         elif kind == "jira_jql":
             discover_args += ["--jql", query]
+        elif kind == "web_sitemap":
+            # --site means "find the sitemap yourself"; --sitemap is an exact URL.
+            discover_args += ["--site" if args.site else "--sitemap", query]
+        elif kind == "web_crawl":
+            discover_args += ["--crawl", query]
+            if args.depth is not None:
+                discover_args += ["--depth", str(args.depth)]
+            if args.max_pages is not None:
+                discover_args += ["--max-pages", str(args.max_pages)]
         else:
             raise SystemExit(f"ERROR: unknown bulk kind: {kind}")
+        if kind in {"web_sitemap", "web_crawl"}:
+            for pattern in args.include or []:
+                discover_args += ["--include", pattern]
+            for pattern in args.exclude or []:
+                discover_args += ["--exclude", pattern]
+            if args.since:
+                discover_args += ["--since", args.since]
+            if args.ignore_robots:
+                discover_args.append("--ignore-robots")
         if args.replace:
             discover_args.append("--replace")
         if args.limit:
             discover_args += ["--limit", str(args.limit)]
 
         result = run_script("discover.py", discover_args)
+
+        # No sitemap found for a --site run: surface the request for explicit
+        # crawl bounds instead of guessing them.
+        if result.get("status") == "needs_bounds":
+            print(json.dumps({"mode": "bulk", "discover": result}, indent=2, ensure_ascii=False))
+            return 0
+
         job_id = result.get("job_id")
         if not job_id:
             # Nothing discovered (empty result). Emit and exit gracefully.
@@ -540,7 +603,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
         )
         return 1
 
-    source_type = detect_source_type(args.source, wiki_root)
+    source_type = detect_source_type(args.source, wiki_root, cfg)
     fetch_summary = dispatch_fetch(source_type, args.source, wiki_root, force=args.force)
     slug = fetch_summary.get("slug")
     if not slug:
@@ -568,8 +631,8 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
 
-    # For Confluence/Jira, download image_hints before running the diff loop.
-    if source_type in {"confluence", "jira"} and source_json:
+    # For Confluence/Jira/web, download image_hints before running the diff loop.
+    if source_type in {"confluence", "jira", "web"} and source_json:
         image_hints = fetch_summary.get("image_hints") or []
         if image_hints:
             run_script(
@@ -627,7 +690,41 @@ def main() -> int:
     parser.add_argument("--space", help="Bulk: Confluence space key")
     parser.add_argument("--cql", help="Bulk: Confluence CQL query")
     parser.add_argument("--jql", help="Bulk: Jira JQL query")
+    parser.add_argument("--sitemap", help="Bulk: sitemap URL (sitemap.xml, index, or .gz)")
+    parser.add_argument("--site", help="Bulk: site URL — auto-discover its sitemap")
+    parser.add_argument(
+        "--crawl",
+        help="Bulk: site URL — crawl it (requires --depth and --max-pages)",
+    )
     parser.add_argument("--resume", help="Bulk: resume an existing job by id")
+
+    # Web bulk knobs
+    parser.add_argument(
+        "--depth", type=int, default=None, help="Web crawl: link levels to follow"
+    )
+    parser.add_argument(
+        "--max-pages", type=int, default=None, help="Web crawl: hard cap on pages enumerated"
+    )
+    parser.add_argument(
+        "--include",
+        action="append",
+        default=[],
+        help="Web bulk: keep URLs matching this regex (repeatable)",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="Web bulk: drop URLs matching this regex (repeatable)",
+    )
+    parser.add_argument(
+        "--since", help="Web bulk: keep sitemap entries with <lastmod> >= YYYY-MM-DD"
+    )
+    parser.add_argument(
+        "--ignore-robots",
+        action="store_true",
+        help="Web bulk: do not enforce robots.txt (use only with permission)",
+    )
 
     # Bulk knobs
     parser.add_argument(
@@ -705,26 +802,35 @@ def main() -> int:
         ("confluence_space", args.space),
         ("confluence_cql", args.cql),
         ("jira_jql", args.jql),
+        ("web_sitemap", args.sitemap),
+        ("web_sitemap", args.site),
+        ("web_crawl", args.crawl),
     ]
     active_bulk = [(k, v) for k, v in bulk_flags if v]
+    bulk_flag_names = "--space / --cql / --jql / --sitemap / --site / --crawl"
 
     if args.resume:
         if active_bulk or args.source:
-            parser.error("--resume cannot be combined with --source or --space/--cql/--jql")
+            parser.error(f"--resume cannot be combined with --source or {bulk_flag_names}")
         return _cmd_bulk(args, kind=None, query=None, resume_job_id=args.resume)
 
     if len(active_bulk) > 1:
-        parser.error("Provide at most one of --space, --cql, --jql")
+        parser.error(f"Provide at most one of {bulk_flag_names}")
 
     if active_bulk:
         if args.source:
-            parser.error("--source cannot be combined with --space/--cql/--jql")
+            parser.error(f"--source cannot be combined with {bulk_flag_names}")
         kind, query = active_bulk[0]
+        if kind == "web_crawl" and (args.depth is None or args.max_pages is None):
+            parser.error(
+                "--crawl requires explicit --depth and --max-pages. Use --site to "
+                "auto-discover a sitemap instead; it only asks for bounds if none exists."
+            )
         return _cmd_bulk(args, kind=kind, query=query, resume_job_id=None)
 
     if not args.source:
         parser.error(
-            "provide --source (single) or --space / --cql / --jql / --resume (bulk), "
+            f"provide --source (single) or {bulk_flag_names} / --resume (bulk), "
             "or use --commit-only"
         )
 
