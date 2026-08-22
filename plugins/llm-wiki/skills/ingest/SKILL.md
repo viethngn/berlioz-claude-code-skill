@@ -559,10 +559,25 @@ failed. Offer to `/ingest --resume <job-id>` for failures.
   `<sitemapindex>` sitemap) that points at a different host is checked against
   *that host's own* robots.txt, cached per origin — never against the
   entry-point host's rules.
-- **Credential scoping**: `web.extra_headers` (Cookie, Authorization, …) is
-  sent to the page itself, and to images only when the image's host matches
-  the page's own host. An image embedded from a third-party CDN never
-  receives them — only `web.user_agent` is sent cross-origin.
+- **Credential scoping**: `web.extra_headers` (Cookie, Authorization, …) is sent
+  only to the **entry-point origin** — compared as scheme+host+port, so a secret
+  never crosses an http/https boundary either. That covers images (a third-party
+  CDN gets only `web.user_agent`) *and* discovery: when a sitemap lists URLs on
+  another host, that host's `robots.txt` and any nested sitemap file on it are
+  fetched without the credentials configured for the site being ingested.
+- **Cookies survive redirects**: `requests` strips a header-supplied `Cookie` on
+  every redirect hop, so `rate_limiter.py` follows redirects manually for web
+  requests that carry one — preserving it across same-origin hops (an
+  `http`→`https` upgrade, a trailing-slash normalization) and dropping it
+  cross-origin, mirroring what `requests` already does for `Authorization`.
+- **Slug collisions**: `web_slug()` flattens `/` and `-` alike, so `/a/b` and
+  `/a-b` produce the same slug. Before writing, `fetch_web.py` compares the
+  stored `url` in an existing `raw/<slug>.source.json`; a *different* page gets a
+  deterministic `-<hash>` suffix instead of overwriting. Same-page re-ingests
+  (including http↔https of one page) keep their slug, so the diff gate holds.
+- **No embedded credentials in URLs**: a `user:pass@host` URL is rejected up
+  front by both `fetch_web.py` and `discover.py` — it would otherwise land in a
+  filename and in the committed `source.json`. Use `web.extra_headers` instead.
 - **Circuit breaker (bulk only)**: `prefetch.py` aborts if 5 consecutive
   items fail. The user resumes with `/ingest --resume <job-id>`.
 - **PAT auth**: `Authorization: Bearer <PAT>` for both Confluence and Jira
@@ -632,6 +647,13 @@ All scripts respond to `--help` with their full argument list.
   consecutive failures. User backs off and resumes.
 - **Bulk: same query re-run**: `discover.py` detects the matching queue
   and reuses it (skips re-enumeration). Pass `--replace` to overwrite.
+- **Bulk: same query, different filters**: reuse is keyed on (kind, query),
+  which says nothing about `--include`/`--exclude`/`--since`/`--limit`/
+  `--depth`/`--max-pages`/`--ignore-robots`. Those are recorded on the queue, so
+  a re-run with different ones returns `status="options_changed"` (exit 1) naming
+  what changed rather than silently handing back the old, differently-scoped
+  queue. Re-run with `--replace` to rebuild, or `--resume <job-id>` to continue
+  the existing one on its original scope.
 - **Web page is JavaScript-rendered**: extraction yields nothing and
   `fetch_web.py` exits with a message saying so. Tell the user to save the
   rendered page from their browser (Save As → Web Page, Complete) and ingest
@@ -664,6 +686,13 @@ All scripts respond to `--help` with their full argument list.
   host's robots.txt, not the entry-point host's.
 - **Sitemap contains a `mailto:`/`ftp:`/non-http `<loc>`**: dropped during
   discovery with a warning; it never reaches the queue.
+- **Sitemap is enormous or a gzip bomb**: sitemap fetches are streamed with a
+  50 MB transfer cap and a 200 MB decompression cap, so a hostile or
+  misconfigured response fails with a clear `ERROR:` instead of exhausting
+  memory. (`MAX_SITEMAP_URLS` only caps *parsed entries*, which is too late.)
+- **URL contains embedded credentials** (`https://user:pass@host/…`): rejected
+  with a pointer to `web.extra_headers`. They would otherwise be written into a
+  slug/filename and into the committed `source.json`.
 - **Sitemap enumerates thousands of pages**: don't ingest them all by reflex.
   Scope with `--include` / `--exclude` / `--since` / `--limit` and say what you
   scoped to. Discovery hard-stops at 50,000 URLs.

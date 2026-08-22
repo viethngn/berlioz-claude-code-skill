@@ -22,11 +22,13 @@ Uses the Confluence PAT when the image host matches
 atlassian.confluence_base_url (needed for authenticated attachment
 downloads), and similarly for Jira. For `type: "web"` sources it uses the
 `web` rate limiter and always sends `web.user_agent`, but `web.extra_headers`
-(Cookie, Authorization, …) is sent **only** when the image's host matches the
-page's own host — an image embedded from a third-party CDN must never receive
-the credentials configured for the site being ingested. It also drops
-anything smaller than `web.min_image_bytes` — that floor is what filters out
-the icons and spacers whose dimensions weren't in the markup.
+(Cookie, Authorization, …) is sent **only** when the image's origin
+(scheme+host+port) matches the page's own — an image embedded from a
+third-party CDN must never receive the credentials configured for the site
+being ingested, and a configured secret must not cross an http/https boundary
+on the same hostname either. It also drops anything smaller than
+`web.min_image_bytes` — that floor is what filters out the icons and spacers
+whose dimensions weren't in the markup.
 
 Usage:
     python3 extract_images.py --wiki-root /path/to/wiki --source-json /path/to/raw/<slug>.source.json
@@ -52,6 +54,7 @@ import requests
 from config import ConfigError, apply_ssl_env, load_config
 from image_manifest import load_manifest
 from rate_limiter import RateLimitFailure, get_limiter
+from web_url import same_origin
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
@@ -83,11 +86,13 @@ def _headers_for(url: str, cfg, source_type: str = "", page_url: str = "") -> di
     if source_type == "web":
         # User-Agent is always sent — a bare python-requests UA is 403'd by
         # many CDNs, and it isn't a secret. web.extra_headers (Cookie,
-        # Authorization, …) is scoped to the *page's own* host: an image
+        # Authorization, …) is scoped to the page's own *origin*: an image
         # embedded from a third-party CDN must never receive the credentials
-        # configured for the site being ingested.
+        # configured for the site being ingested. same_origin() compares
+        # scheme+host+port, not just host, so a configured secret never crosses
+        # an http/https boundary on the same hostname either.
         headers = {"User-Agent": cfg.web_user_agent()}
-        if _matches_host(url, page_url):
+        if same_origin(url, page_url):
             headers.update(cfg.web_extra_headers())
         return headers
     return {}
@@ -97,7 +102,16 @@ def download_to_memory(url: str, headers: dict, verify: bool, limiter=None) -> O
     if limiter is None:
         limiter = get_limiter("atlassian", None)
     try:
-        resp = limiter.request("GET", url, headers=headers, verify=verify, timeout=60)
+        resp = limiter.request(
+            "GET",
+            url,
+            headers=headers,
+            verify=verify,
+            timeout=60,
+            # No-op unless a Cookie is configured; keeps it across same-origin
+            # redirects, which requests would otherwise strip.
+            follow_redirects_preserving_cookie=True,
+        )
     except RateLimitFailure as e:
         print(f"WARN: could not download {url} — {e}", file=sys.stderr)
         return None

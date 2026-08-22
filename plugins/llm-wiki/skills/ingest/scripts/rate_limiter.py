@@ -67,6 +67,9 @@ class RateLimiter:
     is the target. Uses a monotonic clock and a lock to hand out tokens.
     """
 
+    # Cap for the manual redirect loop (requests' own default is 30).
+    MAX_MANUAL_REDIRECTS = 10
+
     def __init__(
         self,
         *,
@@ -117,6 +120,7 @@ class RateLimiter:
         url: str,
         *,
         session: Optional["requests.Session"] = None,
+        follow_redirects_preserving_cookie: bool = False,
         **kwargs,
     ) -> "requests.Response":
         """Execute an HTTP request, honoring rate limits and retrying transient failures.
@@ -131,6 +135,16 @@ class RateLimiter:
           - 5xx other than 503
 
         Raises RateLimitFailure when max_retries is exhausted.
+
+        `follow_redirects_preserving_cookie` works around a requests behavior:
+        Session.resolve_redirects() unconditionally does headers.pop("Cookie")
+        on every hop and only re-adds cookies from the Session's own jar. We
+        pass no Session, so a header-supplied Cookie is silently dropped the
+        moment a URL redirects — including the near-universal http→https
+        upgrade. When this flag is set and a Cookie header is present, redirects
+        are followed manually so the Cookie survives *same-origin* hops (and is
+        dropped cross-origin, mirroring what requests already does correctly for
+        Authorization). No-op when no Cookie header is present.
         """
         if requests is None:
             raise RuntimeError(
@@ -138,6 +152,24 @@ class RateLimiter:
                 "the llm-wiki plugin's Python dependencies."
             )
 
+        headers = kwargs.get("headers") or {}
+        has_cookie = any(k.lower() == "cookie" for k in headers)
+        if (
+            follow_redirects_preserving_cookie
+            and has_cookie
+            and kwargs.get("allow_redirects", True)
+        ):
+            return self._request_manual_redirects(method, url, session, **kwargs)
+
+        return self._request_once(method, url, session, **kwargs)
+
+    def _request_once(
+        self,
+        method: str,
+        url: str,
+        session: Optional["requests.Session"],
+        **kwargs,
+    ) -> "requests.Response":
         sess = session or requests
         attempt = 0
         last_status: Optional[int] = None
@@ -166,6 +198,55 @@ class RateLimiter:
 
             wait = self._retry_after_seconds(resp) or self._backoff_seconds(attempt)
             self._sleep(wait)
+
+    def _request_manual_redirects(
+        self,
+        method: str,
+        url: str,
+        session: Optional["requests.Session"],
+        **kwargs,
+    ) -> "requests.Response":
+        """Follow redirects by hand so a header-supplied Cookie survives them.
+
+        Only ever used for GET by our callers, so there's no method-rewriting
+        (303 → GET) subtlety to handle: we keep the method as given.
+        """
+        from urllib.parse import urljoin, urlparse
+
+        def origin(u: str) -> tuple:
+            p = urlparse(u)
+            return (p.scheme.lower(), p.netloc.lower())
+
+        kwargs = dict(kwargs)
+        kwargs["allow_redirects"] = False
+        headers = dict(kwargs.get("headers") or {})
+        kwargs["headers"] = headers
+
+        current = url
+        for _ in range(self.MAX_MANUAL_REDIRECTS):
+            resp = self._request_once(method, current, session, **kwargs)
+            if resp.status_code not in (301, 302, 303, 307, 308):
+                return resp
+            location = resp.headers.get("Location")
+            if not location:
+                return resp
+
+            nxt = urljoin(current, location)
+            if origin(nxt) != origin(current):
+                # Cross-origin hop: drop the Cookie, exactly as requests does
+                # for Authorization. Everything else carries over.
+                for key in [k for k in headers if k.lower() == "cookie"]:
+                    headers.pop(key)
+                # Nothing left to preserve — hand the rest of the chain back to
+                # requests so its own redirect semantics apply.
+                kwargs["allow_redirects"] = True
+                return self._request_once(method, nxt, session, **kwargs)
+            current = nxt
+
+        raise RateLimitFailure(
+            url, None, self.MAX_MANUAL_REDIRECTS,
+            f"exceeded {self.MAX_MANUAL_REDIRECTS} redirects",
+        )
 
     def _retry_after_seconds(self, resp: "requests.Response") -> Optional[float]:
         header = resp.headers.get("Retry-After")

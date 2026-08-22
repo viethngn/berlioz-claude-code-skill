@@ -100,6 +100,10 @@ PAGES = {
     "/blog/release-notes": ("Release Notes", "What changed in the latest version.", 4),
     # Reachable by link but robots-disallowed, and absent from the sitemap.
     "/private/secret": ("Secret Page", "Should never be ingested.", 5),
+    # Two DIFFERENT pages whose slugs collide: web_slug() flattens both `/` and
+    # `-` to `-`, so `/collide/x` and `/collide-x` produce the same base slug.
+    "/collide/x": ("Collide Nested", "This is the nested page under collide.", 6),
+    "/collide-x": ("Collide Flat", "This is the flat hyphenated page.", 7),
 }
 
 ROBOTS = """User-agent: *
@@ -275,6 +279,7 @@ class _SecondOriginHandler(http.server.BaseHTTPRequestHandler):
 
     robots_body: bytes = b"User-agent: *\n"
     last_headers: dict = {}
+    nested_sitemap: bytes = b""
 
     def log_message(self, *args):  # noqa: D102
         pass
@@ -292,15 +297,22 @@ class _SecondOriginHandler(http.server.BaseHTTPRequestHandler):
         _SecondOriginHandler.last_headers[path] = dict(self.headers)
         if path == "/robots.txt":
             return self._send(200, self.robots_body, "text/plain")
+        if path == "/nested-sitemap.xml":
+            if self.nested_sitemap:
+                return self._send(200, self.nested_sitemap, "application/xml")
+            return self._send(404, b"not found", "text/plain")
         if path.startswith("/img/"):
             return self._send(200, BIG_IMAGE, "image/png")
         return self._send(200, b"<html><body>ok</body></html>", "text/html")
 
 
-def _start_second_origin(robots_body: bytes = b"User-agent: *\n") -> tuple[http.server.HTTPServer, int]:
+def _start_second_origin(
+    robots_body: bytes = b"User-agent: *\n", nested_sitemap: bytes = b""
+) -> tuple[http.server.HTTPServer, int]:
     port = _find_free_port()
     _SecondOriginHandler.robots_body = robots_body
     _SecondOriginHandler.last_headers = {}
+    _SecondOriginHandler.nested_sitemap = nested_sitemap
     srv = http.server.HTTPServer(("127.0.0.1", port), _SecondOriginHandler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, port
@@ -586,9 +598,33 @@ def test_credential_isolation(base: str) -> None:
                 cross_origin_headers.get("User-Agent") == "llm-wiki-smoke-test/1.0",
                 f"cross-origin image request should still carry the User-Agent: {cross_origin_headers}",
             )
+
+            # Scheme must count too: an https image on the same *host* as an
+            # http page is a different origin, so it must not get the Cookie.
+            sys.path.insert(0, str(SCRIPTS_DIR))
+            import extract_images
+            from config import load_config
+
+            cfg = load_config(wiki_root)
+            page = "http://example.com/page"
+            same_scheme = extract_images._headers_for(
+                "http://example.com/a.png", cfg, "web", page
+            )
+            other_scheme = extract_images._headers_for(
+                "https://example.com/a.png", cfg, "web", page
+            )
+            _assert(
+                same_scheme.get("Cookie") == "secret=abc123",
+                f"same-origin image should get the Cookie: {same_scheme}",
+            )
+            _assert(
+                "Cookie" not in other_scheme,
+                "an https image must not receive a Cookie configured for an http "
+                f"page on the same host: {other_scheme}",
+            )
     finally:
         cdn_srv.shutdown()
-    print("[OK] web.extra_headers scoped to same-origin images only")
+    print("[OK] web.extra_headers scoped to same-origin images (scheme+host, not host)")
 
 
 def test_cross_origin_robots_and_non_http(wiki_root: Path, base: str) -> None:
@@ -663,6 +699,266 @@ def test_validation_errors(wiki_root: Path, base: str) -> None:
         _assert("ERROR:" in r.stderr, f"no friendly ERROR: prefix for {extra_args}: {r.stderr}")
         _assert(needle in r.stderr, f"error for {extra_args} doesn't mention {needle}: {r.stderr}")
     print("[OK] friendly validation for --since / --site / --depth / --max-pages / --include")
+
+
+def test_no_userinfo_in_urls(wiki_root: Path) -> None:
+    """Embedded credentials must never reach a slug or committed metadata."""
+    before = set(p.name for p in (wiki_root / "raw").iterdir())
+
+    r = _run_script(
+        "fetch_web.py",
+        ["--wiki-root", str(wiki_root), "--url", "https://alice:secret@example.com/docs"],
+    )
+    _assert(r.returncode != 0, "a URL with embedded credentials must be rejected")
+    _assert("credentials" in r.stderr, f"unhelpful error: {r.stderr}")
+    _assert("Traceback" not in r.stderr, f"traceback leaked: {r.stderr}")
+
+    r = _run_script(
+        "discover.py",
+        ["--wiki-root", str(wiki_root), "--site", "https://alice:secret@example.com"],
+    )
+    _assert(r.returncode != 0, "--site with embedded credentials must be rejected")
+    _assert("credentials" in r.stderr, f"unhelpful error: {r.stderr}")
+
+    after = set(p.name for p in (wiki_root / "raw").iterdir())
+    _assert(before == after, f"rejected URL still wrote files: {after - before}")
+    # And nothing with the secret in its name anywhere under the wiki.
+    leaked = [p for p in wiki_root.rglob("*secret*")]
+    _assert(not leaked, f"credential leaked into a filename: {leaked}")
+    print("[OK] URLs with embedded credentials rejected, nothing written")
+
+
+def test_hostless_url(wiki_root: Path) -> None:
+    r = _run_script("fetch_web.py", ["--wiki-root", str(wiki_root), "--url", "https:///path"])
+    _assert(r.returncode != 0, "a hostless URL should fail")
+    _assert("Traceback" not in r.stderr, f"hostless URL produced a traceback: {r.stderr}")
+    _assert("ERROR:" in r.stderr, f"no friendly error: {r.stderr}")
+    print("[OK] hostless http(s) URL fails cleanly instead of tracebacking")
+
+
+def test_slug_collision(wiki_root: Path, base: str) -> None:
+    """Two different pages that flatten to one slug must not overwrite."""
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    from web_url import web_slug
+
+    nested_url = f"{base}/collide/x"
+    flat_url = f"{base}/collide-x"
+    _assert(
+        web_slug(nested_url) == web_slug(flat_url),
+        "precondition: these URLs are supposed to collide under web_slug()",
+    )
+
+    r1 = _run_script("fetch_web.py", ["--wiki-root", str(wiki_root), "--url", nested_url])
+    _assert(r1.returncode == 0, f"first collide fetch failed: {r1.stderr}")
+    s1 = _json_tail(r1.stdout)
+
+    r2 = _run_script("fetch_web.py", ["--wiki-root", str(wiki_root), "--url", flat_url])
+    _assert(r2.returncode == 0, f"second collide fetch failed: {r2.stderr}\n{r2.stdout}")
+    s2 = _json_tail(r2.stdout)
+
+    _assert(
+        s1["slug"] != s2["slug"],
+        f"colliding pages got the same slug ({s1['slug']}) — one overwrote the other",
+    )
+    md1 = (wiki_root / "raw" / f"{s1['slug']}.md").read_text(encoding="utf-8")
+    md2 = (wiki_root / "raw" / f"{s2['slug']}.md").read_text(encoding="utf-8")
+    _assert("nested page under collide" in md1, f"page 1 content wrong:\n{md1[:300]}")
+    _assert("flat hyphenated page" in md2, f"page 2 content wrong:\n{md2[:300]}")
+
+    # Re-ingesting either must be stable: same slug, and the diff gate holds.
+    r3 = _run_script("fetch_web.py", ["--wiki-root", str(wiki_root), "--url", flat_url])
+    _assert(r3.returncode == 0, f"re-fetch of collided page failed: {r3.stderr}")
+    s3 = _json_tail(r3.stdout)
+    _assert(
+        s3["slug"] == s2["slug"],
+        f"collided slug is not stable across re-ingest: {s2['slug']} → {s3['slug']}",
+    )
+    _assert(
+        s3["status"] == "unchanged",
+        f"re-fetch of collided page should be unchanged, got {s3['status']}",
+    )
+    r4 = _run_script("fetch_web.py", ["--wiki-root", str(wiki_root), "--url", nested_url])
+    s4 = _json_tail(r4.stdout)
+    _assert(
+        s4["slug"] == s1["slug"] and s4["status"] == "unchanged",
+        f"original page destabilized by the collision: {s4}",
+    )
+    print(f"[OK] slug collision resolved ({s1['slug']} / {s2['slug']}), both stable")
+
+
+def test_cookie_survives_same_origin_redirect(base: str) -> None:
+    """requests strips Cookie on every redirect hop; we must re-attach it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wiki_root = Path(tmp) / "wiki-root"
+        wiki_root.mkdir()
+        _write_wikirc(wiki_root, extra_headers={"Cookie": "session=redirect-me"})
+
+        MockSiteHandler.last_headers.pop("/guide/deploy", None)
+        r = _run_script(
+            "fetch_web.py", ["--wiki-root", str(wiki_root), "--url", f"{base}/old/setup"]
+        )
+        _assert(r.returncode == 0, f"redirected fetch failed: {r.stderr}\n{r.stdout}")
+
+        final_headers = MockSiteHandler.last_headers.get("/guide/setup") or {}
+        _assert(
+            final_headers.get("Cookie") == "session=redirect-me",
+            "Cookie was lost across a same-origin redirect — requests strips it on "
+            f"every hop and it must be re-attached. Final-hop headers: {final_headers}",
+        )
+    print("[OK] Cookie survives a same-origin redirect (requests would have dropped it)")
+
+
+def test_discovery_credentials_not_leaked_cross_origin(wiki_root: Path, base: str) -> None:
+    """A foreign sitemap/robots host must not receive our configured secrets."""
+    nested = f"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>PLACEHOLDER/page-a</loc></url>
+</urlset>
+"""
+    host_b_srv, host_b_port = _start_second_origin()
+    host_b_base = f"http://127.0.0.1:{host_b_port}"
+    _SecondOriginHandler.nested_sitemap = nested.replace("PLACEHOLDER", host_b_base).encode()
+
+    # An index on host A pointing at a nested sitemap FILE on host B.
+    index = f"""<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap><loc>{host_b_base}/nested-sitemap.xml</loc></sitemap>
+</sitemapindex>
+"""
+    MockSiteHandler.cross_origin_sitemap = index.encode()
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            wr = Path(tmp) / "wiki-root"
+            wr.mkdir()
+            _write_wikirc(wr, extra_headers={"Cookie": "session=do-not-leak"})
+
+            r = _run_script(
+                "discover.py",
+                [
+                    "--wiki-root", str(wr),
+                    "--sitemap", f"{base}/sitemap-crossorigin.xml",
+                    "--replace",
+                ],
+            )
+            _assert(r.returncode == 0, f"cross-origin discover failed: {r.stderr}\n{r.stdout}")
+
+            b_headers = _SecondOriginHandler.last_headers
+            for path in ("/robots.txt", "/nested-sitemap.xml"):
+                got = b_headers.get(path)
+                _assert(got is not None, f"host B never received a request for {path}")
+                _assert(
+                    "Cookie" not in got,
+                    f"configured Cookie leaked to a foreign origin on {path}: {got}",
+                )
+                _assert(
+                    got.get("User-Agent") == "llm-wiki-smoke-test/1.0",
+                    f"User-Agent should still be sent to {path}: {got}",
+                )
+
+            # The entry-point host DOES legitimately get the credentials.
+            a_headers = MockSiteHandler.last_headers.get("/sitemap-crossorigin.xml") or {}
+            _assert(
+                a_headers.get("Cookie") == "session=do-not-leak",
+                f"entry-point origin should receive the configured Cookie: {a_headers}",
+            )
+    finally:
+        MockSiteHandler.cross_origin_sitemap = b""
+        _SecondOriginHandler.nested_sitemap = b""
+        host_b_srv.shutdown()
+    print("[OK] discovery credentials scoped to the entry-point origin only")
+
+
+def test_queue_options_identity(wiki_root: Path, base: str) -> None:
+    """Changing a filter must not silently return the old, differently-scoped queue."""
+    r = _run_script(
+        "discover.py", ["--wiki-root", str(wiki_root), "--site", base, "--replace"]
+    )
+    _assert(r.returncode == 0, f"baseline discover failed: {r.stderr}")
+    baseline = _json_tail(r.stdout)
+    _assert(baseline["counts"]["total"] == len(SITEMAP_ALLOWED), f"unexpected: {baseline}")
+
+    # Same options, no --replace → reuse is correct and expected.
+    r = _run_script("discover.py", ["--wiki-root", str(wiki_root), "--site", base])
+    _assert(r.returncode == 0, f"same-options rerun should succeed: {r.stderr}")
+    _assert(_json_tail(r.stdout).get("reused") is True, "same options should reuse")
+
+    # Different --include, no --replace → must refuse, not silently reuse.
+    r = _run_script(
+        "discover.py",
+        ["--wiki-root", str(wiki_root), "--site", base, "--include", "/guide/"],
+    )
+    _assert(r.returncode != 0, "changed --include must not silently reuse the old queue")
+    payload = _json_tail(r.stdout)
+    _assert(
+        payload.get("status") == "options_changed",
+        f"expected options_changed, got {payload}",
+    )
+    _assert("include" in payload.get("changed", ""), f"diff should name include: {payload}")
+    _assert("--replace" in payload.get("note", ""), "note should tell the user what to do")
+
+    # With --replace it applies.
+    r = _run_script(
+        "discover.py",
+        ["--wiki-root", str(wiki_root), "--site", base, "--include", "/guide/", "--replace"],
+    )
+    _assert(r.returncode == 0, f"--replace with new options failed: {r.stderr}")
+    _assert(_json_tail(r.stdout)["counts"]["total"] == 2, "new --include should apply")
+
+    # ingest.py surfaces it too rather than crashing opaquely.
+    r = _run_script("ingest.py", ["--wiki-root", str(wiki_root), "--site", base])
+    _assert(r.returncode != 0, "ingest.py should propagate options_changed as a failure")
+    _assert(
+        '"options_changed"' in r.stdout,
+        f"ingest.py did not surface the options_changed payload: {r.stdout}\n{r.stderr}",
+    )
+    print("[OK] queue reuse rejects changed discovery options instead of ignoring them")
+
+
+def test_sitemap_size_bounds() -> None:
+    """The gzip and raw-transfer caps must fire, in-process (no 200 MB anywhere)."""
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    import web_discover
+
+    # --- gzip bomb: highly compressible payload, cap lowered for the test ---
+    bomb = gzip.compress(b"A" * (2 * 1024 * 1024))  # 2 MB → a few KB
+    original = web_discover.MAX_SITEMAP_DECOMPRESSED_BYTES
+    try:
+        web_discover.MAX_SITEMAP_DECOMPRESSED_BYTES = 64 * 1024  # 64 KB
+        try:
+            web_discover._decompress("http://x/sitemap.xml.gz", bomb)
+            raise AssertionError("decompression cap did not fire on a compression bomb")
+        except web_discover.WebDiscoveryError as e:
+            _assert(
+                "compression bomb" in str(e) or "decompressed" in str(e),
+                f"unexpected error text: {e}",
+            )
+        # Under the cap still works.
+        web_discover.MAX_SITEMAP_DECOMPRESSED_BYTES = original
+        small = gzip.compress(b"<urlset></urlset>")
+        _assert(
+            web_discover._decompress("http://x/s.xml.gz", small) == b"<urlset></urlset>",
+            "a normal gzipped sitemap must still decompress",
+        )
+    finally:
+        web_discover.MAX_SITEMAP_DECOMPRESSED_BYTES = original
+
+    # --- raw transfer cap: _read_capped aborts past the limit ---
+    class _FakeResp:
+        def __init__(self, chunks):
+            self._chunks = chunks
+
+        def iter_content(self, chunk_size=65536):  # noqa: ARG002
+            return iter(self._chunks)
+
+    ok = web_discover._read_capped(_FakeResp([b"a" * 10, b"b" * 10]), 100, "test")
+    _assert(ok == b"a" * 10 + b"b" * 10, "under-cap read should return the full body")
+    try:
+        web_discover._read_capped(_FakeResp([b"x" * 60, b"y" * 60]), 100, "test")
+        raise AssertionError("raw byte cap did not fire")
+    except web_discover.WebDiscoveryError as e:
+        _assert("limit" in str(e), f"unexpected error text: {e}")
+    print("[OK] sitemap raw-transfer and gzip-decompression caps both fire")
 
 
 def test_discover_site(wiki_root: Path, base: str) -> str:
@@ -885,12 +1181,19 @@ def main() -> int:
             test_redirect_caching(wiki_root, base)
             test_extract_images(wiki_root, base, slug)
             test_non_html_and_404(wiki_root, base)
+            test_hostless_url(wiki_root)
+            test_no_userinfo_in_urls(wiki_root)
+            test_slug_collision(wiki_root, base)
             test_credential_isolation(base)
+            test_cookie_survives_same_origin_redirect(base)
+            test_sitemap_size_bounds()
 
             job_id = test_discover_site(wiki_root, base)
             test_prefetch(wiki_root, base, job_id)
             test_discover_filters(wiki_root, base)
             test_cross_origin_robots_and_non_http(wiki_root, base)
+            test_discovery_credentials_not_leaked_cross_origin(wiki_root, base)
+            test_queue_options_identity(wiki_root, base)
             test_validation_errors(wiki_root, base)
             test_needs_bounds_and_crawl(wiki_root, base)
     finally:

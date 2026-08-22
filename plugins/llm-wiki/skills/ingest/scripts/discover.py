@@ -24,6 +24,12 @@ the standard /sitemap.xml locations). When no sitemap exists it prints
 caller is expected to ask the user for --depth and --max-pages and re-run with
 --crawl.
 
+An existing queue for the same (kind, query) is reused — but only when the
+discovery options that shaped it (--include/--exclude/--since/--limit/
+--ignore-robots/--depth/--max-pages) are unchanged. If they differ, this prints
+`{"status": "options_changed", …}` to stderr and exits 1 rather than silently
+handing back a differently-scoped queue; re-run with --replace to rebuild.
+
 Prints a JSON summary to stdout, including the assigned job_id.
 """
 
@@ -47,6 +53,7 @@ from bulk_queue import (
     Queue,
     VALID_KINDS,
     find_matching,
+    job_options,
     load_queue,
     make_job_id,
 )
@@ -227,6 +234,14 @@ def _validate_web_args(args) -> None:
                 f"ERROR: {flag} {value!r} is not a valid http(s) URL "
                 "(missing scheme or host)."
             )
+        # Embedded credentials would leak into slugs/filenames and into the
+        # committed source.json for every page of the job.
+        if parsed.username or parsed.password:
+            raise SystemExit(
+                f"ERROR: {flag} {value!r} contains embedded credentials "
+                "(user:pass@host). Strip them from the URL and put the credentials "
+                "in `web.extra_headers` in .wikirc.json instead."
+            )
 
     if args.since:
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", args.since):
@@ -264,6 +279,7 @@ def enumerate_web(args, cfg) -> List[Item]:
         apply_filters,
         collect_sitemap_urls,
         crawl,
+        filter_by_robots,
         find_sitemaps,
         load_robots,
     )
@@ -274,10 +290,14 @@ def enumerate_web(args, cfg) -> List[Item]:
     respect_robots = cfg.web_respect_robots() and not args.ignore_robots
 
     target = normalize_url(args.sitemap or args.site or args.crawl)
+    # Only this origin may receive web.extra_headers (Cookie/Authorization).
+    # Discovery legitimately reaches other hosts via cross-origin sitemap
+    # entries; those must not get the entry-point site's credentials.
+    primary_origin = origin_of(target)
     robots = None
     robots_cache = None
     if respect_robots:
-        robots = load_robots(target, cfg, limiter)
+        robots = load_robots(target, cfg, limiter, primary_origin=primary_origin)
         if robots.disallow_all:
             raise SystemExit(
                 "ERROR: robots.txt disallows automated access to this site. "
@@ -286,7 +306,9 @@ def enumerate_web(args, cfg) -> List[Item]:
         # Seed the cache with the entry-point origin's robots so it isn't
         # fetched twice. A sitemap can list URLs on other origins, each
         # checked against its own robots.txt lazily as they're encountered.
-        robots_cache = RobotsCache(cfg, limiter, seed=(origin_of(target), robots))
+        robots_cache = RobotsCache(
+            cfg, limiter, seed=(primary_origin, robots), primary_origin=primary_origin
+        )
 
     if args.crawl:
         # Bounds and URL shape already validated by _validate_web_args above;
@@ -307,7 +329,9 @@ def enumerate_web(args, cfg) -> List[Item]:
     else:
         # A robots.txt URL isn't a sitemap — it's a pointer to them.
         if args.sitemap and target.lower().endswith("/robots.txt"):
-            sitemaps = find_sitemaps(target, cfg, limiter, robots=robots)
+            sitemaps = find_sitemaps(
+                target, cfg, limiter, robots=robots, primary_origin=primary_origin
+            )
             if not sitemaps:
                 raise SystemExit(
                     f"ERROR: {target} names no Sitemap: directive and no sitemap was "
@@ -317,7 +341,9 @@ def enumerate_web(args, cfg) -> List[Item]:
         elif args.sitemap:
             sitemaps = [target]
         else:
-            sitemaps = find_sitemaps(target, cfg, limiter, robots=robots)
+            sitemaps = find_sitemaps(
+                target, cfg, limiter, robots=robots, primary_origin=primary_origin
+            )
             if not sitemaps:
                 return None  # caller emits `needs_bounds`
         try:
@@ -326,6 +352,7 @@ def enumerate_web(args, cfg) -> List[Item]:
                 cfg,
                 limiter,
                 robots_cache=robots_cache if respect_robots else None,
+                primary_origin=primary_origin,
             )
         except WebDiscoveryError as e:
             raise SystemExit(f"ERROR: {e}")
@@ -345,9 +372,11 @@ def enumerate_web(args, cfg) -> List[Item]:
     except WebDiscoveryError as e:
         raise SystemExit(f"ERROR: {e}")
 
-    # robots for the sitemap path is already enforced per-entry-origin inside
-    # collect_sitemap_urls; for --crawl, crawl() enforces it as it walks
-    # (same-origin only, so a single robots parser is correct there).
+    # Per-page robots runs AFTER the local filters: an origin whose entries all
+    # get filtered out never costs a robots.txt fetch. For --crawl, crawl()
+    # already enforced robots as it walked (same-origin, so one parser is right).
+    if respect_robots and robots_cache is not None and not args.crawl:
+        entries = filter_by_robots(entries, robots_cache)
 
     items: List[Item] = []
     for entry in entries:
@@ -355,6 +384,37 @@ def enumerate_web(args, cfg) -> List[Item]:
             break
         items.append(Item(ref=entry["loc"], title=""))
     return items
+
+
+def canonical_options(args, kind: str) -> dict:
+    """The discovery options that determine a queue's *contents*.
+
+    Reuse is keyed on (kind, query), which says nothing about the filters that
+    shaped the item list. Persisting these lets a re-run detect that the scope
+    changed instead of silently handing back the old queue.
+    """
+    options = {"limit": int(args.limit or 0)}
+    if kind in {"web_sitemap", "web_crawl"}:
+        options.update(
+            {
+                "include": sorted(args.include or []),
+                "exclude": sorted(args.exclude or []),
+                "since": args.since or None,
+                "ignore_robots": bool(args.ignore_robots),
+                "depth": args.depth,
+                "max_pages": args.max_pages,
+            }
+        )
+    return options
+
+
+def describe_option_changes(old: dict, new: dict) -> str:
+    """Human-readable diff of two canonical option dicts."""
+    keys = sorted(set(old) | set(new))
+    changes = [
+        f"{k}: {old.get(k)!r} → {new.get(k)!r}" for k in keys if old.get(k) != new.get(k)
+    ]
+    return "; ".join(changes) or "(no visible differences)"
 
 
 def determine_query(args) -> Tuple[str, str]:
@@ -456,6 +516,7 @@ def main() -> int:
         verify = cfg.atlassian_verify_ssl()
 
     # Detect an existing job for the same (kind, query)
+    options = canonical_options(args, kind)
     existing = find_matching(cfg.wiki_root, kind, query)
     if existing and not args.replace:
         try:
@@ -463,6 +524,39 @@ def main() -> int:
             counts = q.counts()
         except Exception:  # noqa: BLE001
             counts = {}
+
+        # Reuse is only safe when the options that shaped the item list are
+        # unchanged — otherwise the new --include/--since/etc. would be silently
+        # ignored in favor of the old, differently-scoped queue.
+        prior_options = job_options(cfg.wiki_root, existing)
+        if prior_options != options:
+            print(
+                json.dumps(
+                    {
+                        "status": "options_changed",
+                        "job_id": existing,
+                        "kind": kind,
+                        "query": query,
+                        "reused": False,
+                        "counts": counts,
+                        "prior_options": prior_options,
+                        "requested_options": options,
+                        "changed": describe_option_changes(prior_options, options),
+                        "note": (
+                            "An existing queue for this (kind, query) was built with "
+                            "different discovery options, so reusing it would silently "
+                            "ignore the ones you just passed. Re-run with --replace to "
+                            "rebuild the queue with the new options, or use "
+                            "`/ingest --resume <job_id>` to continue the existing one "
+                            "on its original scope."
+                        ),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+
         print(
             json.dumps(
                 {
@@ -491,7 +585,9 @@ def main() -> int:
             target = origin_of(args.site or "")
             delay = None
             try:
-                robots = load_robots(target, cfg, get_limiter("web", cfg.web))
+                robots = load_robots(
+                    target, cfg, get_limiter("web", cfg.web), primary_origin=target
+                )
                 delay = crawl_delay_for(robots, cfg.web_user_agent())
             except Exception:  # noqa: BLE001 — advisory only
                 pass
@@ -553,7 +649,12 @@ def main() -> int:
     # Create the queue
     job_id = existing if (existing and args.replace) else make_job_id(kind, query)
     queue = Queue(
-        wiki_root=cfg.wiki_root, job_id=job_id, kind=kind, query=query, items=items
+        wiki_root=cfg.wiki_root,
+        job_id=job_id,
+        kind=kind,
+        query=query,
+        items=items,
+        options=options,
     )
     queue.save()
 

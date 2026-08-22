@@ -180,11 +180,17 @@ it when a site returns `403` to the default User-Agent (set `user_agent` to a
 browser string), when a page is behind a login (put a `Cookie` or
 `Authorization` header in `extra_headers` — `config.py` redacts the values when
 printing), or when you want to loosen `min_image_bytes` so smaller diagrams get
-described. `extra_headers` reaches only the page's own host — an image embedded
-from a third-party CDN never receives them, even for images on the same page.
-`respect_robots` is `true` by default: robots.txt is **enforced** (per origin,
-so a sitemap entry on another host is checked against that host's own rules)
-on bulk website ingest, and advisory for a single page you name explicitly.
+described. `extra_headers` reaches only the entry-point **origin** (scheme+host+
+port): an image embedded from a third-party CDN never receives them, nor does a
+foreign host whose `robots.txt` or sitemap gets fetched during discovery, nor
+does the same hostname over a different scheme. They do survive same-origin
+redirects, which `requests` would otherwise silently strip. `respect_robots` is
+`true` by default: robots.txt is **enforced** (per origin, so a sitemap entry on
+another host is checked against that host's own rules) on bulk website ingest,
+and advisory for a single page you name explicitly.
+
+URLs with embedded credentials (`https://user:pass@host/…`) are rejected — they
+would land in a filename and in committed metadata. Use `extra_headers`.
 
 Rate-limit knobs are optional. Defaults are conservative so a first-time bulk
 run won't get anyone rate-banned. Every HTTP call flows through `rate_limiter.py`,
@@ -286,7 +292,9 @@ Scope a large site — these compose, and all of them beat crawling:
 
 `--since` filters on the sitemap's `<lastmod>`, which makes a periodic refresh
 cheap. Re-running the same `--site` URL reuses its existing queue, so refreshing
-a site is just the same command again.
+a site is just the same command again — but if you change a filter, the reuse is
+refused with an `options_changed` report rather than silently handing back the
+old, differently-scoped queue. Add `--replace` to rebuild with the new scope.
 
 **Sites with no sitemap** don't get crawled blind. Discovery stops and asks you
 for a depth and a page cap first:

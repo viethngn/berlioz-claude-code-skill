@@ -131,6 +131,39 @@ def web_slug(url: str) -> str:
     return slug
 
 
+def slug_identity(url: str) -> str:
+    """Return what makes two URLs "the same page" for slug-ownership purposes.
+
+    host + path + query, with the **scheme deliberately excluded**: `http://x/a`
+    and `https://x/a` are the same page served two ways and should share one raw
+    file, which is exactly what web_slug() already does by not encoding scheme.
+
+    Used to detect the case web_slug() can't distinguish: two genuinely
+    different paths that flatten to the same slug (e.g. `/a/b` and `/a-b`, since
+    both `/` and `-` collapse to `-`). Comparing identities catches that without
+    breaking the intentional http/https collapse.
+    """
+    parsed = urlparse(normalize_url(url))
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return f"{host}{parsed.path}?{parsed.query}"
+
+
+def disambiguate_slug(slug: str, url: str) -> str:
+    """Append a short, deterministic hash of `url`'s identity to `slug`.
+
+    Deterministic so a colliding URL re-derives the same slug on every
+    re-ingest — otherwise the content-diff gate and the conditional-GET cache
+    would both miss and the page would be rewritten every run.
+    """
+    digest = hashlib.sha256(slug_identity(url).encode("utf-8")).hexdigest()[:_SLUG_HASH_LEN]
+    base = slug
+    if len(base) + 1 + _SLUG_HASH_LEN > SLUG_MAX_LEN:
+        base = base[:_SLUG_TRUNCATE_TO].rstrip("-")
+    return f"{base}-{digest}"
+
+
 def join_base(base_url: str, path: str) -> str:
     """Join a site root and an absolute path (e.g. '/robots.txt')."""
     return f"{origin_of(base_url)}{path}"

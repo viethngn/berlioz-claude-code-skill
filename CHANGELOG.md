@@ -55,11 +55,47 @@
   (`web.min_image_bytes`). Survivors go through the normal describe-on-change
   flow, so diagrams and screenshots are still captured while logos and spacers
   cost nothing.
-- `web.extra_headers` (Cookie, Authorization) is scoped to the page's own
-  host: an image embedded from a third-party CDN receives only
-  `web.user_agent`, never the site's configured credentials. Fixed before it
-  shipped — the initial cut sent `extra_headers` to every image host
-  unconditionally.
+- `web.extra_headers` (Cookie, Authorization) is scoped to the entry-point
+  **origin** — compared as scheme+host+port, so a secret can't cross an
+  http/https boundary on the same hostname. This covers images (a third-party
+  CDN receives only `web.user_agent`) **and discovery**: when a sitemap lists
+  URLs on another host, that host's `robots.txt` and any nested sitemap file on
+  it are fetched without the credentials configured for the site being
+  ingested. All fixed before shipping — the initial cut sent `extra_headers`
+  to every image host and every discovery target unconditionally.
+- A header-supplied `Cookie` now survives redirects. `requests`
+  (`Session.resolve_redirects`) pops `Cookie` on *every* hop and only re-adds
+  from a Session jar, which we don't use — so an authenticated fetch silently
+  returned the anonymous page as soon as a URL redirected, including the
+  near-universal `http`→`https` upgrade. `rate_limiter.py` now follows
+  redirects manually when a Cookie is present, keeping it same-origin and
+  dropping it cross-origin (mirroring what `requests` already does correctly
+  for `Authorization`). No-op for the Atlassian/Slack/nano-banana callers.
+- Slug collisions no longer silently overwrite. `web_slug()` flattens `/` and
+  `-` alike, so `/a/b` and `/a-b` produced one slug for two different pages —
+  the second overwrote the first, worst of all unattended mid-bulk-run.
+  `fetch_web.py` now compares the stored `url` in an existing `source.json` and
+  gives a genuinely different page a deterministic `-<hash>` suffix. Same-page
+  re-ingests (including http↔https of one page) keep their slug, so the diff
+  gate and conditional-GET cache still work.
+- URLs with embedded credentials (`https://user:pass@host/…`) are rejected by
+  both `fetch_web.py` and `discover.py`. They would otherwise be written into a
+  slug — and therefore a filename — and into the committed `source.json`.
+- Sitemap fetches are bounded: streamed with a 50 MB transfer cap and a 200 MB
+  gzip-decompression cap. `MAX_SITEMAP_URLS` only capped *parsed entries*, long
+  after the whole body was already in memory, so a large response or a
+  compression bomb could exhaust memory.
+- Queue reuse is option-aware. Reuse keys on (kind, query), which says nothing
+  about `--include`/`--exclude`/`--since`/`--limit`/`--depth`/`--max-pages`/
+  `--ignore-robots` — so re-running with a different filter silently returned
+  the old, differently-scoped queue. Those options are now recorded on the
+  queue and a mismatch reports `status="options_changed"` (exit 1) naming what
+  changed, instead of ignoring the new scope.
+- A hostless URL (`https:///path`) passed the scheme-only check and tracebacked
+  inside `requests`; it now fails with a clean `ERROR:`.
+- Sitemap discovery filters (`--include`/`--exclude`/`--since`) now run *before*
+  the per-origin robots pass, so an origin whose entries all get filtered out
+  never costs a `robots.txt` request.
 - `--since` / `--depth` / `--max-pages` / the site URL flags are validated
   before any HTTP request, with a plain `ERROR:` on failure instead of a
   traceback or (for `--since`) a silently-wrong lexicographic date comparison
@@ -72,11 +108,13 @@
   the header names visible. Default `user_agent` is a neutral
   `llm-wiki-ingest` string. Existing `.wikirc.json` files need no migration.
 - New: `scripts/fetch_web.py`, `scripts/web_discover.py`, `scripts/web_url.py`,
-  `references/web-pages.md`, `tests/smoke_web_ingest.py` (15 checks against a
+  `references/web-pages.md`, `tests/smoke_web_ingest.py` (22 checks against a
   multi-origin local mock covering extraction, the 304/redirect/missing-file
   paths, nested/gzipped sitemaps, per-origin robots enforcement, credential
-  isolation, non-http(s) entry rejection, filters, input validation, the
-  `needs_bounds` handoff, and a bounded crawl).
+  isolation for both images and discovery, Cookie-across-redirect, slug
+  collisions, embedded-credential and hostless-URL rejection, sitemap size
+  caps, queue option identity, non-http(s) entry rejection, filters, input
+  validation, the `needs_bounds` handoff, and a bounded crawl).
 
 ## 1.5.0 - 2026-07-31
 

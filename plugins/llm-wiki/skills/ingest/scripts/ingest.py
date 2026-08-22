@@ -144,13 +144,23 @@ def detect_source_type(source: str, wiki_root: Path, cfg=None) -> str:
     )
 
 
-def run_script(script_name: str, args: list[str]) -> dict:
+def run_script(
+    script_name: str, args: list[str], tolerate_exit_codes: tuple = ()
+) -> dict:
+    """Run a sibling script and parse its JSON stdout.
+
+    `tolerate_exit_codes` lets a caller handle a script's deliberate non-zero
+    exit itself — e.g. discover.py exits 1 with an `options_changed` payload,
+    which the bulk flow needs to report rather than crash on.
+    """
     cmd = [sys.executable, str(SCRIPT_DIR / script_name), *args]
     proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
+    if proc.returncode != 0 and proc.returncode not in tolerate_exit_codes:
         # Bubble the stderr up to the caller — scripts already print friendly errors
         sys.stderr.write(proc.stderr)
         raise SystemExit(f"ERROR: {script_name} failed with exit code {proc.returncode}")
+    if proc.returncode != 0 and proc.stderr:
+        sys.stderr.write(proc.stderr)
     stdout = (proc.stdout or "").strip()
     if not stdout:
         return {}
@@ -458,13 +468,19 @@ def _cmd_bulk(
         if args.limit:
             discover_args += ["--limit", str(args.limit)]
 
-        result = run_script("discover.py", discover_args)
+        result = run_script("discover.py", discover_args, tolerate_exit_codes=(1,))
 
         # No sitemap found for a --site run: surface the request for explicit
         # crawl bounds instead of guessing them.
         if result.get("status") == "needs_bounds":
             print(json.dumps({"mode": "bulk", "discover": result}, indent=2, ensure_ascii=False))
             return 0
+
+        # An existing queue was built with different filters — report rather
+        # than silently reuse a differently-scoped queue.
+        if result.get("status") == "options_changed":
+            print(json.dumps({"mode": "bulk", "discover": result}, indent=2, ensure_ascii=False))
+            return 1
 
         job_id = result.get("job_id")
         if not job_id:

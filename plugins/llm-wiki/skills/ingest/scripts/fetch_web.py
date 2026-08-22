@@ -44,7 +44,7 @@ from markdownify import markdownify
 from config import ConfigError, apply_ssl_env, load_config
 from rate_limiter import RateLimitFailure, get_limiter
 from raw_store import wiki_state_dir, write_raw_if_changed
-from web_url import normalize_url, web_slug
+from web_url import disambiguate_slug, normalize_url, slug_identity, web_slug
 
 # Tags that never carry page content.
 _STRIP_TAGS = (
@@ -93,6 +93,45 @@ def _validator_key(slug: str) -> str:
     return f"web:{slug}"
 
 
+def resolve_slug_collision(raw_dir: Path, slug: str, url: str) -> str:
+    """Return a slug that isn't already owned by a *different* page.
+
+    web_slug() flattens `/` and `-` identically, so `/a/b` and `/a-b` produce
+    the same slug. Without this check the second page silently overwrites the
+    first's raw/<slug>.md — worst of all during an unattended bulk sitemap run.
+
+    Same-page re-ingests (including http→https of the same page) compare equal
+    via slug_identity() and keep their existing slug, so the diff gate and the
+    conditional-GET cache still work.
+    """
+    from raw_store import read_previous_source_metadata
+
+    prior = read_previous_source_metadata(raw_dir, slug)
+    if not prior:
+        return slug
+    prior_url = str(prior.get("url") or "")
+    if not prior_url or slug_identity(prior_url) == slug_identity(url):
+        return slug  # same page — keep the slug
+
+    candidate = disambiguate_slug(slug, url)
+    prior2 = read_previous_source_metadata(raw_dir, candidate)
+    if prior2:
+        prior2_url = str(prior2.get("url") or "")
+        if prior2_url and slug_identity(prior2_url) != slug_identity(url):
+            raise SystemExit(
+                f"ERROR: slug collision could not be resolved: both {slug!r} and "
+                f"{candidate!r} are already owned by other pages ({prior_url}, "
+                f"{prior2_url}). Refusing to overwrite. Report this — it should be "
+                "practically impossible."
+            )
+    print(
+        f"WARNING: slug {slug!r} is already used by {prior_url} — a different page "
+        f"that flattens to the same slug. Using {candidate!r} for {url} instead.",
+        file=sys.stderr,
+    )
+    return candidate
+
+
 def _raw_files_exist(raw_dir: Path, slug: str) -> bool:
     """True only when both raw files for a slug are present.
 
@@ -124,13 +163,26 @@ def _read_validators(wiki_root: Path, req_slug: str) -> dict:
 
 
 def _write_validators(
-    wiki_root: Path, req_slug: str, resolved_slug: str, etag: str, last_modified: str
+    wiki_root: Path,
+    req_slug: str,
+    req_url: str,
+    resolved_slug: str,
+    resolved_url: str,
+    etag: str,
+    last_modified: str,
 ) -> None:
     """Record validators under the requested slug, and the resolved slug too.
 
     Writing under both means a later `--url <old-redirected-url>` and a later
     `--url <the-redirect-target>` both hit the cache, instead of the second
     one silently missing it because it was written under a different key.
+
+    `identity` records which *requested* URL each key belongs to — so it differs
+    between the two entries when a redirect is involved. Two different pages can
+    share a req_slug (that's the collision resolve_slug_collision() handles), and
+    the identity is what stops the second page's ETag from being replayed against
+    the first page's URL. It must therefore be keyed to what the caller asks for,
+    not to where that request landed.
     """
     state_dir = wiki_state_dir(wiki_root)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -144,17 +196,19 @@ def _write_validators(
         except (json.JSONDecodeError, OSError):
             data = {}
 
-    entry = data.get(_validator_key(req_slug))
-    if not isinstance(entry, dict):
-        entry = {}
-    if etag:
-        entry["etag"] = etag
-    if last_modified:
-        entry["last_modified"] = last_modified
-    entry["slug"] = resolved_slug
-    data[_validator_key(req_slug)] = entry
+    def build(identity_url: str) -> dict:
+        # Rebuild rather than merge: a stale etag from a *different* page that
+        # shared this key must not survive.
+        entry = {"slug": resolved_slug, "identity": slug_identity(identity_url)}
+        if etag:
+            entry["etag"] = etag
+        if last_modified:
+            entry["last_modified"] = last_modified
+        return entry
+
+    data[_validator_key(req_slug)] = build(req_url)
     if resolved_slug != req_slug:
-        data[_validator_key(resolved_slug)] = dict(entry)
+        data[_validator_key(resolved_slug)] = build(resolved_url)
 
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True, ensure_ascii=False)
@@ -336,8 +390,10 @@ def _check_robots(url: str, cfg, limiter) -> None:
         return
     try:
         from web_discover import load_robots
+        from web_url import origin_of
 
-        robots = load_robots(url, cfg, limiter)
+        # Same origin as the page the user named, so extra_headers apply.
+        robots = load_robots(url, cfg, limiter, primary_origin=origin_of(url))
         if not robots.can_fetch(cfg.web_user_agent(), url):
             print(
                 f"WARNING: robots.txt at {urlparse(url).netloc} disallows {url}. "
@@ -372,8 +428,25 @@ def main() -> int:
 
     url = normalize_url(args.url)
     parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        print(f"ERROR: {args.url!r} is not an http(s) URL.", file=sys.stderr)
+    # netloc matters as much as the scheme: 'https:///path' passes a
+    # scheme-only check and then tracebacks inside requests as InvalidURL.
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        print(
+            f"ERROR: {args.url!r} is not a valid http(s) URL (missing scheme or host).",
+            file=sys.stderr,
+        )
+        return 1
+    # Embedded credentials would end up in the slug (and so in filenames) and
+    # in the committed raw/<slug>.source.json. Refuse them outright.
+    if parsed.username or parsed.password:
+        print(
+            f"ERROR: {args.url!r} contains embedded credentials (user:pass@host). "
+            "Strip them from the URL and put the credentials in "
+            "`web.extra_headers` in .wikirc.json instead (e.g. a Cookie or "
+            "Authorization header) — those are redacted when the config is printed "
+            "and never written to raw/.",
+            file=sys.stderr,
+        )
         return 1
 
     apply_ssl_env("web", cfg.web_verify_ssl())
@@ -382,6 +455,7 @@ def main() -> int:
     # any HTTP call. If the server redirects, the eventual content slug (used
     # for raw/ files) may differ; see the write-back below.
     req_slug = web_slug(url)
+    req_url = url  # preserved: `url` is reassigned to the final URL after redirects
     slug = req_slug
 
     if not args.no_robots_check:
@@ -393,15 +467,21 @@ def main() -> int:
     if not args.force:
         validators = _read_validators(cfg.wiki_root, req_slug)
         cached_slug = validators.get("slug") or req_slug
-        if validators and _raw_files_exist(cfg.raw_dir, cached_slug):
+        cached_identity = validators.get("identity")
+        # An entry written by a *different* page that shares this req_slug must
+        # not have its ETag replayed against this URL. Entries predating the
+        # identity field have no identity — treat those as usable.
+        identity_ok = cached_identity is None or cached_identity == slug_identity(url)
+        if validators and identity_ok and _raw_files_exist(cfg.raw_dir, cached_slug):
             if validators.get("etag"):
                 headers["If-None-Match"] = validators["etag"]
             if validators.get("last_modified"):
                 headers["If-Modified-Since"] = validators["last_modified"]
         else:
             # No cached raw files to call "unchanged" relative to (first
-            # ingest, or the raw files were deleted) — send a plain GET so a
-            # stale server-side ETag can't produce a false 304.
+            # ingest, or the raw files were deleted), or the cached entry
+            # belongs to another page — send a plain GET so a stale
+            # server-side ETag can't produce a false 304.
             validators = {}
 
     try:
@@ -412,6 +492,9 @@ def main() -> int:
             verify=cfg.web_verify_ssl(),
             timeout=cfg.web_timeout(),
             allow_redirects=True,
+            # requests drops a header-supplied Cookie on every redirect hop;
+            # keep it across same-origin ones (e.g. an http→https upgrade).
+            follow_redirects_preserving_cookie=True,
         )
     except RateLimitFailure as e:
         print(f"ERROR: {e}", file=sys.stderr)
@@ -475,6 +558,10 @@ def main() -> int:
         slug = web_slug(final_url)
         url = final_url
 
+    # Guard against two different pages flattening to one slug. Must run before
+    # anything writes using `slug` (metadata, raw files, validators).
+    slug = resolve_slug_collision(cfg.raw_dir, slug, url)
+
     markdown = extract_with_trafilatura(html, url)
     extractor = "trafilatura"
     fallback_markdown, node = extract_with_bs4(html)
@@ -517,7 +604,9 @@ def main() -> int:
     _write_validators(
         cfg.wiki_root,
         req_slug,
+        req_url,
         slug,
+        url,
         resp.headers.get("ETag", "") or "",
         resp.headers.get("Last-Modified", "") or "",
     )

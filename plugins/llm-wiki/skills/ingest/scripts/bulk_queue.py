@@ -113,6 +113,7 @@ class Queue:
         items: List[Item],
         created_at: Optional[str] = None,
         updated_at: Optional[str] = None,
+        options: Optional[dict] = None,
     ):
         self.wiki_root = Path(wiki_root)
         self.job_id = job_id
@@ -121,6 +122,11 @@ class Queue:
         self.items = items
         self.created_at = created_at or _now()
         self.updated_at = updated_at or self.created_at
+        # Canonical discovery options this queue was built with. Queue reuse is
+        # keyed on (kind, query), which doesn't capture filters — so without
+        # this, re-running with a different --include silently returns the old,
+        # differently-scoped queue.
+        self.options = dict(options or {})
 
     @property
     def path(self) -> Path:
@@ -151,6 +157,7 @@ class Queue:
             "id": self.job_id,
             "kind": self.kind,
             "query": self.query,
+            "options": self.options,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "counts": self.counts(),
@@ -207,6 +214,7 @@ def load_queue(wiki_root: Path, job_id: str) -> Queue:
         items=[Item.from_dict(x) for x in (data.get("items") or [])],
         created_at=data.get("created_at"),
         updated_at=data.get("updated_at"),
+        options=data.get("options") or {},
     )
 
 
@@ -233,6 +241,7 @@ def list_jobs(wiki_root: Path) -> List[dict]:
                 "id": data.get("id") or entry.name,
                 "kind": data.get("kind"),
                 "query": data.get("query"),
+                "options": data.get("options") or {},
                 "created_at": data.get("created_at"),
                 "updated_at": data.get("updated_at"),
                 "counts": counts,
@@ -247,3 +256,11 @@ def find_matching(wiki_root: Path, kind: str, query: str) -> Optional[str]:
         if meta.get("kind") == kind and meta.get("query") == query:
             return meta.get("id")
     return None
+
+
+def job_options(wiki_root: Path, job_id: str) -> dict:
+    """Return the canonical discovery options a queue was built with."""
+    for meta in list_jobs(wiki_root):
+        if meta.get("id") == job_id:
+            return meta.get("options") or {}
+    return {}

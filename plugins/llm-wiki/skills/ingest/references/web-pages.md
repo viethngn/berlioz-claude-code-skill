@@ -64,6 +64,20 @@ the host's dots and the path's slashes become dashes, a trailing
 `index.html` / `.html` / `.php` is stripped, and tracking params
 (`utm_*`, `gclid`, `fbclid`, …) are removed before slugging.
 
+**Collisions are detected, not ignored.** Flattening means `/a/b` and `/a-b`
+produce the same slug — two genuinely different pages. Before writing,
+`fetch_web.py` compares `slug_identity(url)` against the `url` recorded in any
+existing `raw/<slug>.source.json`; a different page gets
+`-<sha256(identity)[:8]>` appended rather than overwriting the first. The suffix
+is deterministic, so a collided page re-derives the same slug on every re-ingest
+and still hits the diff gate. `slug_identity()` deliberately excludes the
+scheme, so `http://x/a` and `https://x/a` remain *one* page sharing one raw file
+— matching what the slug itself already does.
+
+**Embedded credentials are rejected.** A `https://user:pass@host/…` URL would put
+the password in a filename and in the committed `source.json`, so both
+`fetch_web.py` and `discover.py` refuse it and point at `web.extra_headers`.
+
 ## The two diff gates
 
 Web ingest has one more gate than the other sources, in front of the usual two:
@@ -134,12 +148,41 @@ attachments.
 `extract_images.py` always sends `web.user_agent` for `web` sources (a bare
 `python-requests` User-Agent is `403`d by many CDNs) and uses the `web` rate
 limiter. **`web.extra_headers` — Cookie, Authorization, whatever's configured
-— is sent only when the image's host matches the page's own host** (the
-page URL from `source.json`'s `url` field). An image embedded from a
-third-party CDN never receives them: those headers were configured for the
-site being ingested, not for every host that site happens to link an image
-from, and leaking a session cookie to an unrelated third party is exactly the
-kind of thing a config file shouldn't cause silently.
+— is sent only when the image's *origin* matches the page's own** (the page URL
+from `source.json`'s `url` field), compared via `web_url.same_origin`:
+scheme + host + port, not just host, so a secret can't cross an http/https
+boundary on the same hostname. An image embedded from a third-party CDN never
+receives them: those headers were configured for the site being ingested, not
+for every host that site happens to link an image from, and leaking a session
+cookie to an unrelated third party is exactly the kind of thing a config file
+shouldn't cause silently.
+
+## Credentials during discovery
+
+The same scoping applies to enumeration, which is easy to overlook because
+discovery legitimately talks to hosts the user never named: a sitemap may list
+URLs on another origin, and we then fetch *that* origin's `robots.txt` and
+possibly a nested sitemap file hosted there. `web_discover._scoped_headers()`
+threads a `primary_origin` (the entry-point URL's origin) through `_get`,
+`load_robots`, `RobotsCache`, `find_sitemaps`, `parse_sitemap`, and `crawl`;
+only that origin receives `web.extra_headers`. Everything else gets
+`User-Agent` alone.
+
+## Cookies and redirects
+
+`requests`' `Session.resolve_redirects()` does `headers.pop("Cookie", None)` on
+**every** hop, same-origin or not, and only re-adds cookies from a Session's own
+jar — and `rate_limiter.py` passes no Session. So a `Cookie` set via
+`web.extra_headers` would reach only the first request and silently vanish the
+moment a URL redirects, which for the near-universal `http`→`https` upgrade means
+the authenticated fetch quietly returns the anonymous page.
+
+`RateLimiter.request(follow_redirects_preserving_cookie=True)` handles this: when
+a `Cookie` header is present it follows redirects manually, carrying the header
+across **same-origin** hops and dropping it cross-origin — the same rule
+`requests` already applies correctly to `Authorization` via `rebuild_auth`.
+Capped at 10 hops. It's a no-op when no `Cookie` is configured, so the
+Atlassian/Slack/nano-banana callers are unaffected.
 
 ## Bulk discovery
 
@@ -158,8 +201,20 @@ For `--site <url>`, in order:
 Sitemap parsing handles `<urlset>`, `<sitemapindex>` (recursive, depth cap 3,
 with a visited set so a self-referential index can't loop), gzipped sitemaps,
 and plain-text one-URL-per-line sitemaps. Namespaces are matched by local name,
-so a sitemap with an unusual prefix still parses. Ceilings: 50 000 URLs per
-job, then a warning.
+so a sitemap with an unusual prefix still parses.
+
+Three independent ceilings, because they bound different things:
+
+| Limit | Value | Bounds |
+|---|---|---|
+| `MAX_SITEMAP_URLS` | 50 000 | Parsed entries — warns and stops expanding |
+| `MAX_SITEMAP_RAW_BYTES` | 50 MB | The transfer itself, read via streaming so a server that never stops sending can't grow the process |
+| `MAX_SITEMAP_DECOMPRESSED_BYTES` | 200 MB | Gzip expansion — a `.gz` sitemap is otherwise a compression-bomb vector |
+
+The entry cap alone isn't enough: by the time entries are being counted the
+response body is already fully in memory. The byte caps raise
+`WebDiscoveryError` (surfacing as a clean `ERROR:`) rather than truncating,
+since a half-read document would just fail confusingly in the XML parser.
 
 `--sitemap <url>` skips discovery. Passing a `robots.txt` URL to `--sitemap`
 is understood — it is treated as a pointer and the directives inside are read.
@@ -195,6 +250,20 @@ Re-running the same `--site` / `--sitemap` URL reuses its existing queue
 (`find_matching` keys on kind + query), so incremental site refreshes are the
 default. `--replace` starts over.
 
+**Reuse is option-aware.** (kind, query) says nothing about the filters that
+shaped the item list, so the canonical option set — `include`, `exclude`,
+`since`, `limit`, `ignore_robots`, `depth`, `max_pages` — is stored on the queue
+(`Queue.options`). A re-run whose options differ returns
+`{"status": "options_changed", …}` and exit 1, naming exactly what changed,
+instead of silently returning a queue built to a different scope. Re-run with
+`--replace` to rebuild, or `--resume <job-id>` to continue the existing one as
+originally scoped.
+
+**Filters run before the robots pass.** `collect_sitemap_urls` returns raw
+entries; the caller applies `apply_filters` and *then* `filter_by_robots`. An
+origin whose entries all get filtered out therefore never costs a robots.txt
+request at all.
+
 **All of `--since`, `--depth`, `--max-pages`, and the URL flags are validated
 before any HTTP request** (`discover.py`'s `_validate_web_args`) — a
 malformed `--since` (must be `YYYY-MM-DD`, zero-padded) fails loudly instead
@@ -222,7 +291,8 @@ each sitemap entry — and each nested `<sitemapindex>` sitemap — against its
 **own** origin's rules. Checking everything against the entry-point's robots
 would silently apply the wrong site's policy to cross-origin URLs; `--crawl`
 doesn't have this problem since it only ever visits one origin by
-construction.
+construction. Those cross-origin `robots.txt` fetches carry only
+`web.user_agent` — never the entry-point site's credentials.
 
 Per the robots standard, a `/robots.txt` that returns **401 or 403** means
 "disallow everything"; other 4xx means "no restrictions". A robots.txt that

@@ -17,6 +17,7 @@ Requires `requests`.
 from __future__ import annotations
 
 import gzip
+import io
 import re
 import sys
 import time
@@ -51,6 +52,13 @@ MAX_SITEMAP_DEPTH = 3
 # Hard ceiling so a malformed or hostile sitemap can't exhaust memory.
 MAX_SITEMAP_URLS = 50000
 
+# Byte ceilings for sitemap fetches. MAX_SITEMAP_URLS only caps *parsed entries*,
+# which is far too late to help: the response body is already fully in memory by
+# then. These bound the transfer itself and the gzip expansion (a .gz sitemap is
+# a compression-bomb vector otherwise).
+MAX_SITEMAP_RAW_BYTES = 50 * 1024 * 1024
+MAX_SITEMAP_DECOMPRESSED_BYTES = 200 * 1024 * 1024
+
 
 class WebDiscoveryError(Exception):
     """Discovery could not proceed (network, or an unusable response)."""
@@ -61,10 +69,35 @@ def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].lower()
 
 
+def _scoped_headers(url: str, cfg, primary_origin: Optional[str], accept: str) -> dict:
+    """Headers for a discovery request, with credentials scoped to one origin.
+
+    `web.extra_headers` (Cookie, Authorization, …) is configured for the site the
+    user asked to ingest. Discovery legitimately reaches other hosts — a sitemap
+    can list URLs on another origin, and we then fetch *that* origin's robots.txt
+    and possibly its nested sitemap files. Those hosts must never receive the
+    entry-point site's credentials. User-Agent is always sent; it isn't a secret.
+
+    `primary_origin=None` means "unscoped" (send extra_headers), preserving
+    behavior for any caller that hasn't been threaded yet.
+    """
+    headers = {"User-Agent": cfg.web_user_agent(), "Accept": accept}
+    if primary_origin is None or origin_of(url) == primary_origin:
+        headers.update(cfg.web_extra_headers())
+    return headers
+
+
 def _get(
-    url: str, cfg, limiter, *, accept: str = "*/*", timeout: Optional[int] = None
+    url: str,
+    cfg,
+    limiter,
+    *,
+    accept: str = "*/*",
+    timeout: Optional[int] = None,
+    primary_origin: Optional[str] = None,
+    stream: bool = False,
 ):
-    headers = {**cfg.web_headers(), "Accept": accept}
+    headers = _scoped_headers(url, cfg, primary_origin, accept)
     try:
         return limiter.request(
             "GET",
@@ -73,6 +106,8 @@ def _get(
             verify=cfg.web_verify_ssl(),
             timeout=timeout or cfg.web_timeout(),
             allow_redirects=True,
+            stream=stream,
+            follow_redirects_preserving_cookie=True,
         )
     except RateLimitFailure as e:
         raise WebDiscoveryError(str(e)) from e
@@ -81,7 +116,9 @@ def _get(
 # ---------------------------------------------------------------- robots.txt
 
 
-def load_robots(site_url: str, cfg, limiter) -> RobotFileParser:
+def load_robots(
+    site_url: str, cfg, limiter, primary_origin: Optional[str] = None
+) -> RobotFileParser:
     """Fetch and parse /robots.txt for a site's origin.
 
     We fetch it ourselves rather than using RobotFileParser.read(), which
@@ -94,7 +131,9 @@ def load_robots(site_url: str, cfg, limiter) -> RobotFileParser:
     parser.set_url(robots_url)
 
     try:
-        resp = _get(robots_url, cfg, limiter, accept="text/plain")
+        resp = _get(
+            robots_url, cfg, limiter, accept="text/plain", primary_origin=primary_origin
+        )
     except WebDiscoveryError as e:
         print(f"WARNING: could not fetch {robots_url} — {e}", file=sys.stderr)
         parser.parse([])
@@ -149,10 +188,19 @@ class RobotsCache:
     must be checked against its *own* origin's robots.txt.
     """
 
-    def __init__(self, cfg, limiter, seed: Optional[tuple] = None):
+    def __init__(
+        self,
+        cfg,
+        limiter,
+        seed: Optional[tuple] = None,
+        primary_origin: Optional[str] = None,
+    ):
         self._cfg = cfg
         self._limiter = limiter
         self._cache: dict = {}
+        # Foreign origins reached via a sitemap must not receive the entry-point
+        # site's configured Cookie/Authorization when we fetch their robots.txt.
+        self._primary_origin = primary_origin
         if seed is not None:
             origin, parser = seed
             self._cache[origin] = parser
@@ -160,7 +208,9 @@ class RobotsCache:
     def for_url(self, url: str) -> RobotFileParser:
         origin = origin_of(url)
         if origin not in self._cache:
-            self._cache[origin] = load_robots(url, self._cfg, self._limiter)
+            self._cache[origin] = load_robots(
+                url, self._cfg, self._limiter, primary_origin=self._primary_origin
+            )
         return self._cache[origin]
 
     def can_fetch(self, url: str) -> bool:
@@ -179,16 +229,55 @@ def _looks_like_sitemap(payload: bytes) -> bool:
     return head.startswith(b"http://") or head.startswith(b"https://")
 
 
+def _read_capped(resp, max_bytes: int, what: str) -> bytes:
+    """Read a streamed response body, aborting past `max_bytes`.
+
+    Streaming rather than touching resp.content is the point: it bounds memory
+    even against a server that never stops sending.
+    """
+    chunks: list = []
+    total = 0
+    for chunk in resp.iter_content(chunk_size=65536):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_bytes:
+            raise WebDiscoveryError(
+                f"{what} exceeds the {max_bytes} byte limit — refusing to load it. "
+                "Point --sitemap at a smaller sitemap, or narrow the scope."
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _decompress(url: str, payload: bytes) -> bytes:
+    """Gunzip if needed, with a cap so a compression bomb can't exhaust memory."""
     if payload[:2] == b"\x1f\x8b" or url.lower().endswith(".gz"):
+        limit = MAX_SITEMAP_DECOMPRESSED_BYTES
         try:
-            return gzip.decompress(payload)
+            with gzip.GzipFile(fileobj=io.BytesIO(payload)) as gz:
+                # Read one byte past the limit: if we get it, the real payload is
+                # over the cap. Truncating silently would hand a half-document to
+                # the XML parser instead.
+                out = gz.read(limit + 1)
         except (OSError, EOFError) as e:
             raise WebDiscoveryError(f"could not gunzip {url}: {e}")
+        if len(out) > limit:
+            raise WebDiscoveryError(
+                f"{url} expands to more than {limit} bytes when decompressed "
+                "(possible compression bomb) — refusing to load it."
+            )
+        return out
     return payload
 
 
-def find_sitemaps(site_url: str, cfg, limiter, robots: Optional[RobotFileParser] = None) -> List[str]:
+def find_sitemaps(
+    site_url: str,
+    cfg,
+    limiter,
+    robots: Optional[RobotFileParser] = None,
+    primary_origin: Optional[str] = None,
+) -> List[str]:
     """Return every sitemap URL discoverable for a site, best source first."""
     found: List[str] = []
     seen: Set[str] = set()
@@ -209,13 +298,20 @@ def find_sitemaps(site_url: str, cfg, limiter, robots: Optional[RobotFileParser]
     for path in SITEMAP_CANDIDATES:
         candidate = join_base(site_url, path)
         try:
-            resp = _get(candidate, cfg, limiter, accept="application/xml,text/xml,text/plain")
-        except WebDiscoveryError:
-            continue
-        if resp.status_code != 200:
-            continue
-        try:
-            payload = _decompress(candidate, resp.content)
+            resp = _get(
+                candidate,
+                cfg,
+                limiter,
+                accept="application/xml,text/xml,text/plain",
+                primary_origin=primary_origin,
+                stream=True,
+            )
+            if resp.status_code != 200:
+                continue
+            payload = _decompress(
+                candidate,
+                _read_capped(resp, MAX_SITEMAP_RAW_BYTES, f"sitemap {candidate}"),
+            )
         except WebDiscoveryError:
             continue
         if _looks_like_sitemap(payload):
@@ -233,6 +329,7 @@ def parse_sitemap(
     depth: int = 0,
     visited: Optional[Set[str]] = None,
     robots_cache: Optional[RobotsCache] = None,
+    primary_origin: Optional[str] = None,
 ) -> List[dict]:
     """Fetch one sitemap and return [{loc, lastmod}], recursing into indexes.
 
@@ -246,11 +343,20 @@ def parse_sitemap(
         return []
     visited.add(normalized_self)
 
-    resp = _get(url, cfg, limiter, accept="application/xml,text/xml,text/plain")
+    resp = _get(
+        url,
+        cfg,
+        limiter,
+        accept="application/xml,text/xml,text/plain",
+        primary_origin=primary_origin,
+        stream=True,
+    )
     if resp.status_code != 200:
         raise WebDiscoveryError(f"HTTP {resp.status_code} fetching sitemap {url}")
 
-    payload = _decompress(url, resp.content)
+    payload = _decompress(
+        url, _read_capped(resp, MAX_SITEMAP_RAW_BYTES, f"sitemap {url}")
+    )
     stripped = payload.lstrip()
 
     # Plain-text sitemap: one URL per line.
@@ -292,6 +398,7 @@ def parse_sitemap(
                         depth=depth + 1,
                         visited=visited,
                         robots_cache=robots_cache,
+                        primary_origin=primary_origin,
                     )
                 )
             except WebDiscoveryError as e:
@@ -335,24 +442,34 @@ def _child_text(element, name: str) -> Optional[str]:
 
 
 def collect_sitemap_urls(
-    sitemaps: Sequence[str], cfg, limiter, *, robots_cache: Optional[RobotsCache] = None
+    sitemaps: Sequence[str],
+    cfg,
+    limiter,
+    *,
+    robots_cache: Optional[RobotsCache] = None,
+    primary_origin: Optional[str] = None,
 ) -> List[dict]:
     """Expand every sitemap into a deduplicated, normalized entry list.
 
-    When `robots_cache` is given, each entry is checked against its *own*
-    origin's robots.txt (not the origin of the sitemap that listed it) —
-    a sitemap can legitimately list URLs on another host.
+    `robots_cache` is used only to gate fetching *nested sitemap files* here.
+    The per-page robots check is a separate pass (`filter_by_robots`) that the
+    caller runs after `apply_filters`, so a URL that a filter would drop anyway
+    never costs a robots.txt fetch for its origin.
     """
     entries: List[dict] = []
     seen: Set[str] = set()
     visited: Set[str] = set()
     dropped_non_http = 0
-    dropped_by_robots_origin: dict = {}
 
     for sitemap in sitemaps:
         try:
             raw_entries = parse_sitemap(
-                sitemap, cfg, limiter, visited=visited, robots_cache=robots_cache
+                sitemap,
+                cfg,
+                limiter,
+                visited=visited,
+                robots_cache=robots_cache,
+                primary_origin=primary_origin,
             )
         except WebDiscoveryError as e:
             print(f"WARNING: skipping sitemap {sitemap} — {e}", file=sys.stderr)
@@ -369,10 +486,6 @@ def collect_sitemap_urls(
             loc = normalize_url(raw_loc)
             if not loc or loc in seen or looks_non_html(loc):
                 continue
-            if robots_cache is not None and not robots_cache.can_fetch(loc):
-                host = origin_of(loc)
-                dropped_by_robots_origin[host] = dropped_by_robots_origin.get(host, 0) + 1
-                continue
             seen.add(loc)
             entries.append({"loc": loc, "lastmod": entry.get("lastmod")})
 
@@ -382,17 +495,37 @@ def collect_sitemap_urls(
             "scheme (mailto:, ftp:, …).",
             file=sys.stderr,
         )
-    if dropped_by_robots_origin:
-        total = sum(dropped_by_robots_origin.values())
+    return entries
+
+
+def filter_by_robots(entries: Iterable[dict], robots_cache: RobotsCache) -> List[dict]:
+    """Drop entries their own origin's robots.txt disallows.
+
+    Deliberately a separate pass from collect_sitemap_urls so callers can run
+    the cheap local filters (--include/--exclude/--since) first: an origin whose
+    every entry gets filtered out then never costs a robots.txt request at all.
+    """
+    kept: List[dict] = []
+    dropped_by_origin: dict = {}
+    for entry in entries:
+        loc = entry.get("loc") or ""
+        if robots_cache.can_fetch(loc):
+            kept.append(entry)
+        else:
+            origin = origin_of(loc)
+            dropped_by_origin[origin] = dropped_by_origin.get(origin, 0) + 1
+
+    if dropped_by_origin:
+        total = sum(dropped_by_origin.values())
         breakdown = ", ".join(
-            f"{origin}: {n}" for origin, n in sorted(dropped_by_robots_origin.items())
+            f"{origin}: {n}" for origin, n in sorted(dropped_by_origin.items())
         )
         print(
             f"WARNING: robots.txt disallowed {total} sitemap URLs ({breakdown}). "
             "Pass --ignore-robots to include them.",
             file=sys.stderr,
         )
-    return entries
+    return kept
 
 
 # ------------------------------------------------------------------- filters
@@ -486,6 +619,9 @@ def crawl(
     delay = crawl_delay_for(robots, user_agent) if (robots and respect_robots) else None
 
     start = normalize_url(start_url)
+    # The crawl is same-origin by construction, so every page is the primary
+    # origin — but scope explicitly rather than relying on that invariant.
+    primary_origin = origin_of(start)
     frontier = [(start, 0)]
     seen: Set[str] = {start}
     found: List[dict] = []
@@ -498,7 +634,13 @@ def crawl(
             continue
 
         try:
-            resp = _get(url, cfg, limiter, accept="text/html,application/xhtml+xml")
+            resp = _get(
+                url,
+                cfg,
+                limiter,
+                accept="text/html,application/xhtml+xml",
+                primary_origin=primary_origin,
+            )
         except WebDiscoveryError as e:
             print(f"WARNING: could not fetch {url} during crawl — {e}", file=sys.stderr)
             continue
