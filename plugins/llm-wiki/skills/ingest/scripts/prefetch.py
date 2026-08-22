@@ -231,7 +231,7 @@ def main() -> int:
 
     try:
         queue = load_queue(cfg.wiki_root, args.job_id)
-    except FileNotFoundError as e:
+    except (FileNotFoundError, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
 

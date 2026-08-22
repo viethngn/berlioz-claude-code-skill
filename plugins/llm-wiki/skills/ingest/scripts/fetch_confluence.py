@@ -50,6 +50,40 @@ def slugify(title: str) -> str:
     return dashed or "untitled"
 
 
+def resolve_slug_collision(raw_dir: Path, slug: str, page_id: str) -> str:
+    """Return a slug that isn't already owned by a different page.
+
+    slugify(title) collides whenever two pages share a title — common across
+    spaces ("Overview", "FAQ", "Home"). Without this, the second page's fetch
+    silently overwrites the first's raw/<slug>.md via write_raw_if_changed's
+    plain byte-diff, which has no identity check of its own.
+    """
+    prior = read_previous_source_metadata(raw_dir, slug)
+    if not prior:
+        return slug
+    prior_page_id = str(prior.get("page_id") or "")
+    if not prior_page_id or prior_page_id == str(page_id):
+        return slug  # same page — keep the slug
+
+    candidate = f"{slug}-{page_id}"
+    prior2 = read_previous_source_metadata(raw_dir, candidate)
+    if prior2:
+        prior2_page_id = str(prior2.get("page_id") or "")
+        if prior2_page_id and prior2_page_id != str(page_id):
+            raise SystemExit(
+                f"ERROR: slug collision could not be resolved for page {page_id}: "
+                f"both {slug!r} and {candidate!r} are already owned by other pages "
+                f"({prior_page_id}, {prior2_page_id}). Refusing to overwrite."
+            )
+    print(
+        f"WARNING: slug {slug!r} is already used by page {prior_page_id} — a "
+        f"different page with the same title. Using {candidate!r} for page "
+        f"{page_id} instead.",
+        file=sys.stderr,
+    )
+    return candidate
+
+
 def extract_page_id(url_or_id: str) -> Optional[str]:
     if url_or_id.isdigit():
         return url_or_id
@@ -87,8 +121,18 @@ def _api_get(base_url: str, pat: str, page_id: str, expand: str, verify: bool, l
         raise SystemExit(
             f"ERROR: 404 Not Found — page {page_id} does not exist at {base_url}."
         )
-    resp.raise_for_status()
-    return resp.json()
+    try:
+        resp.raise_for_status()
+        return resp.json()
+    except (requests.exceptions.HTTPError, ValueError) as e:
+        # An unhandled status (5xx, a proxy's 502/504) or a 200 that isn't
+        # actually JSON — most plausibly an SSO-fronted instance returning an
+        # HTML login page once the PAT has expired — would otherwise surface
+        # as a raw traceback instead of a clean error.
+        raise SystemExit(
+            f"ERROR: unexpected response fetching page {page_id} from {base_url} "
+            f"(HTTP {resp.status_code}): {e}"
+        )
 
 
 def fetch_page_version(base_url: str, pat: str, page_id: str, verify: bool, limiter) -> dict:
@@ -166,6 +210,17 @@ def main() -> int:
     if not args.url and not args.page_id:
         parser.error("provide --url or --page-id")
 
+    if args.url:
+        parsed_url = urlparse(args.url)
+        if parsed_url.username or parsed_url.password:
+            print(
+                f"ERROR: {args.url!r} contains embedded credentials (user:pass@host). "
+                "Strip them from the URL — it gets written verbatim into the committed "
+                "raw/<slug>.source.json. Use atlassian.confluence_pat in .wikirc.json instead.",
+                file=sys.stderr,
+            )
+            return 1
+
     try:
         cfg = load_config(args.wiki_root)
     except ConfigError as e:
@@ -209,7 +264,16 @@ def main() -> int:
         tentative_title = version_data.get("title") or f"Confluence Page {page_id}"
         tentative_slug = slugify(tentative_title)
         prior_meta = read_previous_source_metadata(cfg.raw_dir, tentative_slug)
-        if prior_meta is not None and current_version is not None:
+        # Two guards before trusting the cache: the cached entry must actually
+        # BE this page (a same-titled different page at the same version number
+        # is the common case — freshly created pages both sitting at version 1),
+        # and the raw file it refers to must still exist on disk.
+        is_same_page = (
+            prior_meta is not None
+            and str(prior_meta.get("page_id") or "") == str(page_id)
+        )
+        raw_file_exists = (cfg.raw_dir / f"{tentative_slug}.md").exists()
+        if prior_meta is not None and current_version is not None and is_same_page and raw_file_exists:
             stored_version = prior_meta.get("version_number")
             if stored_version is not None and int(current_version) == int(stored_version):
                 summary = {
@@ -246,6 +310,7 @@ def main() -> int:
     )
 
     slug = slugify(title)
+    slug = resolve_slug_collision(cfg.raw_dir, slug, page_id)
     version = page.get("version", {})
     metadata = {
         "type": "confluence",

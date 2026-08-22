@@ -87,8 +87,18 @@ def _jira_get(base_url: str, pat: str, key: str, fields_param: str, verify: bool
         raise SystemExit(
             f"ERROR: 404 Not Found — issue {key} does not exist at {base_url}."
         )
-    resp.raise_for_status()
-    return resp.json()
+    try:
+        resp.raise_for_status()
+        return resp.json()
+    except (requests.exceptions.HTTPError, ValueError) as e:
+        # An unhandled status (5xx, a proxy's 502/504) or a 200 that isn't
+        # actually JSON — most plausibly an SSO-fronted instance returning an
+        # HTML login page once the PAT has expired — would otherwise surface
+        # as a raw traceback instead of a clean error.
+        raise SystemExit(
+            f"ERROR: unexpected response fetching issue {key} from {base_url} "
+            f"(HTTP {resp.status_code}): {e}"
+        )
 
 
 def fetch_issue_updated(base_url: str, pat: str, key: str, verify: bool, limiter) -> Optional[str]:
@@ -234,6 +244,17 @@ def main() -> int:
     if not args.key and not args.url:
         parser.error("provide --key or --url")
 
+    if args.url:
+        parsed_url = urlparse(args.url)
+        if parsed_url.username or parsed_url.password:
+            print(
+                f"ERROR: {args.url!r} contains embedded credentials (user:pass@host). "
+                "Strip them from the URL — it gets written verbatim into the committed "
+                "raw/<slug>.source.json. Use atlassian.jira_pat in .wikirc.json instead.",
+                file=sys.stderr,
+            )
+            return 1
+
     try:
         cfg = load_config(args.wiki_root)
     except ConfigError as e:
@@ -281,7 +302,11 @@ def main() -> int:
                     break
             if prior_meta is not None:
                 stored_updated = prior_meta.get("updated_at", "")
-                if stored_updated and stored_updated == current_updated:
+                # Never trust the cache if the raw file it refers to is gone —
+                # otherwise a deleted raw/<slug>.md is reported "unchanged"
+                # forever and the issue silently drops out of the wiki.
+                raw_file_exists = (Path(raw_dir) / f"{prior_slug}.md").exists()
+                if stored_updated and stored_updated == current_updated and raw_file_exists:
                     summary_title = prior_meta.get("title", key)
                     summary = {
                         "slug": prior_slug,

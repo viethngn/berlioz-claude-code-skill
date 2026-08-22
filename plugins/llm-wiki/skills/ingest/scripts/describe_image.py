@@ -21,17 +21,6 @@ from _deps import require
 
 require(["google.genai", "PIL"])
 
-# The google-genai client and the nano-banana-pro upstream both like TLS knobs
-# tweaked before import. Mirrors the pattern in plugins/nano-banana-pro/scripts/image.py.
-os.environ.setdefault("PYTHONHTTPSVERIFY", "0")
-
-try:
-    import urllib3
-
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except ImportError:  # pragma: no cover
-    pass
-
 from google import genai
 from google.genai import types
 from PIL import Image

@@ -123,6 +123,14 @@ def ensure_task_dirs(target: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def merge_claude_md(target: Path, rendered_block: str, force: bool) -> dict:
+    """Insert or update the managed CLAUDE.md block via BEGIN/END markers.
+
+    `force` only ever affects HOW the block gets updated when markers already
+    exist — never whether the rest of the file survives. Replacing the whole
+    file (the previous behavior) silently destroyed any of the user's own
+    CLAUDE.md content outside the markers, contradicting this module's own
+    "never clobbering the rest of the file" guarantee.
+    """
     claude_md = target / "CLAUDE.md"
     block = rendered_block.strip("\n")
 
@@ -132,21 +140,19 @@ def merge_claude_md(target: Path, rendered_block: str, force: bool) -> dict:
 
     existing = claude_md.read_text(encoding="utf-8")
 
-    if force:
-        write_file(claude_md, block + "\n")
-        return {"path": "CLAUDE.md", "action": "replaced (--force)"}
-
     start = existing.find(BEGIN_MARKER_PREFIX)
     end = existing.find(END_MARKER)
     if start != -1 and end != -1:
         end_full = end + len(END_MARKER)
         new_content = existing[:start] + block + existing[end_full:]
         write_file(claude_md, new_content)
-        return {"path": "CLAUDE.md", "action": "updated in place"}
+        action = "updated in place (--force)" if force else "updated in place"
+        return {"path": "CLAUDE.md", "action": action}
 
     sep = "" if existing.endswith("\n\n") else ("\n\n" if existing.endswith("\n") else "\n\n")
     write_file(claude_md, existing + sep + block + "\n")
-    return {"path": "CLAUDE.md", "action": "appended"}
+    action = "appended (--force, no existing markers found)" if force else "appended"
+    return {"path": "CLAUDE.md", "action": action}
 
 
 # ---------------------------------------------------------------------------
@@ -191,8 +197,19 @@ def merge_settings(target: Path, marketplace: Optional[Path], within_days: int) 
     if settings_path.exists():
         try:
             existing = json.loads(settings_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            existing = {}
+        except (json.JSONDecodeError, OSError) as e:
+            # Resetting to {} here would silently discard every other key
+            # (hooks, permissions, env) in a hand-edited but slightly
+            # malformed file. Leave it untouched instead.
+            return {
+                "path": ".claude/settings.json",
+                "hook_added": False,
+                "note": (
+                    f"existing .claude/settings.json is not valid JSON ({e}) — "
+                    "left untouched. Add the marketplace entry and SessionStart "
+                    "hook manually."
+                ),
+            }
 
     merge_marketplace(existing, marketplace)
     hook_added = merge_session_start_hook(existing, within_days)

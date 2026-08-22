@@ -43,7 +43,6 @@ import re
 import sys
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
 
 from _deps import require
 
@@ -59,6 +58,11 @@ from web_url import same_origin
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
+# A single oversized attachment/image (malicious or just large) shouldn't be
+# able to buffer unbounded bytes in memory before we even hash it. Streamed,
+# so the cap is enforced during download, not after it's already too late.
+MAX_IMAGE_BYTES = 50 * 1024 * 1024
+
 
 def sanitize_filename(name: str, fallback: str) -> str:
     name = name or fallback
@@ -67,21 +71,18 @@ def sanitize_filename(name: str, fallback: str) -> str:
     return name or fallback
 
 
-def _matches_host(url: str, base_url: str) -> bool:
-    if not base_url:
-        return False
-    try:
-        u = urlparse(url)
-        b = urlparse(base_url)
-    except Exception:
-        return False
-    return bool(u.netloc) and u.netloc == b.netloc
-
-
 def _headers_for(url: str, cfg, source_type: str = "", page_url: str = "") -> dict:
-    if _matches_host(url, cfg.confluence_base_url()) and cfg.confluence_pat():
+    # same_origin() compares scheme+host+port, not just host, so a PAT never
+    # goes out over a plaintext http:// URL on an https://-configured host.
+    # Gated by source_type too: on a shared-host Atlassian Data Center install
+    # (Confluence and Jira on the same domain, different context paths — a
+    # common real topology), an image URL's host alone could match either
+    # configured base_url regardless of which tool is actually fetching it —
+    # gating means a Jira fetch can never pick up the Confluence PAT or vice
+    # versa.
+    if source_type == "confluence" and same_origin(url, cfg.confluence_base_url()) and cfg.confluence_pat():
         return {"Authorization": f"Bearer {cfg.confluence_pat()}"}
-    if _matches_host(url, cfg.jira_base_url()) and cfg.jira_pat():
+    if source_type == "jira" and same_origin(url, cfg.jira_base_url()) and cfg.jira_pat():
         return {"Authorization": f"Bearer {cfg.jira_pat()}"}
     if source_type == "web":
         # User-Agent is always sent — a bare python-requests UA is 403'd by
@@ -108,6 +109,7 @@ def download_to_memory(url: str, headers: dict, verify: bool, limiter=None) -> O
             headers=headers,
             verify=verify,
             timeout=60,
+            stream=True,
             # No-op unless a Cookie is configured; keeps it across same-origin
             # redirects, which requests would otherwise strip.
             follow_redirects_preserving_cookie=True,
@@ -121,7 +123,21 @@ def download_to_memory(url: str, headers: dict, verify: bool, limiter=None) -> O
             file=sys.stderr,
         )
         return None
-    return resp.content
+
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in resp.iter_content(chunk_size=65536):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > MAX_IMAGE_BYTES:
+            print(
+                f"WARN: {url} exceeds the {MAX_IMAGE_BYTES} byte limit — skipping.",
+                file=sys.stderr,
+            )
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def choose_extension(url: str, filename_hint: str) -> str:

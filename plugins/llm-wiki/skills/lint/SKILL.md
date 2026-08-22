@@ -70,6 +70,13 @@ JSON on stdout. Top-level keys:
 - `broken_links` — `[[link]]` targets that don't exist in `wiki/`. Links to
   archived pages (`[[old]]` or `[[archive/old]]`) resolve and are NOT flagged.
 - `missing_pages` — de-duplicated broken-link targets, grouped by referrer
+- `archive_links_without_banner` — inbound `[[link]]`s into `wiki/archive/*`
+  whose target page has no `**Status**: Archived`/`Superseded by [[...]]`
+  banner. **Informational, not an error** — a bare reference into the archive
+  is a legitimate historical citation and is never flagged as a broken link.
+  This field exists to catch the *other* case: a page got archived but the
+  pages that linked to it were never repointed to its replacement. Each entry
+  is `{"from", "to", "archived_slug"}`.
 - `format_violations` — pages missing an H1 or `Summary`/`Sources`/`Last updated`
 - `empty_pages` — pages with an empty/stub body (too short, or a placeholder
   marker like `Placeholder — add content` / `TBD — mentioned in`)

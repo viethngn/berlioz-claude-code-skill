@@ -48,6 +48,8 @@ from _deps import require
 
 require(["requests"])
 
+import requests
+
 from bulk_queue import (
     Item,
     Queue,
@@ -138,8 +140,14 @@ def _paginate_confluence(
             raise SystemExit("ERROR: 403 Forbidden — the PAT cannot list this space/query.")
         if resp.status_code == 404:
             raise SystemExit(f"ERROR: 404 Not Found — {endpoint} at {base_url} returned 404.")
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.exceptions.HTTPError, ValueError) as e:
+            raise SystemExit(
+                f"ERROR: unexpected response from {endpoint} at {base_url} "
+                f"(HTTP {resp.status_code}): {e}"
+            )
         results = data.get("results") or []
         for r in results:
             if limit and len(items) >= limit:
@@ -194,8 +202,14 @@ def enumerate_jira_jql(
             raise SystemExit(f"ERROR: Jira rejected the JQL — {resp.text[:200]}")
         if resp.status_code == 403:
             raise SystemExit("ERROR: 403 Forbidden — the PAT cannot run this JQL.")
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.exceptions.HTTPError, ValueError) as e:
+            raise SystemExit(
+                f"ERROR: unexpected response from Jira search at {base_url} "
+                f"(HTTP {resp.status_code}): {e}"
+            )
         issues = data.get("issues") or []
         for issue in issues:
             if limit and len(items) >= limit:

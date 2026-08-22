@@ -35,7 +35,22 @@ def state_dir(wiki_root: Path) -> Path:
     return Path(wiki_root) / ".wiki-state" / "bulk-jobs"
 
 
+# What make_job_id() actually produces — a leading alnum char, else '-' would
+# strip and hyphens/alnum after. Validated centrally here (not just at each
+# CLI's argument parser) because Path's / operator doesn't normalize '..', so
+# an unvalidated job_id joined into a path can escape .wiki-state/bulk-jobs/
+# entirely — e.g. queue_admin.py's `delete` subcommand shutil.rmtree()s
+# whatever job_dir() returns.
+JOB_ID_RE = re.compile(r"^[A-Za-z0-9-]+$")
+
+
 def job_dir(wiki_root: Path, job_id: str) -> Path:
+    if not JOB_ID_RE.match(job_id):
+        raise ValueError(
+            f"invalid job_id {job_id!r} — expected only letters, digits, and "
+            "hyphens (this is what make_job_id() produces; anything else is "
+            "refused before it's joined into a filesystem path)"
+        )
     return state_dir(wiki_root) / job_id
 
 

@@ -37,7 +37,7 @@ from bs4 import BeautifulSoup
 from markdownify import markdownify
 
 from config import ConfigError, load_config
-from raw_store import write_raw_if_changed
+from raw_store import read_previous_source_metadata, write_raw_if_changed
 
 
 _slug_re = re.compile(r"[^\w\-]+", re.UNICODE)
@@ -395,6 +395,56 @@ def read_previous_source_sha(raw_dir: Path, slug: str) -> Optional[str]:
         return None
 
 
+def resolve_slug_collision(
+    raw_dir: Path, slug: str, original_path: str, explicit_slug: bool
+) -> str:
+    """Return a slug that isn't already owned by a different local file.
+
+    The default slug is just the filename stem, so two different files that
+    happen to share one (projectA/README.md, projectB/README.md) collide —
+    write_raw_if_changed only ever compares bytes, never original_path, so the
+    second ingest would silently overwrite the first's raw file. Unlike
+    Confluence's page_id there's no natural short identifier here, so the
+    disambiguator is a short hash of the resolved path.
+
+    When the slug came from an explicit --slug, respect it — the user asked
+    for that name deliberately — but still warn so the mismatch isn't silent.
+    """
+    prior = read_previous_source_metadata(raw_dir, slug)
+    if not prior:
+        return slug
+    prior_path = str(prior.get("original_path") or "")
+    if not prior_path or prior_path == original_path:
+        return slug  # same file — keep the slug
+
+    if explicit_slug:
+        print(
+            f"WARNING: --slug {slug!r} is already used by {prior_path} — a "
+            f"different file. Proceeding will overwrite it with {original_path}.",
+            file=sys.stderr,
+        )
+        return slug
+
+    digest = hashlib.sha256(original_path.encode("utf-8")).hexdigest()[:8]
+    candidate = f"{slug}-{digest}"
+    prior2 = read_previous_source_metadata(raw_dir, candidate)
+    if prior2:
+        prior2_path = str(prior2.get("original_path") or "")
+        if prior2_path and prior2_path != original_path:
+            raise SystemExit(
+                f"ERROR: slug collision could not be resolved for {original_path}: "
+                f"both {slug!r} and {candidate!r} are already owned by other files "
+                f"({prior_path}, {prior2_path}). Pass --slug to disambiguate manually."
+            )
+    print(
+        f"WARNING: slug {slug!r} is already used by {prior_path} — a different "
+        f"file with the same name. Using {candidate!r} for {original_path} instead. "
+        "Pass --slug to choose your own.",
+        file=sys.stderr,
+    )
+    return candidate
+
+
 def copy_into_raw(source: Path, raw_dir: Path, slug: str, ext: str) -> Path:
     """Copy the original file into raw/<slug><ext> and return the copy's path.
 
@@ -435,9 +485,10 @@ def main() -> int:
     slug = args.slug or slugify(source.stem)
     raw_dir = cfg.raw_dir
     raw_dir.mkdir(parents=True, exist_ok=True)
-    images_dir = raw_dir / "images" / slug
     original_filename = source.name
     original_path = str(source)
+    slug = resolve_slug_collision(raw_dir, slug, original_path, bool(args.slug))
+    images_dir = raw_dir / "images" / slug
 
     # Copy the original into raw/ so the wiki owns its source and the diff check
     # never depends on the external file. Two extensions are exempt from the

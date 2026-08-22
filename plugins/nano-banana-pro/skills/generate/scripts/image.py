@@ -4,52 +4,56 @@
 # dependencies = [
 #     "google-genai",
 #     "pillow",
+#     "httpx",
 # ]
 # ///
 """
 Generate images using Google's Gemini image models.
 
 Usage:
-    python generate_image.py --prompt "A colorful abstract pattern" --output "./hero.png"
-    python generate_image.py --prompt "Minimalist icon" --output "./icon.png" --aspect "16:9"
-    python generate_image.py --prompt "Similar style image" --output "./new.png" --reference "./existing.png"
-    python generate_image.py --prompt "High quality art" --output "./art.png" --size 1K
+    uv run image.py --prompt "A colorful abstract pattern" --output "./hero.png"
+    uv run image.py --prompt "Minimalist icon" --output "./icon.png" --aspect "16:9"
+    uv run image.py --prompt "Similar style image" --output "./new.png" --reference "./existing.png"
+    uv run image.py --prompt "High quality art" --output "./art.png" --size 1K
 """
 
-import os
-os.environ['PYTHONHTTPSVERIFY'] = '0'
-
-# Disable SSL verification warnings
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-import ssl
-import httpcore
-from typing import Optional
-
-# Monkey patch httpcore to disable SSL verification
-_original_map_exceptions = httpcore._sync.connection.HTTPConnection._connect
-
-def patched_connect(self, request):
-    # Override to disable SSL verification
-    return _original_map_exceptions(self, request)
-
-# Disable SSL globally for httpcore
-import httpcore._backends.sync
-_original_wrap_socket = httpcore._backends.sync.SyncStream.start_tls
-
-def patched_start_tls(self, *args, **kwargs):
-    kwargs['ssl_context'] = ssl._create_unverified_context()
-    return _original_wrap_socket(self, *args, **kwargs)
-
-httpcore._backends.sync.SyncStream.start_tls = patched_start_tls
-
 import argparse
+import os
 import sys
+from typing import Optional
 
 from google import genai
 from google.genai import types
 from PIL import Image
+
+# TLS verification is on by default. Some corporate networks intercept TLS
+# with their own CA; rather than disabling verification for the whole
+# process (which would affect every TLS connection this interpreter makes,
+# not just Gemini's), set NANO_BANANA_INSECURE_SSL=1 to scope the bypass to
+# this script's own HTTP client only.
+INSECURE_SSL = os.environ.get("NANO_BANANA_INSECURE_SSL", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _http_options(base_url: str, api_key: str) -> types.HttpOptions:
+    kwargs = dict(
+        base_url=base_url,
+        api_version="",  # Keep it empty so that SDK doesn't overwrite
+        headers={
+            "Authorization": api_key,
+        },
+    )
+    if INSECURE_SSL:
+        import httpx
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        kwargs["httpx_client"] = httpx.Client(verify=False)
+    return types.HttpOptions(**kwargs)
+
 
 def generate_image(
     prompt: str,
@@ -67,14 +71,10 @@ def generate_image(
     client = genai.Client(
         vertexai=True,
         api_key=api_key,
-        http_options=types.HttpOptions(
-            base_url="https://api.ai.public.rakuten-it.com/google-vertexai/v1/",
-            api_version="", # Keep it empty so that SDK doesn't overwrite
-            headers={
-                "Authorization": api_key,
-            },
+        http_options=_http_options(
+            "https://api.ai.public.rakuten-it.com/google-vertexai/v1/", api_key
         ),
-        )
+    )
 
     full_prompt = f"{prompt}"
 
@@ -96,13 +96,18 @@ def generate_image(
         response_modalities=["TEXT", "IMAGE"],
         image_config=types.ImageConfig(
             aspect_ratio=aspect,
+            image_size=size,
         ),
     )
-    response = client.models.generate_content(
-        model=model_id,
-        contents=contents,
-        config=config,
-    )
+    try:
+        response = client.models.generate_content(
+            model=model_id,
+            contents=contents,
+            config=config,
+        )
+    except Exception as e:  # noqa: BLE001 — surface a clean error, not a traceback
+        print(f"Error: image generation request failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # Ensure output directory exists
     output_dir = os.path.dirname(output_path)
@@ -139,7 +144,6 @@ def main():
     )
     parser.add_argument(
         "--aspect",
-        required=True,
         default="16:9",
         help="Aspect ratio (default: 16:9)",
     )
@@ -149,7 +153,6 @@ def main():
     )
     parser.add_argument(
         "--size",
-        required=True,
         choices=["1K", "2K", "4K"],
         default="1K",
         help="Image resolution (default: 1K)",

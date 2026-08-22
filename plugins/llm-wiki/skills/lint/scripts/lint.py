@@ -2,9 +2,9 @@
 """Deterministic wiki linter — stdlib only.
 
 Scans wiki/*.md and emits a JSON report of:
-    orphans, broken_links, missing_pages, format_violations, empty_pages,
-    stale_pages, unsourced_claims, status_pages, missing_sources,
-    empty_raw, edges (wiki-link graph)
+    orphans, broken_links, missing_pages, archive_links_without_banner,
+    format_violations, empty_pages, stale_pages, unsourced_claims,
+    status_pages, missing_sources, empty_raw, edges (wiki-link graph)
 
 Pages carrying `**Status**: Archived` or `**Status**: Superseded by [[...]]`
 are excluded from the orphan and stale checks (intentionally retired).
@@ -299,6 +299,12 @@ def find_missing_sources(pages: List[dict], raw_dir: Path) -> List[dict]:
                 # Only check entries that look like a raw/ path.
                 if not candidate.startswith("raw/"):
                     continue
+                if ".." in Path(candidate).parts:
+                    # Never resolve a traversal attempt against the real
+                    # filesystem — treat it as an invalid Sources entry
+                    # rather than a read-oracle for paths outside raw/.
+                    missing.append(candidate)
+                    continue
                 if not (wiki_root / candidate).exists():
                     missing.append(candidate)
         if missing:
@@ -401,6 +407,48 @@ def archived_slugs(wiki_dir: Path) -> set:
     if not archive_dir.exists():
         return set()
     return {p.stem for p in archive_dir.glob("*.md") if p.is_file()}
+
+
+def find_unbannered_archive_links(
+    edges: Dict[str, List[str]], wiki_dir: Path, archived: set
+) -> List[dict]:
+    """Inbound links into wiki/archive/* whose target has no Superseded-by
+    banner — informational, not an error.
+
+    find_broken_links() deliberately treats every archived slug as a valid
+    target (a bare reference into the archive is a legitimate historical
+    citation, not a broken link) — which is the right default, but it means a
+    forgotten link-repoint after archiving a page is otherwise invisible
+    forever. This surfaces that case without reversing the leniency: it flags
+    links whose target lacks a Superseded-by/Archived banner, which is the
+    signal that repointing was actually intended.
+    """
+    archive_dir = wiki_dir / ARCHIVE_SUBDIR
+    prefix = f"{ARCHIVE_SUBDIR}/"
+    banner_cache: Dict[str, bool] = {}
+
+    def archived_slug_of(target: str) -> Optional[str]:
+        if target in archived:
+            return target
+        if target.startswith(prefix) and target[len(prefix):] in archived:
+            return target[len(prefix):]
+        return None
+
+    def has_banner(slug: str) -> bool:
+        if slug not in banner_cache:
+            path = archive_dir / f"{slug}.md"
+            text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+            status, _ = parse_status(text)
+            banner_cache[slug] = status in RETIRED_STATUSES
+        return banner_cache[slug]
+
+    out: List[dict] = []
+    for slug, targets in edges.items():
+        for t in targets:
+            archived_slug = archived_slug_of(t)
+            if archived_slug and not has_banner(archived_slug):
+                out.append({"from": slug, "to": t, "archived_slug": archived_slug})
+    return out
 
 
 def find_stale(
@@ -549,6 +597,7 @@ def main() -> int:
     retired = retired_slugs(pages)
     orphans = find_orphans(pages, inbound, retired)
     broken, missing = find_broken_links(pages, edges, archived)
+    unbannered_archive_links = find_unbannered_archive_links(edges, wiki_dir, archived)
     format_violations = find_format_violations(pages)
     stale = find_stale(pages, raw_dir, args.stale_days, retired)
     unsourced = find_unsourced(pages)
@@ -569,6 +618,7 @@ def main() -> int:
         "orphans": orphans,
         "broken_links": broken,
         "missing_pages": dict(sorted(missing.items())),
+        "archive_links_without_banner": unbannered_archive_links,
         "format_violations": format_violations,
         "empty_pages": empty_pages,
         "stale_pages": stale,

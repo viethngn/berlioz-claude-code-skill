@@ -45,6 +45,12 @@ TEMPLATE_MAP: dict[str, str] = {
     "claude-settings.json": ".claude/settings.json",
 }
 
+# These accumulate real content over a wiki's life (ingest/lint history,
+# project-specific instructions) — unlike templates/page.md, a --force re-run
+# must never reset them to the pristine starter template. Same unconditional
+# protection .wikirc.json already gets below.
+FORCE_PROTECTED = {"CLAUDE.md", "wiki/index.md", "wiki/log.md", ".gitignore"}
+
 
 def resolve_marketplace(explicit: Optional[Path]) -> Optional[Path]:
     if explicit is not None:
@@ -83,7 +89,12 @@ def merge_claude_settings(existing: dict, marketplace: Optional[Path]) -> dict:
     else:
         source = str(marketplace)
 
-    marketplaces = existing.get("marketplaces") or []
+    # Defensive even though the caller already pre-checks this (see
+    # _bootstrap): a non-list "marketplaces" value must never reach
+    # .append(), which would raise AttributeError/TypeError and abort the
+    # whole bootstrap partway through with no diagnostic.
+    raw_marketplaces = existing.get("marketplaces")
+    marketplaces = raw_marketplaces if isinstance(raw_marketplaces, list) else []
     if not any(
         (isinstance(m, dict) and m.get("source") == source) for m in marketplaces
     ):
@@ -259,8 +270,24 @@ def _bootstrap(
                 try:
                     with dest.open("r", encoding="utf-8") as f:
                         existing = json.load(f)
-                except (json.JSONDecodeError, OSError):
-                    existing = {}
+                except (json.JSONDecodeError, OSError) as e:
+                    # Starting the merge from {} would silently discard every
+                    # other key (hooks, permissions, env) in a hand-edited but
+                    # slightly malformed file. Leave it untouched instead.
+                    warnings.append(
+                        f"existing {dest_rel} is not valid JSON ({e}) — left "
+                        "untouched. Add the marketplace entry manually: "
+                        f'{{"marketplaces": [{{"source": "{context["marketplace_path"]}"}}]}}'
+                    )
+                    skipped.append(dest_rel)
+                    continue
+                if "marketplaces" in existing and not isinstance(existing["marketplaces"], list):
+                    warnings.append(
+                        f'existing {dest_rel} has a non-list "marketplaces" value — '
+                        "left untouched. Add the marketplace entry manually."
+                    )
+                    skipped.append(dest_rel)
+                    continue
             merged = merge_claude_settings(existing, marketplace)
             write_file(dest, json.dumps(merged, indent=2) + "\n")
             created.append(dest_rel)
@@ -268,7 +295,7 @@ def _bootstrap(
 
         rendered = render_template(tpl, context)
 
-        if dest.exists() and not force:
+        if dest.exists() and (dest_rel in FORCE_PROTECTED or not force):
             skipped.append(dest_rel)
             continue
 
@@ -312,11 +339,27 @@ def _bootstrap(
         else:
             subprocess.run(["git", "-C", str(target), "init", "-q"], check=True)
             subprocess.run(["git", "-C", str(target), "add", "."], check=True)
-            subprocess.run(
+            commit_proc = subprocess.run(
                 ["git", "-C", str(target), "commit", "-q", "-m", "chore: bootstrap llm-wiki"],
                 check=False,
+                capture_output=True,
+                text=True,
             )
-            git_status = {"initialized": True, "note": "initial commit created"}
+            if commit_proc.returncode == 0:
+                git_status = {"initialized": True, "note": "initial commit created"}
+            else:
+                # e.g. no git identity configured — a common state on a fresh
+                # machine/sandbox. The scaffold itself still succeeded; don't
+                # claim a commit happened when it didn't.
+                git_status = {
+                    "initialized": True,
+                    "note": (
+                        "git init done, but the initial commit failed (no git "
+                        "identity configured?) — run `git config user.name`/"
+                        "`user.email` and commit manually. "
+                        f"git said: {commit_proc.stderr.strip() or commit_proc.stdout.strip()}"
+                    ),
+                }
     else:
         git_status = {"initialized": False, "note": "--no-git passed"}
 

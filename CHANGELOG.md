@@ -1,5 +1,117 @@
 # Changelog
 
+## 1.7.0 - 2026-08-23
+
+Repo-wide security/correctness audit, covering every plugin (not just the web-ingest
+work in 1.6.0). Four parallel investigations found 28 verified issues — each confirmed
+against the actual code before being fixed, and several caught live by temporarily
+reverting the fix and confirming the regression test actually fails.
+
+### nano-banana-pro
+
+- **TLS verification was globally disabled** while the Gemini API key traveled in an
+  `Authorization` header — a process-wide `httpcore` monkeypatch forced
+  `ssl._create_unverified_context()` on every TLS handshake this interpreter made, not
+  just this script's own. Now defaults to verified TLS; `NANO_BANANA_INSECURE_SSL=1`
+  opts in, and the bypass is scoped to just this script's own `httpx.Client` instead of
+  patching a shared class.
+- `--aspect`/`--size` were `required=True` in argparse despite having defaults and
+  despite every documented example omitting them — running the documented command
+  failed immediately. Now genuinely optional. `--reference`'s docs mislabeled it
+  "(required)" when the script itself already treated it as optional.
+- `--size` was accepted but silently had no effect on generation — wired into
+  `ImageConfig.image_size`, which the SDK already supports.
+- Every doc example ran `python image.py ...`; the script only declares dependencies via
+  a `uv run`-style inline PEP 723 header, so plain `python3` failed with
+  `ModuleNotFoundError`. Every example now says `uv run`.
+- The actual generation network call had no error handling, unlike every other failure
+  path in the file — wrapped so a request failure prints a clean `Error:` instead of a
+  traceback. Removed dead monkeypatch code and a stale reference to a nonexistent
+  `.claude/settings.local.json`.
+
+### llm-wiki
+
+The web-ingest hardening (1.6.0) added collision detection, "does the cached file still
+exist" checks, and origin-scoped credentials — none of which had been applied to the
+older Confluence/Jira/Slack/local-file fetchers this pass audited:
+
+- **Confluence**: two pages with the same title (different spaces — "Overview", "FAQ")
+  slugified identically and silently overwrote each other; worse, the version pre-check
+  could report the *wrong page's* stale cached content as `"unchanged"` for a same-titled
+  different page sitting at the same version number (the common case for two freshly
+  created pages). Both fixed: a page_id mismatch now disambiguates the slug, and the
+  cache is only trusted when the page_id matches *and* the raw file still exists on disk.
+- **Jira**: the `updated_at` pre-check was already correctly scoped by issue key, but
+  never checked the raw file still existed — a deleted raw file was reported
+  `"unchanged"` forever. Fixed with the same existence guard.
+- **Images** (`extract_images.py`): Confluence/Jira PAT scoping compared host only, not
+  scheme, and wasn't gated by which tool was actually fetching — on a shared-host
+  Atlassian Data Center install, a Jira fetch could pick up the Confluence PAT. Now uses
+  `same_origin()` (scheme+host+port) gated by `source_type`. Image downloads also had no
+  byte cap, unlike the sitemap-fetching code from 1.6.0 — added a 50 MB streamed cap.
+- **Embedded credentials**: a `--url` containing `user:pass@host` was written verbatim
+  into committed `source.json` for Confluence and Jira, same as the bug already fixed for
+  web URLs in 1.6.0 — now rejected the same way.
+- **Slack**: thread slugs collided whenever two threads in the same channel started on
+  the same calendar day — salted with a hash of `thread_ts`, which is now also recorded
+  in metadata.
+- **Local files**: two different files sharing a filename stem silently overwrote each
+  other with no warning — now compared against the prior ingest's `original_path` and
+  disambiguated.
+- **Bulk queue**: a hand-typed or prompt-injected `job_id` like `../../.git` was joined
+  straight into a filesystem path with no validation — `queue_admin.py delete --force`
+  would `shutil.rmtree()` whatever that resolved to. Now validated centrally in
+  `bulk_queue.job_dir()` against the actual charset `make_job_id()` produces.
+- **Git commit**: `git_commit()` hardcoded literal `"raw"`/`"wiki"` pathspecs instead of
+  the configurable `raw_dir`/`wiki_dir` — renaming either in `.wikirc.json` (which the
+  shipped example config invites) crashed every auto-commit with an uncaught
+  `CalledProcessError`. Now uses the configured names.
+- Several fetchers only special-cased 401/403/404 and fell through to an unguarded
+  `resp.json()` for anything else — most plausibly an SSO-fronted instance returning an
+  HTML login page once a PAT expires, which raised a raw `JSONDecodeError` traceback.
+  Wrapped in the same friendly-error style as the existing status checks.
+- `describe_image.py` suppressed TLS-verification warnings unconditionally at import,
+  regardless of the user's actual `nano_banana.verify_ssl` setting — now only touches
+  anything when `verify_ssl` is actually `false`, matching every other section.
+- **`create-wiki/bootstrap.py`**: a malformed pre-existing `.claude/settings.json` was
+  silently reset to `{}` (discarding hooks/permissions/env), and a `"marketplaces"` value
+  that wasn't a list crashed the merge with an unhandled exception partway through
+  bootstrap. Both cases now leave the file untouched and surface a `warnings` entry
+  instead. `--force` unconditionally overwrote `wiki/index.md`, `wiki/log.md`,
+  `CLAUDE.md`, and `.gitignore` with the pristine starter template — these can
+  accumulate months of real ingest/lint history, so they now get the same
+  unconditional protection `.wikirc.json` already had. A failed `git commit` (e.g. no
+  git identity configured) was reported as `"initial commit created"` regardless —
+  now reflects the actual outcome.
+- **`lint.py`**: a `raw/../../etc/passwd`-style Sources entry was resolved against the
+  real filesystem as a boolean read-oracle — now rejected outright as an invalid entry
+  rather than checked. Added `archive_links_without_banner`, a new informational report
+  field: an inbound link into `wiki/archive/*` whose target has no `Superseded by`
+  banner usually means a page was archived but the pages linking to it were never
+  repointed — invisible before, since a bare archive reference is (correctly) never
+  treated as a broken link.
+
+### secretary
+
+- **`create-secretary/bootstrap.py`**: `--force` replaced the *entire* CLAUDE.md file
+  instead of just the managed block between its markers, silently destroying any of the
+  user's own instructions outside them — despite the module's own docstring promising
+  exactly the opposite. Now always confines the write to the marker span (or appends, if
+  no markers exist yet), matching create-wiki's equivalent fix. A malformed pre-existing
+  `.claude/settings.json` had the same silent-reset-to-`{}` bug as create-wiki's — same
+  fix: leave it untouched, surface a warning.
+- **`task_store.py`**: `write_task`/`find_task` joined a task id straight into a
+  filesystem path with no format check — not reachable through the documented sync
+  pipeline today, but no defense-in-depth against a hand-corrupted `id:` frontmatter line
+  or a steered agent passing a crafted id. Now validated against `T-<digits>`.
+- **`tasks_cli.py`**: a corrupted target task file crashed `update`/`done`/`remove` with
+  a raw traceback (only `KeyError` was caught, not the `ValueError` a malformed file
+  raises) — confirmed by reverting the fix and reproducing the traceback. Now caught
+  alongside `KeyError` and reported as the tool's normal clean JSON error.
+- New regression tests in `tests/smoke_bulk_ingest.py`: two same-titled Confluence pages
+  at the same version number resolve to distinct, stable slugs; a path-traversal
+  `job_id` is rejected; a renamed `raw_dir`/`wiki_dir` no longer crashes `git_commit()`.
+
 ## 1.6.0 - 2026-08-22
 
 ### llm-wiki

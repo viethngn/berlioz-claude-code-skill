@@ -225,7 +225,12 @@ def main() -> int:
 
     try:
         result = args.func(args, root)
-    except KeyError as e:
+    except (KeyError, ValueError) as e:
+        # ValueError: a malformed target task file (parse_task_file) or an
+        # invalid id reaching find_task/write_task — _load_dir already
+        # tolerates one bad file during list/digest, but update/done/remove
+        # target a *specific* file directly and would otherwise crash with a
+        # raw traceback instead of this tool's normal clean JSON error.
         print(json.dumps({"error": str(e)}))
         return 1
 

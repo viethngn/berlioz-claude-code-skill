@@ -54,7 +54,7 @@ def _cmd_show(args) -> int:
     wiki_root = _resolve_wiki_root(args)
     try:
         q = load_queue(wiki_root, args.job_id)
-    except FileNotFoundError as e:
+    except (FileNotFoundError, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
     print(json.dumps(q.to_dict(), indent=2, ensure_ascii=False))
@@ -65,7 +65,7 @@ def _cmd_reset(args) -> int:
     wiki_root = _resolve_wiki_root(args)
     try:
         q = load_queue(wiki_root, args.job_id)
-    except FileNotFoundError as e:
+    except (FileNotFoundError, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
@@ -91,7 +91,7 @@ def _cmd_mark(args) -> int:
     wiki_root = _resolve_wiki_root(args)
     try:
         q = load_queue(wiki_root, args.job_id)
-    except FileNotFoundError as e:
+    except (FileNotFoundError, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
@@ -128,7 +128,11 @@ def _cmd_mark(args) -> int:
 
 def _cmd_delete(args) -> int:
     wiki_root = _resolve_wiki_root(args)
-    directory = job_dir(wiki_root, args.job_id)
+    try:
+        directory = job_dir(wiki_root, args.job_id)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
     if not directory.exists():
         print(f"ERROR: no job dir at {directory}", file=sys.stderr)
         return 1

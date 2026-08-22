@@ -105,6 +105,13 @@ def serialize_task(task: dict) -> str:
 
 
 def write_task(root: Path, task: dict, archived: bool) -> Path:
+    if not ID_RE.match(str(task.get("id") or "")):
+        # task['id'] is only ever next_id()'s output or an unchanged value
+        # from an already-parsed file today, so this shouldn't fire in
+        # practice — but it's the one place a corrupted id: frontmatter line,
+        # or a caller passing something else through, would otherwise get
+        # joined straight into a filesystem path with no validation at all.
+        raise ValueError(f"invalid task id {task.get('id')!r} — expected T-<digits>")
     target_dir = archived_dir(root) if archived else tasks_dir(root)
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / f"{task['id']}.md"
@@ -137,6 +144,8 @@ def load_all_tasks(root: Path, include_archived: bool = False) -> list[dict]:
 
 def find_task(root: Path, task_id: str) -> Optional[dict]:
     """Locate a task by id in either tasks/ or archived/. Sets `_archived`."""
+    if not ID_RE.match(str(task_id or "")):
+        raise ValueError(f"invalid task id {task_id!r} — expected T-<digits>")
     for d, is_archived in ((tasks_dir(root), False), (archived_dir(root), True)):
         path = d / f"{task_id}.md"
         if path.exists():

@@ -19,6 +19,7 @@ timestamp, so repeated plain runs only ingest new messages.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -73,8 +74,14 @@ def _slack_get(session: _requests.Session, limiter, method: str, params: dict) -
         resp = limiter.request("GET", url, session=session, params=params)
     except RateLimitFailure as e:
         raise SystemExit(f"ERROR: {e}")
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        resp.raise_for_status()
+        data = resp.json()
+    except (_requests.exceptions.HTTPError, ValueError) as e:
+        raise SystemExit(
+            f"ERROR: unexpected response from Slack {method} "
+            f"(HTTP {resp.status_code}): {e}"
+        )
     if not data.get("ok"):
         error = data.get("error", "unknown_error")
         # Slack also signals throttling with ok:false error:ratelimited on some
@@ -517,7 +524,13 @@ def main() -> int:
         source_label = f"Slack search: {args.search}"
         title = f"Slack search: {args.search} — {date_range_display}"
     elif is_thread:
-        slug = f"slack-{channel_name}-thread-{oldest_date}"
+        # oldest_date alone collides whenever two threads in the same channel
+        # start on the same calendar day — routine in any active channel.
+        # thread_ts uniquely identifies the thread, so salt the slug with a
+        # short hash of it (also recorded in metadata below, so a collision
+        # is at least detectable after the fact).
+        thread_hash = hashlib.sha256((args.thread_ts or "").encode("utf-8")).hexdigest()[:8]
+        slug = f"slack-{channel_name}-thread-{oldest_date}-{thread_hash}"
         source_label = f"Slack thread in #{channel_name}"
         title = f"#{channel_name} thread — {date_range_display}"
     else:
@@ -556,6 +569,8 @@ def main() -> int:
     }
     if is_search:
         source_dict["search_query"] = args.search or ""
+    if is_thread:
+        source_dict["thread_ts"] = args.thread_ts or ""
 
     # Loudly flag partial coverage: an explicit --limit dropped older messages
     # in the window. Without this the user could believe the whole channel was

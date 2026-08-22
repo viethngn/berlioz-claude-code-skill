@@ -224,8 +224,20 @@ def has_staged_changes(path: Path) -> bool:
     return proc.returncode == 0 and bool(proc.stdout.strip())
 
 
-def git_commit(wiki_root: Path, message: str) -> Optional[str]:
-    subprocess.run(["git", "-C", str(wiki_root), "add", "raw", "wiki"], check=True)
+def git_commit(
+    wiki_root: Path,
+    message: str,
+    raw_dir: Optional[Path] = None,
+    wiki_dir: Optional[Path] = None,
+) -> Optional[str]:
+    # raw_dir/wiki_dir are configurable in .wikirc.json; hardcoding the
+    # literal names "raw"/"wiki" here would make `git add` fail with
+    # "pathspec did not match any files" the moment either is renamed —
+    # and since this call uses check=True, that crashes the whole commit
+    # instead of committing the actual (renamed) content.
+    raw_arg = str(raw_dir) if raw_dir is not None else "raw"
+    wiki_arg = str(wiki_dir) if wiki_dir is not None else "wiki"
+    subprocess.run(["git", "-C", str(wiki_root), "add", raw_arg, wiki_arg], check=True)
     proc = subprocess.run(
         ["git", "-C", str(wiki_root), "diff", "--cached", "--quiet"],
     )
@@ -566,7 +578,12 @@ def _cmd_commit_only(args: argparse.Namespace) -> int:
     message = args.message or (
         f"ingest: {args.slug} ({args.new_images} new, {args.changed_images} changed images)"
     )
-    commit = git_commit(wiki_root, message)
+    commit = git_commit(
+        wiki_root,
+        message,
+        cfg.raw_dir if cfg is not None else None,
+        cfg.wiki_dir if cfg is not None else None,
+    )
     result: dict = {"commit": commit, "message": message}
     if commit and cfg is not None and cfg.auto_push:
         result["pushed"] = git_push(wiki_root, cfg)
@@ -681,7 +698,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
             f"({image_summary.get('new', 0)} new, "
             f"{image_summary.get('changed', 0)} changed images)"
         )
-        commit_hash = git_commit(wiki_root, message)
+        commit_hash = git_commit(wiki_root, message, cfg.raw_dir, cfg.wiki_dir)
         result["committed"] = {"commit": commit_hash, "message": message}
         if commit_hash and cfg.auto_push:
             result["pushed"] = git_push(wiki_root, cfg)

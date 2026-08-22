@@ -350,6 +350,57 @@ def test_ingest_auto_detect_bulk(wiki_root: Path, port: int) -> None:
     print("[OK] ingest.py auto-detects /spaces/ URL as bulk")
 
 
+def test_confluence_slug_collision(wiki_root: Path, port: int) -> None:
+    """Two different pages sharing a title must not collide onto one slug.
+
+    Both mock pages report version 1 (MockConfluenceHandler always does) —
+    exactly the "freshly created pages at the same version number" scenario
+    that caused the pre-fix version-cache check to report page B's fetch as
+    "unchanged" using page A's stale, cached content.
+    """
+    MockConfluenceHandler.pages["20001"] = {"title": "Duplicate Title", "body": "first page body"}
+    MockConfluenceHandler.pages["20002"] = {"title": "Duplicate Title", "body": "second page body"}
+
+    r1 = _run_script(
+        "fetch_confluence.py", ["--wiki-root", str(wiki_root), "--page-id", "20001"]
+    )
+    _assert(r1.returncode == 0, f"first page fetch failed: {r1.stderr}\n{r1.stdout}")
+    s1 = json.loads(r1.stdout.strip())
+
+    r2 = _run_script(
+        "fetch_confluence.py", ["--wiki-root", str(wiki_root), "--page-id", "20002"]
+    )
+    _assert(r2.returncode == 0, f"second page fetch failed: {r2.stderr}\n{r2.stdout}")
+    s2 = json.loads(r2.stdout.strip())
+
+    _assert(
+        s1["slug"] != s2["slug"],
+        f"colliding pages got the same slug ({s1['slug']}) — one overwrote the other",
+    )
+    _assert(
+        "already used by page" in r2.stderr,
+        f"expected a collision WARNING on stderr, got: {r2.stderr!r}",
+    )
+    md1 = (wiki_root / "raw" / f"{s1['slug']}.md").read_text(encoding="utf-8")
+    md2 = (wiki_root / "raw" / f"{s2['slug']}.md").read_text(encoding="utf-8")
+    _assert("first page body" in md1, f"page 1 content wrong:\n{md1}")
+    _assert("second page body" in md2, f"page 2 content wrong:\n{md2}")
+
+    # Re-fetching page 20002 must match itself (page_id-scoped), not fall
+    # back to page 20001's cached version/content just because both are v1
+    # and share a title.
+    r3 = _run_script(
+        "fetch_confluence.py", ["--wiki-root", str(wiki_root), "--page-id", "20002"]
+    )
+    _assert(r3.returncode == 0, f"re-fetch of page 20002 failed: {r3.stderr}")
+    s3 = json.loads(r3.stdout.strip())
+    _assert(
+        s3["slug"] == s2["slug"] and s3["status"] == "unchanged",
+        f"re-fetch of the disambiguated page is not stable: {s3}",
+    )
+    print("[OK] Confluence same-title pages resolve to distinct, stable slugs")
+
+
 def test_queue_utilities(wiki_root: Path, job_id: str) -> None:
     r = _run_script("queue_admin.py", ["--wiki-root", str(wiki_root), "list"])
     _assert(r.returncode == 0, f"queue list failed: {r.stderr}")
@@ -384,6 +435,69 @@ def test_queue_utilities(wiki_root: Path, job_id: str) -> None:
     print("[OK] queue_admin.py list / show / mark")
 
 
+def test_job_id_path_traversal_rejected(wiki_root: Path) -> None:
+    """A crafted job_id must never be joined into a filesystem path."""
+    r = _run_script(
+        "queue_admin.py", ["--wiki-root", str(wiki_root), "delete", "../../.git", "--force"]
+    )
+    _assert(r.returncode != 0, "path-traversal job_id should be rejected")
+    _assert(
+        "invalid job_id" in r.stderr,
+        f"expected a clean invalid-job_id error, got: {r.stderr!r}",
+    )
+    print("[OK] queue_admin.py rejects a path-traversal job_id")
+
+
+def test_renamed_raw_wiki_dirs(port: int) -> None:
+    """git_commit() must use the configured raw_dir/wiki_dir, not literals."""
+    with tempfile.TemporaryDirectory() as td:
+        wiki_root = Path(td) / "wiki"
+        wiki_root.mkdir()
+        (wiki_root / ".wikirc.json").write_text(
+            json.dumps(
+                {
+                    "wiki_root": ".",
+                    "raw_dir": "sources",
+                    "wiki_dir": "knowledge",
+                    "auto_commit": True,
+                    "atlassian": {
+                        "confluence_base_url": f"http://127.0.0.1:{port}",
+                        "jira_base_url": f"http://127.0.0.1:{port}",
+                        "confluence_pat": "test-pat",
+                        "jira_pat": "test-pat",
+                    },
+                    "nano_banana": {"base_url": "", "api_key": ""},
+                },
+                indent=2,
+            )
+        )
+        (wiki_root / "sources").mkdir()
+        (wiki_root / "knowledge").mkdir()
+        subprocess.run(["git", "init", "-q", str(wiki_root)], check=True)
+        subprocess.run(["git", "-C", str(wiki_root), "config", "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", str(wiki_root), "config", "user.name", "t"], check=True)
+
+        r = _run_script("fetch_confluence.py", ["--wiki-root", str(wiki_root), "--page-id", "10001"])
+        _assert(r.returncode == 0, f"fetch failed: {r.stderr}\n{r.stdout}")
+        slug = json.loads(r.stdout.strip())["slug"]
+
+        r = _run_script(
+            "ingest.py", ["--wiki-root", str(wiki_root), "--commit-only", "--slug", slug]
+        )
+        _assert(
+            r.returncode == 0,
+            f"commit with renamed raw_dir/wiki_dir should not crash: {r.stderr}\n{r.stdout}",
+        )
+        # git's own "[main abc123] message" line (inherited stdout from the
+        # uncaptured `git commit` subprocess inside git_commit()) precedes
+        # ingest.py's own JSON print on the same stream — take the trailing
+        # object, not the whole thing.
+        stdout = r.stdout.strip()
+        commit = json.loads(stdout[stdout.rfind("\n{") + 1 :])
+        _assert(commit.get("commit"), f"expected a real commit, got: {commit}")
+    print("[OK] git_commit() honors renamed raw_dir/wiki_dir instead of crashing")
+
+
 # ------------------------------- Entrypoint ---------------------------------
 
 
@@ -405,6 +519,9 @@ def main() -> int:
             job_id = test_discover_and_prefetch(pages, wiki_root, port)
             test_queue_utilities(wiki_root, job_id)
             test_ingest_auto_detect_bulk(wiki_root, port)
+            test_confluence_slug_collision(wiki_root, port)
+            test_job_id_path_traversal_rejected(wiki_root)
+            test_renamed_raw_wiki_dirs(port)
     finally:
         srv.shutdown()
 
