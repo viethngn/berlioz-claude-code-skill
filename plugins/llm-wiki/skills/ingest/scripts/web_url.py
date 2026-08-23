@@ -35,6 +35,16 @@ NON_HTML_EXT_RE = re.compile(
     re.I,
 )
 
+# Does this URL name a sitemap (or a robots.txt that points at one)?
+# sitemap.xml, sitemap_index.xml, sitemap-1.xml.gz, /sitemaps/pages.xml,
+# robots.txt. Lives here rather than in ingest.py because two callers need the
+# same answer: ingest.py classifies a bare `--source` URL as bulk-or-single,
+# and list_sources.py tells a recorded `--sitemap <exact-url>` query apart
+# from a `--site <bare-url>` one when rebuilding its discovery flags.
+SITEMAP_URL_RE = re.compile(
+    r"(^|/)(robots\.txt|sitemap[^/]*\.xml(\.gz)?|[^/]*sitemap[^/]*\.xml(\.gz)?)$", re.I
+)
+
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 SLUG_MAX_LEN = 80

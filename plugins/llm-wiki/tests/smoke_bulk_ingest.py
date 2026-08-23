@@ -16,7 +16,10 @@ Spins up a local HTTP server that mimics a Confluence Server REST API and:
 5. Runs `queue_admin.py list` / `show` for basic sanity.
 
 Run:
-    python3 plugins/llm-wiki/tests/smoke_bulk_ingest.py
+    ~/.llm-wiki-venv/bin/python3 plugins/llm-wiki/tests/smoke_bulk_ingest.py
+
+(The plugin's deps live in that venv, so plain `python3` fails on
+`markdownify` / `beautifulsoup4`.)
 
 Exits 0 on success, non-zero on failure. Uses only stdlib for the driver.
 Requires `requests`, `markdownify`, `beautifulsoup4` installed for the

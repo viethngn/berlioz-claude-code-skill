@@ -14,6 +14,16 @@ Bulk usage:
     python3 ingest.py --wiki-root PATH --crawl https://example.com --depth 2 --max-pages 100
     python3 ingest.py --wiki-root PATH --resume <job-id>
 
+Refresh usage (no source at all):
+    python3 ingest.py --wiki-root PATH                 # == --refresh-all
+    python3 ingest.py --wiki-root PATH --refresh-all --yes
+
+Refresh re-fetches every source the wiki has ever ingested plus a fresh
+re-enumeration of every recorded bulk query, diffs each against its raw/ copy,
+and leaves only the genuinely changed ones queued for synthesis. It runs on the
+same resumable queue as bulk, so Ctrl-C is safe and `--resume refresh`
+continues.
+
 Auto-detection: `--source` alone will pick single vs bulk based on URL
 shape. `.../pages/N` or `.../browse/KEY` → single Confluence/Jira;
 `.../spaces/KEY` without a page → bulk Confluence space; a sitemap or
@@ -35,16 +45,15 @@ from typing import Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 # The orchestrator is stdlib-only so it doesn't need require([...]).
-# config, raw_store, and bulk_queue are stdlib-only too.
+# config, raw_store, bulk_queue and web_url are stdlib-only too.
 from config import ConfigError, load_config
 from raw_store import write_fetch_history
+from web_url import SITEMAP_URL_RE
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
 CONFLUENCE_SPACE_URL_RE = re.compile(r"/spaces/([A-Za-z0-9._~-]+)(?:/|$)")
-# sitemap.xml, sitemap_index.xml, sitemap-1.xml.gz, /sitemaps/pages.xml, robots.txt
-SITEMAP_URL_RE = re.compile(r"(^|/)(robots\.txt|sitemap[^/]*\.xml(\.gz)?|[^/]*sitemap[^/]*\.xml(\.gz)?)$", re.I)
 
 
 def detect_bulk_from_url(source: str) -> Optional[Tuple[str, str]]:
@@ -385,7 +394,14 @@ def do_image_diff_loop(
     return {**counts, "images": per_image}
 
 
-def _stream_prefetch(job_id: str, wiki_root: Path, retry_failed: bool, max_items: int, skip_images: bool) -> int:
+def _stream_prefetch(
+    job_id: str,
+    wiki_root: Path,
+    retry_failed: bool,
+    max_items: int,
+    skip_images: bool,
+    force: bool = False,
+) -> int:
     """Run prefetch.py as a subprocess and stream its output line-by-line.
 
     Returns the child's exit code.
@@ -404,6 +420,8 @@ def _stream_prefetch(job_id: str, wiki_root: Path, retry_failed: bool, max_items
         cmd.extend(["--max-items", str(max_items)])
     if skip_images:
         cmd.append("--skip-images")
+    if force:
+        cmd.append("--force")
 
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
@@ -435,6 +453,10 @@ def _cmd_bulk(
 
     Either (kind, query) is set (for new/reused jobs), or resume_job_id is
     set (skip discovery, just resume prefetch).
+
+    Drives refresh-all too: `kind="refresh"` is discovered differently but
+    fetched, resumed, reported and synthesized by exactly the same machinery as
+    a bulk query, which is the whole point of modelling it as a queue kind.
     """
     wiki_root = args.wiki_root.resolve()
     try:
@@ -443,13 +465,16 @@ def _cmd_bulk(
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
+    mode = "refresh" if kind == "refresh" else "bulk"
     job_id: Optional[str] = resume_job_id
 
     if job_id is None:
         assert kind is not None and query is not None
         # Run discover.py
         discover_args = ["--wiki-root", str(cfg.wiki_root)]
-        if kind == "confluence_space":
+        if kind == "refresh":
+            discover_args.append("--refresh")  # --replace is appended below
+        elif kind == "confluence_space":
             discover_args += ["--space", query]
         elif kind == "confluence_cql":
             discover_args += ["--cql", query]
@@ -485,45 +510,58 @@ def _cmd_bulk(
         # No sitemap found for a --site run: surface the request for explicit
         # crawl bounds instead of guessing them.
         if result.get("status") == "needs_bounds":
-            print(json.dumps({"mode": "bulk", "discover": result}, indent=2, ensure_ascii=False))
+            print(json.dumps({"mode": mode, "discover": result}, indent=2, ensure_ascii=False))
             return 0
 
         # An existing queue was built with different filters — report rather
         # than silently reuse a differently-scoped queue.
         if result.get("status") == "options_changed":
-            print(json.dumps({"mode": "bulk", "discover": result}, indent=2, ensure_ascii=False))
+            print(json.dumps({"mode": mode, "discover": result}, indent=2, ensure_ascii=False))
             return 1
+
+        # Too many sources to sweep unattended. The queue is already on disk, so
+        # "yes" costs nothing extra — it's `--resume` (or --yes to skip the gate).
+        if result.get("status") == "needs_confirmation" and not args.yes:
+            print(json.dumps({"mode": mode, "discover": result}, indent=2, ensure_ascii=False))
+            return 0
 
         job_id = result.get("job_id")
         if not job_id:
             # Nothing discovered (empty result). Emit and exit gracefully.
-            print(json.dumps({"mode": "bulk", "discover": result}, indent=2, ensure_ascii=False))
+            print(json.dumps({"mode": mode, "discover": result}, indent=2, ensure_ascii=False))
             return 0
         counts = result.get("counts") or {}
-        print(
-            json.dumps(
-                {
-                    "mode": "bulk",
-                    "phase": "discover",
-                    "job_id": job_id,
-                    "kind": result.get("kind"),
-                    "query": result.get("query"),
-                    "counts": counts,
-                    "reused": result.get("reused", False),
-                    "replaced": result.get("replaced", False),
-                },
-                indent=2,
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
+        discover_report = {
+            "mode": mode,
+            "phase": "discover",
+            "job_id": job_id,
+            "kind": result.get("kind"),
+            "query": result.get("query"),
+            "counts": counts,
+            "reused": result.get("reused", False),
+            "replaced": result.get("replaced", False),
+        }
+        # Refresh-specific context Claude needs for the scope note and the
+        # final report; absent for a plain bulk query.
+        for key in (
+            "status",
+            "bulk_queries",
+            "disappeared_upstream",
+            "skipped",
+            "backfilled_bulk_queries",
+            "registry_error",
+            "query_warnings",
+        ):
+            if key in result:
+                discover_report[key] = result[key]
+        print(json.dumps(discover_report, indent=2, ensure_ascii=False), flush=True)
 
     if args.discover_only:
         return 0
 
     # Prefetch phase — stream so Claude/user can watch progress
     print(
-        json.dumps({"mode": "bulk", "phase": "prefetch", "job_id": job_id}, ensure_ascii=False),
+        json.dumps({"mode": mode, "phase": "prefetch", "job_id": job_id}, ensure_ascii=False),
         flush=True,
     )
     rc = _stream_prefetch(
@@ -532,6 +570,7 @@ def _cmd_bulk(
         retry_failed=bool(resume_job_id) or args.retry_failed,
         max_items=args.max_items,
         skip_images=args.skip_images,
+        force=args.force,
     )
 
     # After prefetch, report queue counts to guide Claude's synthesis loop
@@ -544,7 +583,7 @@ def _cmd_bulk(
     print(
         json.dumps(
             {
-                "mode": "bulk",
+                "mode": mode,
                 "phase": "prefetch-complete",
                 "job_id": job_id,
                 "prefetch_exit_code": rc,
@@ -730,6 +769,24 @@ def main() -> int:
         help="Bulk: site URL — crawl it (requires --depth and --max-pages)",
     )
     parser.add_argument("--resume", help="Bulk: resume an existing job by id")
+    parser.add_argument(
+        "--refresh-all",
+        action="store_true",
+        help=(
+            "Re-fetch every source ever ingested into this wiki, diff it against "
+            "the raw/ copy, and queue only what changed for synthesis. Also the "
+            "default when no mode flag is given — bare `ingest.py --wiki-root "
+            "PATH` means refresh-all."
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "Refresh: proceed past the large-wiki confirmation gate without "
+            "asking (for unattended runs)"
+        ),
+    )
 
     # Web bulk knobs
     parser.add_argument(
@@ -805,8 +862,9 @@ def main() -> int:
         "--force",
         action="store_true",
         help=(
-            "Single: bypass content-diff gates: re-download images, re-describe them, "
-            "and commit even if the source content is unchanged"
+            "Bypass content-diff gates: re-download images, re-describe them, "
+            "and commit even if the source content is unchanged. Honored by "
+            "single, bulk and refresh runs"
         ),
     )
 
@@ -822,6 +880,21 @@ def main() -> int:
     parser.add_argument("--changed-images", type=int, default=0, help="For --commit-only")
 
     args = parser.parse_args()
+
+    # Reject before dispatching: --commit-only / --push-only return below, so
+    # without this an explicit --refresh-all alongside either would be silently
+    # ignored and the user would think a refresh had run.
+    if args.refresh_all and (args.commit_only or args.push_only):
+        parser.error("--refresh-all cannot be combined with --commit-only or --push-only")
+
+    # An empty --source means a caller's variable was empty, not "refresh
+    # everything". Falling through to refresh-all here would turn a typo into a
+    # whole-wiki API sweep that exits 0.
+    if args.source is not None and not args.source.strip():
+        parser.error(
+            "--source was given but is empty. Pass a URL / Jira key / file path, "
+            "or omit --source entirely to refresh every source in the wiki."
+        )
 
     if args.push_only:
         return _cmd_push_only(args)
@@ -841,6 +914,9 @@ def main() -> int:
     ]
     active_bulk = [(k, v) for k, v in bulk_flags if v]
     bulk_flag_names = "--space / --cql / --jql / --sitemap / --site / --crawl"
+
+    if args.refresh_all and (args.source or active_bulk or args.resume):
+        parser.error(f"--refresh-all cannot be combined with --source, {bulk_flag_names}, or --resume")
 
     if args.resume:
         if active_bulk or args.source:
@@ -862,10 +938,13 @@ def main() -> int:
         return _cmd_bulk(args, kind=kind, query=query, resume_job_id=None)
 
     if not args.source:
-        parser.error(
-            f"provide --source (single) or {bulk_flag_names} / --resume (bulk), "
-            "or use --commit-only"
-        )
+        # Bare invocation, or explicit --refresh-all: no --source, no bulk
+        # flag, no --resume. Deliberate, user-confirmed UX decision — this
+        # means "re-fetch every source in this wiki and ingest what changed"
+        # (see SKILL.md's "Refresh-all workflow"), replacing what used to be a
+        # usage error. Discovery is cheap and the fetch phase is gated on a
+        # source count, so a stray bare run can't quietly sweep a huge wiki.
+        return _cmd_bulk(args, kind="refresh", query="", resume_job_id=None)
 
     # Auto-detect: is --source actually a bulk source URL?
     bulk_from_url = detect_bulk_from_url(args.source)

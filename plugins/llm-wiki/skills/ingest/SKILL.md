@@ -15,6 +15,10 @@ description: |
   breaker so a whole-space or whole-site ingest can be paused (Ctrl-C) and
   resumed with `/ingest --resume <job-id>` without re-fetching completed items.
 
+  Bare `/ingest` with no source at all (or `--refresh-all`) re-fetches every
+  source the wiki already holds, diffs each against its `raw/` copy, and
+  ingests only what actually changed.
+
   Use this skill whenever the user wants to add, update, refresh, re-ingest,
   import, backfill, or batch-import content into their wiki. Trigger on
   phrases like: "ingest this Confluence page", "add this Jira ticket to the
@@ -22,7 +26,9 @@ description: |
   document", "refresh this source", "ingest the FOO space", "backfill space
   FOO", "ingest all tickets matching this JQL", "ingest this website", "scrape
   these docs into the wiki", "ingest this sitemap", "crawl this site into the
-  wiki", "resume the last bulk ingest".
+  wiki", "resume the last bulk ingest", "refresh everything", "refresh the
+  whole wiki", "resync the wiki", "update all sources", "bring the wiki up to
+  date".
 
   Requires a per-wiki `.wikirc.json` file with Confluence, Jira, and
   nano-banana endpoints and Personal Access Tokens. Public website ingest
@@ -77,6 +83,9 @@ proceed — no confirmation needed.
 | `--slack-channel CHANNEL` or `--channel CHANNEL` with `fetch_slack.py` | Slack channel |
 | `--slack-search "QUERY"` or `--search "QUERY"` with `fetch_slack.py` | Slack search results |
 | `--slack-thread CHANNEL THREAD_TS` or `--channel`+`--thread-ts` | Slack thread |
+| No source at all — bare `/ingest --wiki-root <path>` | Refresh-all |
+| `--refresh-all` | Refresh-all (explicit; same effect as bare invocation) |
+| `--resume refresh` | Continue an in-flight or confirmed refresh |
 
 Explicit flags win over URL heuristics. A URL that matches both "single
 page" and "space" resolves to single (the `/pages/` segment wins).
@@ -225,6 +234,16 @@ triggers the SHA-256 content-diff gate — if nothing changed, it returns
 `"unchanged"` without writing anything or committing. Without `--after`, the
 script auto-increments from the last `fetched_until` timestamp, so a plain
 `/ingest --slack-channel general` always fetches only new messages.
+
+**Watermark precedence** (reported as `window_from` in the JSON):
+`--oldest-ts` (exact epoch) → `--after` (a date, so day granularity) →
+`.wiki-state/last-fetched.json` → the `fetched_until` in the committed
+`raw/*.source.json` for that channel. The last one is what makes an
+incremental fetch work on a **fresh clone**, where `.wiki-state/` doesn't
+exist: without it there would be no floor at all and the whole channel history
+would be refetched. Prefer letting the watermark do the work — passing
+`--after` for a refresh would re-ingest up to a day of messages the wiki
+already has, into a second overlapping raw shard.
 
 ### Phase 1 — Run fetch_slack.py
 
@@ -467,6 +486,131 @@ ${WIKI_PY} "${SKILL_DIR}/scripts/queue_admin.py" --wiki-root "${WIKI_ROOT}" show
 Tell the user how many items are done, skipped, and (if any) still
 failed. Offer to `/ingest --resume <job-id>` for failures.
 
+## Refresh-all workflow
+
+Bare `/ingest` (no `--source`, no bulk flag, no `--resume`) — or the explicit
+`--refresh-all` flag — brings the whole wiki up to date: it **really re-fetches
+every source the wiki holds**, diffs each against its `raw/` copy, and leaves
+only the genuinely changed or new ones for you to synthesize.
+
+It is not a new pathway. Refresh is **one more bulk queue kind**, so it reuses
+the same discovery → prefetch → synthesis machinery as the Bulk workflow
+above: one resumable queue, rate limiting, the circuit breaker, per-item
+streaming, `queue_admin.py`, and `--resume`. The only new part is how the queue
+is built.
+
+```bash
+${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" --wiki-root "${WIKI_ROOT}"
+```
+
+That single command runs Phase 1 and Phase 2 back to back. Everything below
+describes how to read its output.
+
+### Refresh Phase 1 — Discovery (what will be checked)
+
+`ingest.py` runs `discover.py --refresh`, which builds one queue (job id
+`refresh`) from two sources:
+
+- **one item per `raw/*.source.json`** — every Confluence page, Jira issue,
+  web page, local file, Slack channel and Slack thread already in the wiki;
+- **a fresh re-enumeration of every recorded bulk query** in
+  `raw/.bulk-queries.json`, so a page *added* to a tracked space or sitemap
+  since the last ingest is picked up too.
+
+The two are merged by ref (page id / issue key / URL), so a page ingested both
+individually and via a space query is one queue item, not two.
+
+Discovery is cheap — one paginated search per bulk query, no page fetches — and
+prints:
+
+| Field | Meaning |
+|-------|---------|
+| `status` | `ready`, `resumable`, `needs_confirmation`, or `empty` |
+| `counts.total` | Sources that will be fetched |
+| `counts.known_sources` / `brand_new_upstream` | Already in `raw/` vs newly discovered |
+| `bulk_queries` | Per-query enumeration counts |
+| `disappeared_upstream` | Refs in `raw/` the re-enumeration no longer returns |
+| `skipped` | Everything deliberately not refreshed (see below) |
+| `query_warnings` | Bulk queries that failed to enumerate this run |
+
+**`status` handling:**
+
+- `ready` — fetching starts automatically; report the scope as an FYI and let
+  it run.
+- `empty` — nothing has ever been ingested. Say so; there is nothing to do.
+- `resumable` — an unfinished refresh is already on disk and is being
+  continued rather than rebuilt (re-enumerating would reset and re-download
+  everything already fetched). Only pass `--replace` if the user explicitly
+  wants to start over.
+- `needs_confirmation` — more than ~200 sources. `ingest.py` **stops before
+  fetching anything**. Use `AskUserQuestion` to confirm, quoting the counts and
+  that this means hundreds of API calls. On approval, continue with the queue
+  that is already on disk:
+
+    ```bash
+    ${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
+      --wiki-root "${WIKI_ROOT}" --resume refresh
+    ```
+
+  If the user declines, stop — nothing has been fetched. Do not pass `--yes`
+  on their behalf; that flag exists for unattended/cron runs.
+
+### Refresh Phase 2 — Fetch and diff (long-running, no Claude needed)
+
+`prefetch.py` then walks the queue and invokes the ordinary single-source
+fetcher for each item, so every existing diff gate applies unchanged:
+Confluence's version pre-check, Jira's `updated_at` check, the web
+conditional-GET (ETag / If-Modified-Since), Slack's incremental watermark, and
+the SHA-256 content gate behind all of them. One JSON line is streamed per
+item.
+
+Each item lands in one of:
+
+| `raw_status` | Meaning | Needs synthesis? |
+|--------------|---------|------------------|
+| `unchanged` | Refetched, content identical to `raw/` | **No** — `wiki_status` stays `done` |
+| `done` | Content changed (or the source is new) and `raw/` was rewritten | **Yes** |
+| `failed` | Fetch errored — including a page deleted upstream (404) | No |
+
+Ctrl-C is safe; the circuit breaker stops after 5 consecutive failures. Either
+way re-run `--resume refresh` to continue.
+
+Pass `--force` to bypass every diff gate and re-fetch, re-describe images, and
+re-synthesize everything.
+
+### Refresh Phase 3 — Synthesis (only what changed)
+
+Identical to **Bulk Phase 3** above, with `<job-id>` = `refresh`: for each item
+with `raw_status in {done, unchanged}` and `wiki_status == pending`, read
+`raw/<slug>.md`, update the wiki pages, `queue_admin.py mark refresh --ref
+<ref> --wiki-done`, then commit + push that item with `--commit-only`.
+
+On a wiki that is already current this list is **empty** — that is the expected
+outcome, and the right report is "everything is up to date", not silence.
+
+### Refresh Phase 4 — Final report
+
+```bash
+${WIKI_PY} "${SKILL_DIR}/scripts/queue_admin.py" --wiki-root "${WIKI_ROOT}" show refresh
+```
+
+Report, in this order:
+
+1. **Changed** — how many sources were re-ingested and which wiki pages moved.
+2. **Unchanged** — the count only; do not list them.
+3. **Failed** — with `last_error`. Offer `/ingest --resume refresh`.
+4. **`disappeared_upstream`** — sources whose upstream page is gone. Their
+   `raw/` files and wiki pages are still present and are **not** touched by
+   refresh; suggest `/lint` to retire them.
+5. **`skipped`** — with the relevant advice per bucket:
+   - `dropped_duplicates` — two raw files for one upstream page → `/lint`
+   - `local_missing_original` — the original file isn't on this machine
+   - `slack_searches` — excluded by design (see Concrete rules)
+   - `unhandled_type`, `unreadable_source_json`, `unreplayable_bulk_queries`
+   - `registry_error` / `query_warnings` — a broken registry or a bulk query
+     that failed to enumerate, so **part of the wiki was not checked**. Say so
+     explicitly; do not report the refresh as complete.
+
 ## Concrete rules
 
 - **Slug**: `slugify(title)` for Confluence, `KEY-123-<slug-of-summary>` for
@@ -497,6 +641,46 @@ failed. Offer to `/ingest --resume <job-id>` for failures.
     ingest diffs against, so it must be in git even though the bytes are not.
 - **Bulk queue layout**: `.wiki-state/bulk-jobs/<job-id>/queue.json` holds
   the queue for one bulk job. Git-ignored. Never referenced by wiki pages.
+  A refresh uses the fixed job id `refresh`, so there is only ever one.
+- **Bulk query registry**: `raw/.bulk-queries.json` — **committed** (unlike
+  the job queues above), because it's what lets a refresh know which bulk
+  queries were ever run even from a fresh clone where `.wiki-state/` never
+  existed. One entry per `(kind, query)`: kind, query, canonical options,
+  first/last job id, first/last run timestamp.
+  - Dot-prefixed on purpose. `raw/` otherwise holds only immutable source
+    documents (the wiki's own CLAUDE.md says never to edit anything in there);
+    this is plugin-managed metadata, and the leading dot also keeps it out of
+    the `raw/*.md` and `raw/*.source.json` globs every other script walks.
+  - Written whenever discovery enumerates, **and** on a plain reuse when the
+    query isn't registered yet (so a query first run before this file existed
+    still becomes refreshable). A reuse of an already-registered query leaves
+    the file byte-identical — no git churn on a no-op discovery.
+  - Queries known only from a local `.wiki-state/bulk-jobs/` queue are
+    **backfilled** into it on the next refresh.
+  - If the file is malformed, discovery **fails loudly and leaves it alone**
+    rather than overwriting it — silently rewriting it would discard every
+    query the wiki had registered.
+- **`wiki_status` carry-over**: re-enumeration builds fresh `Item`s, which are
+  `wiki_status="pending"` by construction — so a refresh (or a `--replace`)
+  would otherwise force full re-synthesis of an already-finished space. To
+  avoid that, `discover.py` stamps `prior_wiki_status` on each newly
+  enumerated item: from the queue being replaced (matched by `ref`, only for
+  refs whose old `wiki_status` was `done`/`skipped`), or, for a refresh, on
+  every ref that already has a `raw/<slug>.source.json`. `prefetch.py` then
+  restores `wiki_status` from it whenever a refetch comes back
+  `raw_status="unchanged"`, so only genuinely new or changed items reach
+  `Queue.pending_wiki()`.
+  - The hint is **retired the moment a fetch comes back changed**. Every
+    failure path after the fetch (image download, image description) marks the
+    item `failed` *after* the new raw bytes are already on disk — so without
+    this, a retry would refetch, see `unchanged`, and restore
+    `wiki_status="done"` for a page whose wiki side was never re-synthesized.
+- **Per-item `source_kind`**: a `refresh` queue mixes Confluence, Jira, web,
+  local and Slack items, so each carries the fetcher to use. Bulk query queues
+  don't set it and dispatch on `queue.kind` as before. `web` vs `web_bulk`
+  decides whether the per-page robots.txt check runs: a page enumerated from a
+  sitemap/crawl was already robots-filtered at discovery, an individually
+  ingested page was not.
 - **Volatile / local-only state lives outside git**:
   - `.wiki-state/last-fetched.json` at the wiki root records the timestamp
     and status of the most recent single-item fetch per slug. For web sources
@@ -604,8 +788,10 @@ You can run scripts individually for debugging or non-standard flows.
 | `scripts/image_manifest.py --wiki-root <p> --slug <s> status` | Print per-image diff status |
 | `scripts/describe_image.py --wiki-root <p> --image <p> --output <p>` | Describe one image |
 | `scripts/discover.py --wiki-root <p> --space/--cql/--jql/--sitemap/--site/--crawl <q>` | Enumerate items, write a job queue |
-| `scripts/prefetch.py --wiki-root <p> --job-id <id>` | Bulk-fetch items in a queue, resumable |
+| `scripts/discover.py --wiki-root <p> --refresh` | Build the one `refresh` queue covering every known source |
+| `scripts/prefetch.py --wiki-root <p> --job-id <id>` | Fetch + diff every item in a queue, resumable |
 | `scripts/queue_admin.py --wiki-root <p> list \| show \| reset \| mark \| delete` | Inspect and manage job queues |
+| `scripts/list_sources.py --wiki-root <p>` | Print the source manifest a refresh is built from (read-only) |
 
 All scripts respond to `--help` with their full argument list.
 
@@ -704,6 +890,42 @@ All scripts respond to `--help` with their full argument list.
   is inside the extracted region (a CSRF token, a visitor counter, an ad slot).
   Show the user `git diff raw/<slug>.md` — there's no per-source ignore
   mechanism, so the practical answer is to stop re-ingesting that page.
+- **Refresh: "nothing to synthesize"** — that's success, not a failure. Every
+  source was refetched and every one matched its `raw/` copy. Report the
+  unchanged count and stop; don't re-run with `--force` looking for work.
+- **Refresh: local source's original file moved or was deleted**: routed to
+  `skipped.local_missing_original`; it never blocks the rest of the run. Normal
+  on a fresh clone, since `original_path` is an absolute path on whichever
+  machine did the ingest. Tell the user which originals are missing; re-ingest
+  manually once the file is available again.
+- **Refresh: a source is gone upstream** — a deleted Confluence page shows up
+  twice: as `disappeared_upstream` from discovery (the re-enumeration no longer
+  lists it) and, if it was in `raw/`, as a `failed` item whose fetch 404s.
+  Refresh never deletes anything, so its raw file and wiki pages remain.
+  Suggest `/lint` to archive the page and retire the raw file.
+- **Refresh: Slack threads vs searches**: threads **are** refreshed — refetching
+  by `(channel_id, thread_ts)` is deterministic and picks up new replies. Ad hoc
+  searches are not (`skipped.slack_searches`): a search's result set shifts over
+  time, so re-running it would rewrite that raw file with a different set of
+  messages than the wiki cited. Re-ingest a search explicitly if the user wants
+  it refreshed.
+- **Refresh: duplicate raw files for the same page** (a retitled Confluence page
+  or a Jira issue whose summary changed left an orphaned old `.source.json` —
+  `fetch_confluence.py`/`fetch_jira.py` never delete the superseded file):
+  deduped by `page_id`/`key`, keeping the higher `version_number` (compared
+  numerically) or newer `updated_at`, with the rest under
+  `skipped.dropped_duplicates`. Suggest `/lint` to clean up the orphaned raw
+  files and any wiki pages still citing them.
+- **Refresh: `registry_error` or `query_warnings` in the output**: a malformed
+  `raw/.bulk-queries.json`, or a bulk query that failed to enumerate this run
+  (auth, network, a sitemap that has since vanished). Either means **part of the
+  wiki was not checked** — the individually-ingested sources still refreshed
+  normally. Report it explicitly rather than calling the refresh complete. For a
+  malformed registry, show the user the parse error; the file is deliberately
+  left untouched so nothing is lost by fixing it by hand.
+- **Refresh: a source was ingested both individually and via a bulk query**:
+  not a problem any more. Both sides key items by the same ref (page id / issue
+  key / URL), so they merge into one queue item and the source is fetched once.
 
 ## Reference docs
 

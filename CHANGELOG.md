@@ -1,5 +1,84 @@
 # Changelog
 
+## 1.8.0 - 2026-08-24
+
+### llm-wiki — `/ingest` with no arguments refreshes the whole wiki
+
+Bare `/ingest` (or `--refresh-all`) now re-fetches every source the wiki holds,
+diffs each against its `raw/` copy, and re-synthesizes only what actually
+changed. It is not a new code path: refresh is **one more bulk queue kind**, so
+it reuses the existing discovery → prefetch → synthesis pipeline and inherits
+resumability, rate limiting, the circuit breaker and per-item streaming.
+
+- **Really fetches, then compares.** `discover.py --refresh` builds one queue
+  (job id `refresh`) from every `raw/*.source.json` plus a fresh re-enumeration
+  of every recorded bulk query — so a page *added* to a tracked space or sitemap
+  is picked up too, not just changes to pages already in the wiki.
+  `prefetch.py` then invokes the ordinary single-source fetcher per item, so
+  every existing diff gate applies unchanged (Confluence version pre-check,
+  Jira `updated_at`, web conditional GET, Slack watermark, content SHA).
+- Covers **Confluence pages, Jira issues, web pages, local files, Slack
+  channels and Slack threads**. Ad hoc Slack searches stay excluded: their
+  result set shifts over time, so re-running one would rewrite a raw file with
+  different messages than the wiki cited.
+- Both halves of discovery key items by the same ref (page id / issue key /
+  URL), so a page ingested individually *and* via a space query is one queue
+  item fetched once, not two.
+- **Never destroys a paused job.** One unified queue replaces the earlier
+  design's per-query `--replace` fan-out, which reset every item to pending and
+  re-downloaded a whole space. An unfinished refresh is reported as
+  `resumable` and continued.
+- **Reports what it didn't check.** Sources gone upstream
+  (`disappeared_upstream` — report only; `/lint` owns removal), failed queries,
+  a broken registry, duplicates, missing local originals, unknown source types.
+- Above ~200 sources it stops after enumerating and hands the decision back
+  (`needs_confirmation`) instead of launching hours of API calls. The gate
+  applies to a resumed refresh too, so a repeat bare run can't slip past it.
+  `--yes` is for unattended runs; `--force` re-fetches everything regardless.
+
+### llm-wiki — fixes found auditing the above
+
+- **A changed page could be silently marked synthesized and never updated.**
+  `prefetch.py` marks an item `failed` *after* the fetcher has already written
+  the new raw bytes (image download / description failure). `--resume` implies
+  `--retry-failed`, so the retry refetched, saw "unchanged", and restored
+  `wiki_status="done"` — leaving the wiki page stale forever while the queue
+  reported success. The carry-over hint is now retired the moment a fetch comes
+  back changed. (`queue_admin.py reset` hit the same bug.)
+- **A malformed bulk-query registry broke all bulk ingest, then erased
+  itself.** A JSON list where an object was expected raised an uncaught
+  `AttributeError` out of `discover.py`; a truncated file parsed as "no queries"
+  and was then overwritten, discarding every registered query. Both are now a
+  loud error that leaves the file untouched — the same anti-pattern 1.7.0 fixed
+  for `settings.json`. The registry is validated before discovery spends any API
+  calls, and a broken one no longer costs the individually-ingested half of a
+  refresh.
+- **Existing wikis reported zero bulk queries.** The registry was only written
+  when discovery enumerated, so any query first run before it existed was
+  invisible to a refresh. Queries are now also registered on the plain-reuse
+  path (without rewriting an already-registered entry, so no git churn) and
+  backfilled from local `.wiki-state/bulk-jobs/` metadata.
+- **Confluence duplicate resolution compared versions as strings**, so version
+  9 outranked version 10 and the manifest kept the stale copy.
+- **Sources could vanish from the manifest silently.** A `.source.json` missing
+  its identifier, or carrying an unknown `type`, produced no target, no skip
+  entry and no count. Every file now lands in exactly one bucket — a coverage
+  invariant the test suite asserts.
+- **Slack could re-fetch a channel's entire history.** A missing
+  `fetched_until` produced `--after 1970-01-01`. Refresh no longer passes a date
+  window at all: `fetch_slack.py` falls back to the `fetched_until` committed in
+  `raw/*.source.json` when the git-ignored `.wiki-state` watermark is absent
+  (the fresh-clone case), preserving microsecond precision where a date would
+  have re-ingested up to a day of messages into a second overlapping raw shard.
+  New `--oldest-ts` accepts an exact epoch timestamp.
+- `raw/bulk-queries.json` → `raw/.bulk-queries.json`: `raw/` otherwise holds
+  only immutable source documents, and the dot keeps plugin metadata out of the
+  globs every other script walks.
+- `--refresh-all` alongside `--commit-only` / `--push-only` was silently
+  ignored; now rejected. An empty `--source ""` fell through to refresh-all and
+  exited 0, turning a caller's empty variable into a whole-wiki sweep; now
+  rejected. `--force` reaches bulk and refresh runs, not just single-item ones.
+
 ## 1.7.0 - 2026-08-23
 
 Repo-wide security/correctness audit, covering every plugin (not just the web-ingest

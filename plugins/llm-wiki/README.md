@@ -353,6 +353,33 @@ before new messages arrive returns "unchanged" — nothing is committed.
 
 > /ingest --slack-search "topic:decision after:2026-07-01"
 
+### Bring the whole wiki up to date
+
+> /ingest
+
+With no source at all, `/ingest` refreshes everything: it re-fetches every
+source the wiki already holds — Confluence pages, Jira issues, web pages, local
+files, Slack channels and threads — plus a fresh re-enumeration of every bulk
+query it has run, so pages *added* to a tracked space or sitemap are picked up
+too. Each source is diffed against its `raw/` copy, and only what actually
+changed is re-synthesized into wiki pages.
+
+On a wiki that's already current this ends with nothing to do and nothing
+committed. That's the expected result.
+
+It runs on the same resumable queue as a bulk ingest (job id `refresh`), so
+Ctrl-C is safe:
+
+> /ingest --resume refresh
+
+Above ~200 sources it stops after enumerating and asks first, since a full sweep
+can mean hours of API calls. Add `--yes` for unattended runs, or `--force` to
+re-fetch and re-synthesize everything regardless of whether it changed.
+
+Two things a refresh deliberately does **not** do: it never deletes anything (a
+page removed upstream is reported so you can run `/lint`), and it doesn't re-run
+ad hoc Slack searches, whose results shift over time.
+
 ### Lint the wiki
 
 > /lint
@@ -421,6 +448,18 @@ same per-item flow but routes it through three phases:
    wiki pages, and commits + pushes one commit per item via
    `ingest.py --commit-only` automatically — no per-batch pause.
 
+**Refresh mode** (`/ingest` with no source) is a fourth queue kind rather than a
+fourth code path — it reuses discovery → prefetch → synthesis exactly as above,
+including resumability, rate limiting and the circuit breaker. Only discovery
+differs: [`discover.py --refresh`](skills/ingest/scripts/discover.py) builds one
+queue (job id `refresh`) from
+[`list_sources.py`](skills/ingest/scripts/list_sources.py)'s inventory of every
+`raw/*.source.json`, merged with a fresh re-enumeration of every bulk query in
+`raw/.bulk-queries.json`. Both sides key items by the same ref (page id / issue
+key / URL), so a page ingested individually *and* via a space query is fetched
+once. Items that already have a raw file are pre-marked as synthesized, so an
+unchanged refetch queues no work — the diff gates above decide what's real.
+
 Inspect and re-queue with
 [`queue_admin.py`](skills/ingest/scripts/queue_admin.py):
 
@@ -485,11 +524,13 @@ my-wiki/
 ├── .wiki-state/              # git-ignored; volatile per-machine state
 │   ├── last-fetched.json     # last-fetch timestamp + status per slug (single mode)
 │   └── bulk-jobs/            # one directory per bulk-ingest job
-│       └── <job-id>/queue.json  # discovery output + per-item status
+│       ├── <job-id>/queue.json  # discovery output + per-item status
+│       └── refresh/queue.json   # the single whole-wiki refresh queue
 ├── .wikirc.json              # your endpoints + PATs (git-ignored)
 ├── .wikirc.example.json      # example config, committed
 ├── CLAUDE.md                 # wiki system prompt
 ├── raw/                      # immutable ingested sources
+│   ├── .bulk-queries.json    # COMMITTED — bulk queries this wiki tracks, so `/ingest` knows what to re-check
 │   ├── <slug>.md             # rendered Markdown
 │   ├── <slug>.source.json    # stable metadata: rel path, title, content_sha256, source_sha256, image_hints (NO fetched_at)
 │   ├── <slug>.<ext>          # local ingests: original copied in. Docs/sheets/decks COMMITTED; media git-ignored

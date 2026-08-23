@@ -129,10 +129,14 @@ information:
 
 ## Rules
 
-- Never edit the *contents* of anything in the `raw/` folder. The only
-  exception: `/lint` may **delete** an empty, uncited raw file after the user
-  confirms — it never modifies a raw file's content or removes a
-  non-empty/cited one.
+- Never edit the *contents* of anything in the `raw/` folder. Two exceptions,
+  both plugin-managed:
+  - `/lint` may **delete** an empty, uncited raw file after the user confirms —
+    it never modifies a raw file's content or removes a non-empty/cited one.
+  - `raw/.bulk-queries.json` is metadata, not a source document: it records
+    which bulk queries (space / CQL / JQL / sitemap / crawl) this wiki tracks,
+    so a bare `/ingest` knows what to re-check. `/ingest` maintains it; don't
+    hand-edit it, and don't treat it as a source when answering questions.
 - Always update `wiki/index.md` and `wiki/log.md` after changes
 - Keep page names lowercase with hyphens (e.g. `machine-learning.md`)
 - Write in clear, plain language

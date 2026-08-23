@@ -35,7 +35,10 @@ Spins up a local HTTP server that mimics a small documentation site and:
     `--include` all fail with a clean `ERROR:` message and never a traceback.
 
 Run:
-    python3 plugins/llm-wiki/tests/smoke_web_ingest.py
+    ~/.llm-wiki-venv/bin/python3 plugins/llm-wiki/tests/smoke_web_ingest.py
+
+(The plugin's deps live in that venv, so plain `python3` fails on
+`markdownify` / `beautifulsoup4`.)
 
 Exits 0 on success, non-zero on failure. Driver is stdlib only; the scripts
 under test need `requests`, `markdownify`, `beautifulsoup4` and (optionally)

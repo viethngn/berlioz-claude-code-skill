@@ -375,6 +375,44 @@ def _read_fetched_until(wiki_root: Path, channel_key: str) -> Optional[float]:
     return float(fu)
 
 
+def _read_committed_fetched_until(raw_dir: Path, channel_id: str) -> Optional[float]:
+    """Highest `fetched_until` recorded for this channel in raw/*.source.json.
+
+    The watermark above lives in .wiki-state/, which is git-ignored — so on a
+    fresh clone (or after that directory is wiped) it is gone and an
+    incremental fetch would have no floor at all. The committed source.json
+    files carry the same timestamp at full precision, so recover it from there.
+    Precision matters: falling back to a `--after YYYY-MM-DD` window instead
+    would re-ingest up to a day of messages already in the wiki.
+    """
+    if not channel_id:
+        return None
+    best: Optional[float] = None
+    raw_dir = Path(raw_dir)
+    if not raw_dir.exists():
+        return None
+    for p in sorted(raw_dir.glob("*.source.json")):
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict) or data.get("type") != "slack":
+            continue
+        if str(data.get("channel_id") or "") != str(channel_id):
+            continue
+        # Threads and searches record no usable channel watermark.
+        if data.get("thread_ts") or data.get("search_query"):
+            continue
+        try:
+            value = float(data.get("fetched_until"))
+        except (TypeError, ValueError):
+            continue
+        if best is None or value > best:
+            best = value
+    return best
+
+
 def _write_fetched_until(wiki_root: Path, channel_key: str, fetched_until: float) -> None:
     state_dir = wiki_state_dir(wiki_root)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -408,6 +446,15 @@ def main() -> int:
     source_group.add_argument("--search", help="Search query (search.messages)")
     parser.add_argument("--thread-ts", help="Fetch a single thread (requires --channel)")
     parser.add_argument("--after", help="Start of date window YYYY-MM-DD")
+    parser.add_argument(
+        "--oldest-ts",
+        type=float,
+        default=None,
+        help=(
+            "Start of window as an exact Slack epoch timestamp — full precision, "
+            "unlike --after's day granularity. Wins over --after."
+        ),
+    )
     parser.add_argument("--before", help="End of date window YYYY-MM-DD")
     parser.add_argument(
         "--limit",
@@ -465,12 +512,26 @@ def main() -> int:
         channel_key = f"slack-search-{_slugify(args.search or '')}"
 
     # --- Determine oldest_ts ---
-    if args.after:
+    # Precedence: explicit --oldest-ts, explicit --after, then the incremental
+    # watermark (local .wiki-state first, then the committed source.json copy
+    # so a fresh clone still resumes instead of refetching all history).
+    watermark_source: Optional[str] = None
+    if args.oldest_ts is not None:
+        oldest_ts = args.oldest_ts
+        watermark_source = "explicit --oldest-ts"
+    elif args.after:
         oldest_ts = _date_to_ts(args.after)
+        watermark_source = "explicit --after"
     elif not args.force:
         prior_until = _read_fetched_until(wiki_root, channel_key)
         if prior_until is not None:
             oldest_ts = prior_until
+            watermark_source = ".wiki-state/last-fetched.json"
+        elif not is_search and not is_thread:
+            prior_until = _read_committed_fetched_until(cfg.raw_dir, channel_id)
+            if prior_until is not None:
+                oldest_ts = prior_until
+                watermark_source = "committed raw/*.source.json"
 
     # --- Fetch ---
     truncated = False
@@ -612,6 +673,9 @@ def main() -> int:
         "date_range": date_range_display,
         "oldest_ts": f"{actual_oldest:.6f}",
         "latest_ts": f"{actual_latest:.6f}",
+        # Where the window's floor came from, so a refresh can be audited:
+        # null means "no floor at all — whole history".
+        "window_from": watermark_source,
         "raw_md": result["raw_md"],
         "source_json": result["source_json"],
     }
