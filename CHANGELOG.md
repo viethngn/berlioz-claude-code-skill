@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.9.0 - 2026-09-04
+
+### llm-wiki — new `/log` skill: a per-day work diary with cross-wiki links
+
+A fourth `llm-wiki` skill for turning meeting notes, transcripts, and action
+logs into structured Event entries — one flat `wiki/YYYY-MM-DD.md` page per
+calendar day, each Event capturing Action/What/When/Where/Who/Why, links to
+related past Events, and Next steps.
+
+- **Reuses `/ingest`'s machinery, doesn't duplicate it.** A local-file source
+  goes through `ingest.py`'s existing local-file dispatch unchanged; pasted
+  text gets a new `write_raw_note.py` writer using the same diff-gated
+  `raw_store.write_raw_if_changed` every fetcher already uses; the final
+  commit reuses `ingest.py --commit-only` as-is.
+- **Bare `/log` auto-scans** `raw/*.source.json` for sources not yet reflected
+  in a day-page, tracked via a new `.wiki-state/last-logged.json` watermark
+  (independent of `/ingest`'s own `last-fetched.json` — a source can be
+  fetched long before it's ever logged).
+- **New `linked_wikis` config section** (`.wikirc.json`) lets a wiki name
+  other llm-wiki instances by role (`who`/`what`/`generic`) and resolve
+  mentions against them via `[[label/slug]]` links — read-only, never writing
+  into the linked wiki. Opt-in and empty by default; zero behavior change for
+  existing wikis.
+- **Immutable, backfill-safe day-pages.** A correction to an already-logged
+  Event never overwrites it in place — it appends a dated `Update`/`Amends`
+  block instead, so out-of-order/backfilled logging never loses history.
+- **`/ingest` cascade (opt-in).** When a `linked_wikis` entry has
+  `cascade_ingest: true`, a single-item `/ingest` run now judges the fetched
+  source's relevance against that entry's `purpose` and, on a match, spawns a
+  `model: haiku` subagent to run the same single-item workflow against the
+  linked wiki — a full independent fetch + synthesize + commit + push cycle
+  scoped to that wiki, guarded against sweeping in unrelated pending changes.
+  No `ingest.py` code changed to support this — purely additive `SKILL.md`
+  orchestration plus the new config accessor.
+
 ## 1.8.0 - 2026-08-24
 
 ### llm-wiki — `/ingest` with no arguments refreshes the whole wiki

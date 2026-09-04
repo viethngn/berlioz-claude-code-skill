@@ -1,6 +1,6 @@
 # LLM Wiki
 
-Three skills for maintaining a personal LLM knowledge wiki, backed by git.
+Four skills for maintaining a personal LLM knowledge wiki, backed by git.
 
 - **`/ingest`** — Pull content from a Confluence page, Jira issue, local file
   (Markdown, HTML, PDF, DOCX, XLSX, CSV, PPTX, image — all parsed natively, no
@@ -27,6 +27,15 @@ Three skills for maintaining a personal LLM knowledge wiki, backed by git.
   verifies the Python dependencies automatically** (idempotent) and creates a
   ready-to-edit `.wikirc.json` — the only thing left is filling in your
   credentials.
+- **`/log`** — Turn a meeting note, transcript, or pasted text into structured
+  Event entries on a per-day page (`wiki/YYYY-MM-DD.md` — a flat page like any
+  other, no new folder). Each Event captures Action/What/When/Where/Who/Why,
+  links to related past Events, and Next steps. What/Who resolve as read-only
+  links into other configured `llm-wiki` instances (via `linked_wikis` in
+  `.wikirc.json`) — never written into those wikis. Bare `/log` auto-scans for
+  raw sources not yet reflected in a day-page. `/ingest` can also opt in to
+  cascading a matching source into a linked wiki via a cheap-model subagent —
+  see `linked_wikis[].cascade_ingest` below.
 
 Vendor-neutral: no hardcoded URLs or product names. Every endpoint comes from
 your `.wikirc.json`.
@@ -121,6 +130,22 @@ optional; leave one empty and that source type is simply skipped.
     "remote": "origin",
     "branch": ""
   },
+  "linked_wikis": [
+    {
+      "label": "people",
+      "path": "/absolute/path/to/your-people-wiki",
+      "role": "who",
+      "purpose": "Colleague profiles: roles, working style, org structure",
+      "cascade_ingest": false
+    },
+    {
+      "label": "topics",
+      "path": "/absolute/path/to/your-topic-wiki",
+      "role": "what",
+      "purpose": "Product/topic knowledge for your team",
+      "cascade_ingest": false
+    }
+  ],
   "atlassian": {
     "confluence_base_url": "https://your-confluence.example.com",
     "jira_base_url": "https://your-jira.example.com",
@@ -170,6 +195,14 @@ every commit. Push failures warn but never fail the ingest; the local commit is
 always preserved. Credential resolution is delegated to Git — set up an SSH key
 or `git credential-osxkeychain` (macOS) / `git-credential-store` once and it
 just works. No token goes in `.wikirc.json`.
+
+**`linked_wikis`** — other `llm-wiki` instances this wiki can cross-link into
+via `[[label/slug]]` (used by `/log` to resolve Who/What mentions read-only —
+never writing into the linked wiki) and, if `cascade_ingest: true`, that
+`/ingest` can automatically re-ingest a matching source into, via a
+`model: haiku` subagent. The two entries above are illustrative placeholders
+(`/absolute/path/to/your-...-wiki`) — entirely optional and inert until you
+replace them with real paths, or delete them to leave the array empty.
 
 **`slack.token`** — a Slack User OAuth Token (`xoxp-…`). See
 [How to get a Slack token](#how-to-get-a-slack-token) below.
@@ -380,6 +413,28 @@ Two things a refresh deliberately does **not** do: it never deletes anything (a
 page removed upstream is reported so you can run `/lint`), and it doesn't re-run
 ad hoc Slack searches, whose results shift over time.
 
+### Log a meeting or decision
+
+> /log ~/Downloads/2026-09-04-standup-transcript.txt
+
+Or paste notes directly:
+
+> /log
+>
+> [paste meeting notes]
+
+Extracts one or more Events (Action/What/When/Where/Who/Why/Next steps) and
+files each onto `wiki/YYYY-MM-DD.md` — a flat page, not a new folder. `What`/
+`Who` resolve as `[[label/slug]]` links into whichever `linked_wikis` entry
+matches by role, read-only.
+
+### Catch up the diary
+
+> /log
+
+Bare `/log` scans this wiki's `raw/` for sources not yet reflected in a
+day-page and processes only what's pending.
+
 ### Lint the wiki
 
 > /lint
@@ -502,6 +557,30 @@ files). Then Claude:
 6. **Commits + pushes**: one commit per category, then `ingest.py --push-only`
    pushes them all (gated on `auto_push`).
 
+### `/log`
+
+1. Get the raw material into `raw/` — a local file goes through `/ingest`'s
+   own local-file dispatch unchanged; pasted text is written via a new
+   `write_raw_note.py` (same diff-gated `raw_store.write_raw_if_changed`
+   every fetcher uses); bare `/log` lists sources not yet logged via
+   `log_state.py --pending` (tracked in `.wiki-state/last-logged.json`,
+   independent of `/ingest`'s own `last-fetched.json`).
+2. Extract discrete Events (Action/What/When/Where/Who/Why/Related
+   events/Next steps) from the raw text.
+3. Resolve `What`/`Who` mentions read-only against `linked_wikis` (by role)
+   via `resolve_link.py`, which shells out to the target wiki's own
+   `scripts/wiki_search.sh` if present, else falls back to ripgrep. A
+   confident match becomes `[[label/slug]]`; no match is left as plain text
+   with an unresolved marker — **never** written into the linked wiki.
+4. Write/update the correct `wiki/YYYY-MM-DD.md` day-page (creating it from
+   `templates/day-page.md` if needed), inserting the Event in time-of-day
+   order. A correction to an already-logged Event appends a dated
+   `Update`/`Amends` block rather than editing it in place.
+5. Update `wiki/index.md`'s Diary section and append one entry to the
+   operational `wiki/log.md` — a separate file from the day-pages themselves.
+6. Commit (and push, if `auto_push`) via `ingest.py --commit-only`, reused
+   as-is.
+
 ### `/create-wiki`
 
 Runs [bootstrap.py](skills/create-wiki/scripts/bootstrap.py) to lay out the
@@ -523,6 +602,7 @@ my-wiki/
 ├── .gitignore                # ignores .wikirc.json, .wiki-state/, tmp files
 ├── .wiki-state/              # git-ignored; volatile per-machine state
 │   ├── last-fetched.json     # last-fetch timestamp + status per slug (single mode)
+│   ├── last-logged.json      # last-/log-ed timestamp + day-pages touched per slug
 │   └── bulk-jobs/            # one directory per bulk-ingest job
 │       ├── <job-id>/queue.json  # discovery output + per-item status
 │       └── refresh/queue.json   # the single whole-wiki refresh queue
@@ -540,12 +620,14 @@ my-wiki/
 │       └── <n>.md            # COMMITTED — nano-banana-pro description (cache; avoids re-describing)
 ├── wiki/                     # Claude-maintained pages
 │   ├── index.md
-│   ├── log.md
+│   ├── log.md                # operational log (every /ingest, /lint, /log run) — distinct from day-pages below
 │   ├── <page>.md
+│   ├── YYYY-MM-DD.md         # day-pages written by /log — flat pages, same as any other
 │   └── archive/              # retired pages moved here by /lint (out of active scope, still linkable)
 │       └── <old-page>.md
 └── templates/
-    └── page.md
+    ├── page.md
+    └── day-page.md           # seed template for a new day-page (used by /log)
 ```
 
 ## Reference documents
@@ -561,6 +643,10 @@ my-wiki/
   image filtering, and troubleshooting.
 - [skills/ingest/references/page-format.md](skills/ingest/references/page-format.md) —
   Wiki page template and citation rules.
+- [skills/log/references/event-format.md](skills/log/references/event-format.md) —
+  Event fields, day-page template, and the immutability/backfill rule.
+- [skills/log/references/cross-wiki-links.md](skills/log/references/cross-wiki-links.md) —
+  The `[[label/slug]]` convention and its accepted `/lint`/Obsidian limitations.
 
 ## Requirements
 

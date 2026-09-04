@@ -157,6 +157,58 @@ ${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
 The orchestrator prints a JSON summary. Parse it to know which files were
 created and how many images were described.
 
+### Phase 1.5 — Cascade to linked wikis (opt-in, non-blocking)
+
+Single-item workflow only — bulk and refresh-all don't run this phase (judging
+per-item relevance across a whole bulk queue would be expensive; a possible
+future extension, not attempted here).
+
+Read `cfg.linked_wikis()` (see `scripts/config.py`). For each entry whose
+`cascade_ingest` is `true` and whose `path` isn't a placeholder (skip entries
+that still look like `wikirc.example.json`'s illustrative paths — e.g.
+containing `your-`), judge whether the source you just fetched
+(`raw/<slug>.md`) is topically relevant to that entry's `purpose` string. This
+is your own judgment call, not a script.
+
+For each relevant match, launch one `Agent` tool call with `model: "haiku"` —
+issue every matching cascade **in the same message** so they run in parallel.
+Prompt template:
+
+```
+You are executing the llm-wiki `ingest` skill's single-item workflow as a
+cascade triggered by another wiki's /ingest run. Read and follow
+"<absolute-path-to-this-plugin-root>/skills/ingest/SKILL.md" — specifically
+its "Single-item workflow" Phases 1 through 4 — for exactly this invocation:
+
+  wiki_root: <linked-wiki-absolute-path>
+  source: <the original --source value from the parent run>
+
+Use this wiki's own .wikirc.json at <linked-wiki-absolute-path>/.wikirc.json
+for all credentials — do not reuse the parent wiki's config or credentials.
+
+Before doing anything else, run `git -C <linked-wiki-absolute-path> status
+--porcelain`. If it shows any pending changes, STOP before Phase 4 (do not
+commit) and report outcome="error" — those changes aren't yours to sweep into
+this cascade's commit.
+
+Do not skip Phase 4 (commit + push) once you do reach it. If Phase 1 reports
+status="unchanged", stop after Phase 1 and report outcome="unchanged" —
+nothing to synthesize or commit.
+
+Reply with ONLY this JSON, no prose:
+{"label": "<label>", "wiki_root": "<path>", "outcome":
+ "ingested"|"unchanged"|"error", "slug": "<slug-or-null>",
+ "pages_touched": ["<slug>", ...], "commit": "<sha-or-null>",
+ "pushed": true|false|null, "error": "<message-or-null>"}
+```
+
+Don't block this wiki's own Phase 2-4 on cascade completion — collect each
+subagent's JSON reply when convenient and fold a `## Cascade results` block
+into the final ingest summary you show the user, including
+`skipped_irrelevant` entries (label + one-line reason) for transparency. A
+wiki with no `linked_wikis` configured (every wiki today, until you opt one
+in) sees no change at all from this phase.
+
 ### Phase 2 — Report takeaways (non-blocking)
 
 After the orchestrator finishes, read the newly written `raw/<slug>.md`

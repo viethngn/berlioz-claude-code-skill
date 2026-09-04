@@ -32,6 +32,10 @@ DEFAULT_CONFIG = {
         "remote": "origin",
         "branch": "",
     },
+    # Other llm-wiki instances this wiki can cross-link into (via [[label/slug]])
+    # and optionally cascade-ingest matching sources into from /ingest. Empty by
+    # default — opt-in per wiki, no effect unless populated.
+    "linked_wikis": [],
     "atlassian": {
         "confluence_base_url": "",
         "jira_base_url": "",
@@ -107,6 +111,22 @@ class Config:
 
     def git_branch(self) -> str:
         return (self.data.get("git") or {}).get("branch", "")
+
+    def linked_wikis(self) -> list[dict]:
+        """Other llm-wiki instances this wiki can cross-link into or cascade-ingest into.
+
+        Each entry: label, path, role ("who"|"what"|"generic"), purpose,
+        cascade_ingest (bool, default False). Malformed (non-dict) entries are
+        dropped rather than raised on, since this list is hand-edited JSON.
+        """
+        raw = self.data.get("linked_wikis") or []
+        return [dict(item) for item in raw if isinstance(item, dict)]
+
+    def linked_wiki(self, label: str) -> Optional[dict]:
+        return next((e for e in self.linked_wikis() if e.get("label") == label), None)
+
+    def linked_wikis_by_role(self, role: str) -> list[dict]:
+        return [e for e in self.linked_wikis() if e.get("role") == role]
 
     @property
     def atlassian(self) -> dict:
@@ -184,6 +204,8 @@ class Config:
 
     def redacted(self) -> dict:
         clone = json.loads(json.dumps(self.data))
+        # linked_wikis carries no secrets (label/path/role/purpose/cascade_ingest
+        # only) — passed through as-is, same as web.extra_headers' header names.
 
         def redact(section: dict, keys: list[str]) -> None:
             for k in keys:

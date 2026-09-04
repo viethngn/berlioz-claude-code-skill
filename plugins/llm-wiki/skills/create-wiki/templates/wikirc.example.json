@@ -8,6 +8,22 @@
     "remote": "origin",
     "branch": ""
   },
+  "linked_wikis": [
+    {
+      "label": "people",
+      "path": "/absolute/path/to/your-people-wiki",
+      "role": "who",
+      "purpose": "Colleague profiles: roles, working style, org structure",
+      "cascade_ingest": false
+    },
+    {
+      "label": "topics",
+      "path": "/absolute/path/to/your-topic-wiki",
+      "role": "what",
+      "purpose": "Product/topic knowledge for your team",
+      "cascade_ingest": false
+    }
+  ],
   "atlassian": {
     "confluence_base_url": "https://your-confluence.example.com",
     "jira_base_url": "https://your-jira.example.com",
