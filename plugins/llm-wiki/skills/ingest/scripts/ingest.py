@@ -541,6 +541,13 @@ def _cmd_bulk(
             "reused": result.get("reused", False),
             "replaced": result.get("replaced", False),
         }
+        # A reused queue is a resume, not a refresh. Forward discover's plain-language
+        # note (and rechecked=false) so a no-op re-run is not mistaken for an
+        # up-to-date source.
+        if result.get("reused"):
+            discover_report["rechecked"] = result.get("rechecked", False)
+            if result.get("note"):
+                discover_report["note"] = result["note"]
         # Refresh-specific context Claude needs for the scope note and the
         # final report; absent for a plain bulk query.
         for key in (

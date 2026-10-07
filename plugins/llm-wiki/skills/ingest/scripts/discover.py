@@ -35,9 +35,11 @@ the standard /sitemap.xml locations). When no sitemap exists it prints
 caller is expected to ask the user for --depth and --max-pages and re-run with
 --crawl.
 
-An existing queue for the same (kind, query) is reused — but only when the
+An existing queue for the same (kind, query) is reused, but only when the
 discovery options that shaped it (--include/--exclude/--since/--limit/
---ignore-robots/--depth/--max-pages) are unchanged. If they differ, this prints
+--ignore-robots/--depth/--max-pages) are unchanged. Reuse is a resume, not a
+refresh: nothing is re-enumerated and fetched pages are not re-checked (the
+output says `"rechecked": false`); pass --replace to refresh. If options differ, this prints
 `{"status": "options_changed", …}` to stderr and exits 1 rather than silently
 handing back a differently-scoped queue; re-run with --replace to rebuild.
 
@@ -968,6 +970,27 @@ def main() -> int:
         except BulkSourcesError as e:
             print(f"WARNING: could not register this query for refresh: {e}", file=sys.stderr)
 
+        # Reuse is a resume, not a refresh: nothing is re-enumerated and pages that
+        # were already fetched are never re-checked. Say so plainly, because a
+        # fully fetched queue looks like a successful no-op and the pages it
+        # holds can be stale.
+        pending_raw = int(counts.get("pending_raw") or 0)
+        if pending_raw:
+            note = (
+                f"Reused the existing queue; {pending_raw} item(s) are still to fetch and "
+                "prefetch continues where it left off. Pages already fetched are not "
+                "re-checked and new pages are not discovered. To refresh this source, "
+                "re-run with --replace."
+            )
+        else:
+            note = (
+                "Reused the existing queue, which is already fully fetched, so NOTHING was "
+                "re-checked: pages edited since then and pages added since then are NOT "
+                "picked up. To bring this source up to date, re-run with --replace "
+                "(re-enumerates, re-checks every page, and only queues wiki synthesis for "
+                "pages that changed). To refresh everything the wiki has ever ingested, run "
+                "a bare /ingest."
+            )
         print(
             json.dumps(
                 {
@@ -975,8 +998,9 @@ def main() -> int:
                     "kind": kind,
                     "query": query,
                     "reused": True,
+                    "rechecked": False,
                     "counts": counts,
-                    "note": "A queue for this (kind, query) already exists. Pass --replace to overwrite, or use `/ingest --resume <job_id>` to continue prefetch.",
+                    "note": note,
                 },
                 indent=2,
                 ensure_ascii=False,

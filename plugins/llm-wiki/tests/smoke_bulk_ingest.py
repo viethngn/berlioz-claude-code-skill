@@ -62,6 +62,7 @@ class MockConfluenceHandler(http.server.BaseHTTPRequestHandler):
     """
 
     hits: dict = {}
+    requests: list = []  # (pageId, expand) for every content fetch, in order
     lock = threading.Lock()
     pages: dict = {}  # pageId -> {title, body}
 
@@ -115,6 +116,7 @@ class MockConfluenceHandler(http.server.BaseHTTPRequestHandler):
             with self.lock:
                 self.hits[page_id] = self.hits.get(page_id, 0) + 1
                 hits = self.hits[page_id]
+                self.requests.append((page_id, (qs.get("expand") or [""])[0]))
             if hits == 1:
                 # First hit → 429 with Retry-After: 1
                 self.send_response(429)
@@ -128,7 +130,7 @@ class MockConfluenceHandler(http.server.BaseHTTPRequestHandler):
                 {
                     "id": page_id,
                     "title": page["title"],
-                    "version": {"number": 1},
+                    "version": {"number": page.get("version", 1)},
                     "space": {"key": "FOO"},
                     "body": {
                         "storage": {
@@ -154,6 +156,7 @@ def _find_free_port() -> int:
 def _start_server(pages: dict) -> tuple[http.server.HTTPServer, int]:
     port = _find_free_port()
     MockConfluenceHandler.hits = {}
+    MockConfluenceHandler.requests = []
     MockConfluenceHandler.pages = pages
     srv = http.server.HTTPServer(("127.0.0.1", port), MockConfluenceHandler)
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -504,8 +507,134 @@ def test_renamed_raw_wiki_dirs(port: int) -> None:
 # ------------------------------- Entrypoint ---------------------------------
 
 
+# ------------------- re-running a bulk source: resume vs refresh -------------
+
+
+def _ingest(wiki_root: Path, *flags: str) -> subprocess.CompletedProcess:
+    return _run_script("ingest.py", ["--wiki-root", str(wiki_root), *flags])
+
+
+def _first_json(stdout: str) -> dict:
+    """The first pretty-printed JSON object in ingest.py's streamed stdout (discover report)."""
+    start = stdout.index("{")
+    return json.JSONDecoder().raw_decode(stdout[start:])[0]
+
+
+def _queue(wiki_root: Path, job_id: str) -> dict:
+    r = _run_script("queue_admin.py", ["--wiki-root", str(wiki_root), "show", job_id])
+    _assert(r.returncode == 0, f"queue show failed: {r.stderr}")
+    return json.loads(r.stdout)
+
+
+def _states(wiki_root: Path, job_id: str) -> dict:
+    return {
+        i["ref"]: (i["raw_status"], i["wiki_status"]) for i in _queue(wiki_root, job_id)["items"]
+    }
+
+
+def _only_job(wiki_root: Path) -> str:
+    r = _run_script("queue_admin.py", ["--wiki-root", str(wiki_root), "list"])
+    jobs = json.loads(r.stdout)["jobs"]
+    _assert(len(jobs) == 1, f"expected exactly one job, got {jobs}")
+    return jobs[0]["id"]
+
+
+def _mark_wiki_done(wiki_root: Path, job_id: str, *refs: str) -> None:
+    for ref in refs:
+        r = _run_script(
+            "queue_admin.py",
+            ["--wiki-root", str(wiki_root), "mark", job_id, "--ref", ref, "--wiki-done"],
+        )
+        _assert(r.returncode == 0, f"mark failed: {r.stderr}")
+
+
+def test_rerun_is_resume_and_replace_is_refresh() -> None:
+    """A plain re-run of a bulk source only resumes (and says so); --replace refreshes."""
+    pages = {
+        "10001": {"title": "Onboarding", "body": "how to onboard"},
+        "10002": {"title": "Runbook", "body": "alerts steps"},
+        "10003": {"title": "Handbook", "body": "team handbook"},
+    }
+    srv, port = _start_server(pages)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            wiki = Path(td) / "wiki"
+            wiki.mkdir()
+            _write_wikirc(wiki, port)
+            flags = ["--space", "FOO", "--skip-images"]
+
+            # Baseline: fetch everything, then pretend the wiki pages were synthesized.
+            r = _ingest(wiki, *flags)
+            _assert(r.returncode == 0, f"baseline failed: {r.stderr}\n{r.stdout}")
+            job = _only_job(wiki)
+            _mark_wiki_done(wiki, job, *pages)
+
+            # The page set changes upstream: one page edited, one added.
+            pages["10002"].update(body="alerts steps v2", version=2)
+            pages["10004"] = {"title": "New page", "body": "brand new"}
+
+            # Plain re-run: reuses the queue, re-checks nothing, and says so.
+            seen = len(MockConfluenceHandler.requests)
+            r = _ingest(wiki, *flags)
+            _assert(r.returncode == 0, f"plain re-run failed: {r.stderr}\n{r.stdout}")
+            _assert(len(MockConfluenceHandler.requests) == seen, "a plain re-run must not re-fetch")
+            report = _first_json(r.stdout)
+            _assert(report["reused"] is True and report["rechecked"] is False, report)
+            _assert("NOT picked up" in report["note"] and "--replace" in report["note"], report)
+            _assert(
+                set(_states(wiki, job).values()) == {("done", "done")},
+                "stale queue is untouched by a plain re-run",
+            )
+            _assert(len(_queue(wiki, job)["items"]) == 3, "new page is not discovered by a re-run")
+
+            # --replace: re-enumerates, re-checks every page, keeps unchanged pages' wiki status.
+            seen = len(MockConfluenceHandler.requests)
+            r = _ingest(wiki, *flags, "--replace")
+            _assert(r.returncode == 0, f"--replace failed: {r.stderr}\n{r.stdout}")
+            new = MockConfluenceHandler.requests[seen:]
+            for pid in pages:
+                _assert(any(p == pid and e == "version" for p, e in new), f"{pid} not re-checked: {new}")
+            st = _states(wiki, job)
+            _assert(st["10002"] == ("done", "pending"), f"edited page must be re-synthesized: {st}")
+            _assert(st["10004"] == ("done", "pending"), f"new page must be found: {st}")
+            _assert(st["10001"] == ("unchanged", "done"), f"unchanged keeps wiki status: {st}")
+            _assert(st["10003"] == ("unchanged", "done"), f"unchanged keeps wiki status: {st}")
+            _assert(_only_job(wiki) == job, "--replace reuses the job id")
+            _mark_wiki_done(wiki, job, "10002")
+
+            # 10004 is still unsynthesized. A refresh with nothing new must not forget it.
+            r = _ingest(wiki, *flags, "--replace")
+            _assert(r.returncode == 0, f"second --replace failed: {r.stderr}")
+            st = _states(wiki, job)
+            _assert(st["10004"] == ("unchanged", "pending"), f"unfinished page must stay pending: {st}")
+            _assert(
+                all(st[k] == ("unchanged", "done") for k in ("10001", "10002", "10003")), st
+            )
+
+            # An unfinished fetch is reported as a continue, not as "nothing re-checked".
+            _run_script(
+                "queue_admin.py",
+                ["--wiki-root", str(wiki), "mark", job, "--ref", "10003", "--raw-status", "pending"],
+            )
+            r = _ingest(wiki, *flags)
+            report = _first_json(r.stdout)
+            _assert(report["reused"] is True and "still to fetch" in report["note"], report)
+
+            # --force is not a refresh: it re-fetches AND re-synthesizes everything.
+            r = _ingest(wiki, *flags, "--replace", "--force")
+            _assert(r.returncode == 0, f"--replace --force failed: {r.stderr}\n{r.stdout}")
+            _assert(
+                set(_states(wiki, job).values()) == {("done", "pending")},
+                f"--force re-runs synthesis for every page: {_states(wiki, job)}",
+            )
+    finally:
+        srv.shutdown()
+    print("[OK] plain re-run = resume (says so); --replace = refresh (new + edited found, unchanged kept)")
+
+
 def main() -> int:
     test_detect_bulk_from_url()
+    test_rerun_is_resume_and_replace_is_refresh()
 
     pages = {
         "10001": {"title": "Onboarding", "body": "how to onboard"},

@@ -422,7 +422,29 @@ resume.
 
 **If the same query already has a queue**, `discover.py` reuses it and
 `prefetch.py` continues where it left off (skipping items already `done`
-or `unchanged`). Pass `--replace` to discard the old queue and start fresh.
+or `unchanged`). **A plain re-run therefore only resumes**: it does not look for
+new pages and does not re-check pages that were already fetched, so pages edited
+upstream stay stale. The discover summary says `"rechecked": false` and carries a
+`note` when this happens; if you see it on a source the user wanted brought up to
+date, re-run with `--replace`.
+
+**To bring an earlier bulk ingest up to date, re-run it with `--replace`.** Use it
+whenever the user asks to refresh, re-ingest, update, re-sync or backfill a space,
+query, site or earlier bulk job. (To refresh *everything* the wiki has ever ingested,
+run a bare `/ingest` instead; see **Refresh-all workflow**.)
+
+```bash
+${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
+  --wiki-root "${WIKI_ROOT}" \
+  --space FOO --replace
+```
+
+`--replace` rebuilds the queue (so new pages are found) and re-checks every page
+against the copy already in `raw/`. Pages whose content did not change keep their
+existing wiki status, so Phase 3 below only sees pages that are new, changed, or
+still unsynthesized from an interrupted earlier run. Do **not** add `--force` for an
+ordinary refresh: `--force` re-fetches every body *and* re-runs synthesis for every
+page, even when the content is identical.
 
 **If prefetch aborts** (Ctrl-C, or the circuit breaker trips after 5
 consecutive item failures), the queue is safe on disk. Resume with:
@@ -473,10 +495,11 @@ to pick, ingest the pages they actually care about individually instead.
 | `--since YYYY-MM-DD` | Only pages whose `<lastmod>` is recent — the cheapest refresh |
 | `--limit N` | Hard cap, good for a trial run before committing to the full site |
 
-Re-running the same `--site` / `--sitemap` URL **reuses its queue**, so a
-periodic refresh is just the same command again; `prefetch.py` skips items
-already `done`/`unchanged` and the conditional-GET gate makes untouched pages
-nearly free. `--replace` starts fresh.
+Re-running the same `--site` / `--sitemap` URL **reuses its queue**, which only
+resumes it: pages already fetched are not re-checked and new pages are not found.
+For a periodic refresh, re-run the same command with `--replace`. It re-enumerates,
+re-checks every page (the conditional-GET gate makes untouched pages nearly free),
+and only changed or new pages reach synthesis.
 
 **robots.txt is enforced on all bulk website paths** — disallowed URLs are
 dropped from the queue and reported. `--ignore-robots` overrides it; only pass
@@ -883,8 +906,10 @@ All scripts respond to `--help` with their full argument list.
   Retry-After. If a single request exhausts `max_retries`, the item is
   marked `failed`; the circuit breaker aborts the whole run after 5
   consecutive failures. User backs off and resumes.
-- **Bulk: same query re-run**: `discover.py` detects the matching queue
-  and reuses it (skips re-enumeration). Pass `--replace` to overwrite.
+- **Bulk: same query re-run**: `discover.py` detects the matching queue and reuses
+  it (skips re-enumeration), and prefetch skips pages already fetched. That is a
+  resume, not a refresh (`rechecked: false`). Pass `--replace` to refresh: it
+  re-enumerates, re-checks every page, and keeps the wiki status of unchanged ones.
 - **Bulk: same query, different filters**: reuse is keyed on (kind, query),
   which says nothing about `--include`/`--exclude`/`--since`/`--limit`/
   `--depth`/`--max-pages`/`--ignore-robots`. Those are recorded on the queue, so
