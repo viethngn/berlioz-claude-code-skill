@@ -91,6 +91,8 @@ Every wiki has a `.wikirc.json` at its root. Fields:
   (e.g. `gemini-3-pro`, `gemini-2.5-pro`). Not `-image-preview` — that model
   is for image generation, not description.
 - **`nano_banana.verify_ssl`** — Same semantics as `atlassian.verify_ssl`.
+- **`slack.verify_ssl`** / **`web.verify_ssl`** — Same semantics as
+  `atlassian.verify_ssl`, for Slack API and website requests respectively.
 - **`web.*`** — Website ingest. Every key has a default, so this whole block is
   optional and public pages need no credentials at all.
   - **`user_agent`** — Sent on every page and image request. Set it to a real

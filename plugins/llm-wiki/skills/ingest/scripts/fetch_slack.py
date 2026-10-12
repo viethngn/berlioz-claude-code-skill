@@ -37,7 +37,7 @@ require(["requests"])
 
 import requests as _requests  # noqa: E402
 
-from config import ConfigError, load_config
+from config import ConfigError, apply_ssl_env, load_config
 from rate_limiter import RateLimitFailure, get_limiter
 from raw_store import wiki_state_dir, write_fetch_history, write_raw_if_changed
 
@@ -69,10 +69,22 @@ def _slack_get(session: _requests.Session, limiter, method: str, params: dict) -
     # Route through limiter.request so HTTP 429/503 responses honor Retry-After
     # and back off, exactly like the Atlassian fetchers. throttle() alone only
     # paces outgoing calls; it does not retry a rate-limited response.
+    # verify is passed per request, not just left on the session: requests lets
+    # REQUESTS_CA_BUNDLE override Session.verify, so slack.verify_ssl=false would
+    # otherwise be silently ignored whenever that env var is set.
     url = f"{SLACK_API}/{method}"
     try:
-        resp = limiter.request("GET", url, session=session, params=params)
+        resp = limiter.request(
+            "GET", url, session=session, params=params, verify=session.verify
+        )
     except RateLimitFailure as e:
+        if (e.last_error or "").startswith("SSLError"):
+            raise SystemExit(
+                f"ERROR: {e}\n"
+                "SSL verification failed for slack.com. On a corporate network that "
+                "intercepts TLS, point REQUESTS_CA_BUNDLE at your corporate CA bundle, "
+                "or as a last resort set slack.verify_ssl=false in .wikirc.json."
+            )
         raise SystemExit(f"ERROR: {e}")
     try:
         resp.raise_for_status()
@@ -488,8 +500,12 @@ def main() -> int:
         )
         return 1
 
+    verify = cfg.slack_verify_ssl()
+    apply_ssl_env("slack", verify)
+
     limiter = get_limiter("slack", cfg.slack)
     session = _requests.Session()
+    session.verify = verify
     session.headers.update({"Authorization": f"Bearer {token}"})
 
     now_ts = time.time()
