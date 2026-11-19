@@ -173,6 +173,50 @@ def test_drift_untracked_and_retired(tmp):
     _assert("p" in d and d["p"]["drifted"][0]["uncommitted"] is True, f"untracked cited raw is drift: {d}")
 
 
+def test_fact_collision_and_overlap(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
+    write_page(root, "rate-limits", "The API rate limit is 1000 requests per minute for all tenants (source: raw/a.md). "
+               "Tenants are isolated by key. Bursts are smoothed over ten seconds windows always.")
+    write_page(root, "api-rate-limit", "The API rate limit is 5000 requests per minute for all tenants (source: raw/a.md). "
+               "Tenants are isolated by key. Bursts are smoothed over ten seconds windows always.")
+    write_page(root, "unrelated", "Onboarding takes three steps and ends with a welcome email being sent.", sources=("raw/a.md",))
+    r = run_lint(root)
+    fc = r["fact_collisions"]
+    _assert(len(fc) == 1 and fc[0]["pages"] == ["api-rate-limit", "rate-limits"], f"collision: {fc}")
+    _assert(fc[0]["differing"] == [["5000"], ["1000"]], f"differing: {fc[0]['differing']}")
+    top = r["overlap_candidates"][0]
+    _assert(top["pages"] == ["api-rate-limit", "rate-limits"] and top["shared_sources"] == 1, f"overlap: {top}")
+    _assert(all("unrelated" not in c["pages"] for c in r["overlap_candidates"]), "unrelated page not a candidate")
+
+
+def test_collision_cjk(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
+    write_page(root, "seigen-a", "APIのレート制限は毎分1000リクエストです。全テナントに適用されます。")
+    write_page(root, "seigen-b", "APIのレート制限は毎分5000リクエストです。全テナントに適用されます。")
+    _assert(len(run_lint(root)["fact_collisions"]) == 1, "CJK collision found")
+
+
+def test_collision_ignores_code_tables_versions(tmp):   # Review Focus 2
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
+    write_page(root, "rel-a", "Release notes for the service.\n\n```\nretries = 3\ntimeout = 30\n```\n\n| limit | 10 |\n")
+    write_page(root, "rel-b", "Release notes for the service.\n\n```\nretries = 5\ntimeout = 60\n```\n\n| limit | 20 |\n")
+    _assert(run_lint(root)["fact_collisions"] == [], "code blocks and tables are not compared")
+
+
+def test_pair_generation_scales(tmp):                    # Review Focus 3
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
+    for i in range(300):
+        write_page(root, f"topic{i:03d}x", f"Page number {i} talks about subject {i} in some detail here. " * 5,
+                   sources=(f"raw/s{i}.md",))
+    t = time.time(); r = run_lint(root)
+    _assert(time.time() - t < 20, "300 pages under 20s")
+    _assert(len(r["overlap_candidates"]) <= 20, "candidate cap respected")
+
+
 def main() -> int:
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed = 0

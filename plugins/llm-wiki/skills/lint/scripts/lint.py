@@ -4,8 +4,9 @@
 Scans wiki/*.md and emits a JSON report of:
     orphans, broken_links, missing_pages, archive_links_without_banner,
     format_violations, empty_pages, source_drift, unsourced_claims,
-    status_pages, missing_sources, empty_raw, warnings; plus edges /
-    inbound_counts (wiki-link graph) with --graph
+    status_pages, missing_sources, empty_raw, overlap_candidates,
+    fact_collisions, warnings; plus edges / inbound_counts (wiki-link graph)
+    with --graph
 
 `index`, `log` and README pages (EXEMPT_PAGES) are skipped by every per-page
 check, and their links do not count as inbound links for orphan detection.
@@ -23,7 +24,7 @@ AND which no wiki page cites — safe-to-prune candidates. The linter only
 REPORTS them; the /lint skill deletes them after user confirmation.
 
 Usage:
-    python3 lint.py --wiki-root PATH [--sources] [--graph]
+    python3 lint.py --wiki-root PATH [--sources] [--graph] [--max-candidates N]
 """
 
 from __future__ import annotations
@@ -34,9 +35,23 @@ import re
 import subprocess
 import sys
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
+from itertools import combinations
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+
+# Overlap / fact-collision tuning. Score = weighted sum of components in [0, 1];
+# a shared source alone (W_SOURCES) must stay below OVERLAP_THRESHOLD.
+MAX_CANDIDATES = 20
+OVERLAP_THRESHOLD = 0.5
+SENTENCE_SIM_THRESHOLD = 0.8
+W_SOURCES = 0.2
+W_LINKS = 0.1
+W_SLUG = 0.2
+W_TEXT = 0.5
+SLUG_TOKEN_MIN = 4
+MAX_BUCKET = 50  # index keys shared by more pages than this generate no pairs
 
 WIKI_LINK_RE = re.compile(r"\[\[([^\]\|]+?)(?:\|[^\]]+)?\]\]")
 H1_RE = re.compile(r"^#\s+.+", re.MULTILINE)
@@ -578,6 +593,131 @@ def find_unsourced(pages: List[dict]) -> List[dict]:
     return unsourced
 
 
+NUM_TOKEN_RE = re.compile(r"(?:\d[\d.,:/\-]*\d|\d)%?")
+CITATION_RE = re.compile(r"\(source:[^)]*\)", re.IGNORECASE)
+# `.!?` end a sentence only before whitespace/end, so `1.5` and `raw/a.md` stay whole.
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])|\n")
+
+
+def prose_sentences(body: str) -> List[str]:
+    """Sentences from prose only: drops fenced code, table rows, headings and
+    the `## Related pages` list."""
+    kept: List[str] = []
+    in_fence = in_related = False
+    for line in body.splitlines():
+        s = line.strip()
+        if s.startswith("```") or s.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence or s.startswith("|"):
+            continue
+        if s.startswith("#"):
+            in_related = s.lstrip("#").strip().lower() == "related pages"
+            continue
+        if not in_related:
+            kept.append(line)
+    return [t.strip() for t in SENTENCE_SPLIT_RE.split("\n".join(kept)) if t.strip()]
+
+
+def _info(page: dict, raw_dir: Path) -> dict:
+    """Per-page derived data, computed once and cached on the page dict."""
+    if "_info" not in page:
+        sents = prose_sentences(page_body(page["text"]))
+        page["_info"] = {
+            "slug": slug_from_path(page["path"]),
+            "sources": set(resolve_source_paths(page["text"], raw_dir)),
+            "links": set(wiki_links_in(page_body(page["text"]))),
+            "prose": " ".join(sents),
+            "sentences": sents,
+        }
+    return page["_info"]
+
+
+def related_pairs(pages: List[dict], raw_dir: Path) -> List[Tuple[dict, dict]]:
+    """Active content pages sharing a cited raw, an outbound link, or a slug
+    token of >= SLUG_TOKEN_MIN chars, via inverted indexes."""
+    retired = retired_slugs(pages)
+    active = [p for p in pages if slug_from_path(p["path"]) not in EXEMPT_PAGES | retired]
+    index: Dict[str, List[int]] = {}
+    for i, page in enumerate(active):
+        info = _info(page, raw_dir)
+        keys = {f"s:{s}" for s in info["sources"]} | {f"l:{l}" for l in info["links"]}
+        keys |= {f"t:{t}" for t in re.split(r"[-_/\s]+", info["slug"]) if len(t) >= SLUG_TOKEN_MIN}
+        for k in keys:
+            index.setdefault(k, []).append(i)
+    seen = set()
+    for bucket in index.values():
+        # A key shared by very many pages (one raw cited everywhere) is not a
+        # signal and would make pairing O(n^2).
+        if len(bucket) <= MAX_BUCKET:
+            seen.update(combinations(bucket, 2))
+    return [(active[i], active[j]) for i, j in sorted(seen)]
+
+
+def _jaccard(a: set, b: set) -> float:
+    return len(a & b) / len(a | b) if a | b else 0.0
+
+
+def find_overlap(pairs: List[Tuple[dict, dict]], raw_dir: Path, limit: int) -> List[dict]:
+    out: List[dict] = []
+    for pa, pb in pairs:
+        a, b = sorted((_info(pa, raw_dir), _info(pb, raw_dir)), key=lambda x: x["slug"])
+        slug_sim = SequenceMatcher(None, a["slug"], b["slug"]).ratio()
+        base = (W_SOURCES * _jaccard(a["sources"], b["sources"])
+                + W_LINKS * _jaccard(a["links"], b["links"]) + W_SLUG * slug_sim)
+        sm = SequenceMatcher(None, a["prose"], b["prose"])
+        # quick_ratio is an upper bound: skip the costly ratio() when it can't clear the bar.
+        text_sim = sm.quick_ratio()
+        if base + W_TEXT * text_sim < OVERLAP_THRESHOLD:
+            continue
+        text_sim = sm.ratio()
+        score = base + W_TEXT * text_sim
+        if score < OVERLAP_THRESHOLD:
+            continue
+        out.append({
+            "pages": [a["slug"], b["slug"]],
+            "score": round(score, 3),
+            "shared_sources": len(a["sources"] & b["sources"]),
+            "shared_links": len(a["links"] & b["links"]),
+            "slug_sim": round(slug_sim, 3),
+            "text_sim": round(text_sim, 3),
+        })
+    out.sort(key=lambda c: (-c["score"], c["pages"]))
+    return out[:limit]
+
+
+def find_fact_collisions(pairs: List[Tuple[dict, dict]]) -> List[dict]:
+    """Near-identical prose sentences (numbers removed) whose numbers differ."""
+    def numeric(sents: List[str]) -> List[Tuple[str, str, List[str]]]:
+        out = []
+        for s in sents:
+            bare = CITATION_RE.sub("", s)
+            tokens = NUM_TOKEN_RE.findall(bare)
+            if tokens:
+                out.append((s, NUM_TOKEN_RE.sub("", bare), tokens))
+        return out
+
+    found: List[dict] = []
+    for pa, pb in pairs:
+        a, b = sorted(
+            ((slug_from_path(p["path"]), p["_info"]["sentences"] if "_info" in p
+              else prose_sentences(page_body(p["text"]))) for p in (pa, pb)),
+            key=lambda x: x[0],
+        )
+        for sa, ta, ka in numeric(a[1]):
+            for sb, tb, kb in numeric(b[1]):
+                if ka == kb:
+                    continue
+                sm = SequenceMatcher(None, ta, tb)
+                if sm.quick_ratio() >= SENTENCE_SIM_THRESHOLD and sm.ratio() >= SENTENCE_SIM_THRESHOLD:
+                    found.append({
+                        "pages": [a[0], b[0]],
+                        "sentences": [sa, sb],
+                        "differing": [[t for t in ka if t not in kb], [t for t in kb if t not in ka]],
+                    })
+    return found
+
+
 def scan_raw(raw_dir: Path) -> List[dict]:
     if not raw_dir.exists():
         return []
@@ -619,6 +759,12 @@ def main() -> int:
         "--graph",
         action="store_true",
         help="Include the wiki-link graph (edges, inbound_counts) in the report",
+    )
+    parser.add_argument(
+        "--max-candidates",
+        type=int,
+        default=MAX_CANDIDATES,
+        help=f"Cap on overlap_candidates (default {MAX_CANDIDATES})",
     )
     args = parser.parse_args()
     warnings: List[str] = []
@@ -663,6 +809,9 @@ def main() -> int:
     missing_sources = find_missing_sources(pages, raw_dir)
     cited = cited_raw_slugs(pages, raw_dir)
     empty_raw = find_empty_raw(raw_dir, cited)
+    pairs = related_pairs(pages, raw_dir)
+    overlap = find_overlap(pairs, raw_dir, args.max_candidates)
+    collisions = find_fact_collisions(pairs)
 
     report = {
         "wiki_root": str(wiki_root),
@@ -681,6 +830,8 @@ def main() -> int:
         "status_pages": status_pages,
         "missing_sources": missing_sources,
         "empty_raw": empty_raw,
+        "overlap_candidates": overlap,
+        "fact_collisions": collisions,
         "warnings": warnings,
     }
 
