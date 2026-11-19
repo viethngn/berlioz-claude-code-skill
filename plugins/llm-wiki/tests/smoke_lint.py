@@ -207,14 +207,82 @@ def test_collision_ignores_code_tables_versions(tmp):   # Review Focus 2
 
 
 def test_pair_generation_scales(tmp):                    # Review Focus 3
+    import random
+    root = make_wiki(tmp)
+    words = ("cache queue worker billing search gateway ledger auth export import index shard "
+             "replica tenant invoice report metric alert backup token").split()
+    for i in range(300):
+        rnd = random.Random(i)
+        body = " ".join(
+            f"The {rnd.choice(words)} {rnd.choice(words)} handles {rnd.randint(1, 9999)} "
+            f"{rnd.choice(words)} jobs per {rnd.choice(('second', 'minute', 'hour'))} in region {rnd.randint(1, 20)}."
+            for _ in range(22))
+        write_page(root, f"topic{i:03d}x", body, sources=(f"raw/g{i // 30}.md",))  # groups of 30 share a raw
+    t = time.time(); r = run_lint(root); elapsed = time.time() - t
+    print(f"     300 pages / 10 groups of 30: {elapsed:.1f}s")
+    _assert(elapsed < 30, f"300 pages under 30s: {elapsed:.1f}s")
+    _assert(len(r["overlap_candidates"]) <= 20, "candidate cap respected")
+    _assert(len(r["fact_collisions"]) <= 50, "collision cap respected")
+
+
+NEAR_DUP_A = (
+    "The ingestion service reads every source from the raw folder and writes one wiki page per topic. "
+    "Each page carries a summary, a list of sources and a last updated date at the top. "
+    "When a source changes, the page that cites it is flagged for review by the linter. "
+    "Links between pages use double brackets and must point at an existing page or the archive. "
+    "Archived pages keep their slug so that older references continue to resolve correctly. "
+    "Conflicting statements across pages are reported to the user before anything is rewritten. "
+    "The index page lists every active page with a one line description of what it covers. "
+    "Large spaces are ingested in batches with a resumable job queue and a circuit breaker. "
+    "Images found in a source are described once and reused until the image itself changes. "
+    "Every run ends with a log entry and a single commit so the history stays easy to follow."
+)
+NEAR_DUP_B = (
+    "The ingestion service reads each source from the raw folder and writes one wiki page per topic. "
+    "Links between pages use double brackets and must point at an existing page or the archive. "
+    "Each page carries a summary, a list of sources and a last-updated date at the top. "
+    "When a source changes, the page citing it is flagged for review by the linter. "
+    "Archived pages keep their slug so older references continue to resolve correctly. "
+    "The index page lists every active page with a one line description of what it covers. "
+    "Conflicting statements across pages are reported to the user before anything gets rewritten. "
+    "Large spaces are ingested in batches using a resumable job queue and a circuit breaker. "
+    "Images found in a source are described once and then reused until the image changes. "
+    "Every run ends with a log entry and one commit so that the history stays easy to follow."
+)
+
+
+def test_near_duplicate_both_slug_orders(tmp):
+    _assert(len(NEAR_DUP_A) > 800 and len(NEAR_DUP_B) > 800, "fixture pages are >800 chars")
     root = make_wiki(tmp)
     write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
-    for i in range(300):
-        write_page(root, f"topic{i:03d}x", f"Page number {i} talks about subject {i} in some detail here. " * 5,
-                   sources=(f"raw/s{i}.md",))
-    t = time.time(); r = run_lint(root)
-    _assert(time.time() - t < 20, "300 pages under 20s")
-    _assert(len(r["overlap_candidates"]) <= 20, "candidate cap respected")
+    for first, second in ((NEAR_DUP_A, NEAR_DUP_B), (NEAR_DUP_B, NEAR_DUP_A)):
+        write_page(root, "ingest-pipeline", first)
+        write_page(root, "wiki-workflow", second)
+        cands = run_lint(root)["overlap_candidates"]
+        _assert(any(c["pages"] == ["ingest-pipeline", "wiki-workflow"] for c in cands), f"near-dup found: {cands}")
+
+
+def test_hub_key_exact_collision_and_warning(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "hub.md", "# hub\n\nsource body that is long enough to count.\n")
+    for i in range(58):
+        write_page(root, f"filler{i:03d}", "Filler page that mentions the [[glossary]] once in passing here.",
+                   sources=("raw/hub.md",))
+    write_page(root, "alpha", "The rate limit is 1000 requests per minute. See [[glossary]].", sources=("raw/hub.md",))
+    write_page(root, "beta", "The rate limit is 5000 requests per minute. See [[glossary]].", sources=("raw/hub.md",))
+    r = run_lint(root)
+    fc = [c for c in r["fact_collisions"] if c["pages"] == ["alpha", "beta"]]
+    _assert(len(fc) == 1 and fc[0]["differing"] == [["1000"], ["5000"]], f"hub collision: {fc}")
+    _assert(any("raw/hub.md" in w and "60" in w for w in r["warnings"]), f"hub warning: {r['warnings']}")
+
+
+def test_collision_reordered_numbers_and_self_link(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
+    write_page(root, "one", "Window opens at 9 and closes at 17 every day. See [[two]].", sources=("raw/x.md",))
+    write_page(root, "two", "Window opens at 17 and closes at 9 every day.", sources=("raw/y.md",))
+    fc = run_lint(root)["fact_collisions"]
+    _assert(len(fc) == 1 and fc[0]["differing"] == [["9", "17"], ["17", "9"]], f"positional differing: {fc}")
 
 
 def main() -> int:

@@ -34,6 +34,7 @@ import json
 import re
 import subprocess
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from itertools import combinations
@@ -46,12 +47,16 @@ from typing import Dict, Iterable, List, Optional, Tuple
 MAX_CANDIDATES = 20
 OVERLAP_THRESHOLD = 0.5
 SENTENCE_SIM_THRESHOLD = 0.8
+SENTENCE_GATE = 0.5  # trigram Jaccard a sentence pair needs before ratio() is computed
 W_SOURCES = 0.2
 W_LINKS = 0.1
 W_SLUG = 0.2
 W_TEXT = 0.5
 SLUG_TOKEN_MIN = 4
-MAX_BUCKET = 50  # index keys shared by more pages than this generate no pairs
+SHINGLE = 5  # character n-gram size for page-level text_sim
+MAX_BUCKET = 50  # index keys shared by more pages generate no pairs (warned)
+MAX_COLLISIONS = 50
+COLLISION_SCAN_LIMIT = 20 * MAX_COLLISIONS  # stop scanning here; the warning then says "at least"
 
 WIKI_LINK_RE = re.compile(r"\[\[([^\]\|]+?)(?:\|[^\]]+)?\]\]")
 H1_RE = re.compile(r"^#\s+.+", re.MULTILINE)
@@ -622,35 +627,61 @@ def prose_sentences(body: str) -> List[str]:
 def _info(page: dict, raw_dir: Path) -> dict:
     """Per-page derived data, computed once and cached on the page dict."""
     if "_info" not in page:
-        sents = prose_sentences(page_body(page["text"]))
+        prose = " ".join(prose_sentences(page_body(page["text"])))
         page["_info"] = {
             "slug": slug_from_path(page["path"]),
             "sources": set(resolve_source_paths(page["text"], raw_dir)),
             "links": set(wiki_links_in(page_body(page["text"]))),
-            "prose": " ".join(sents),
-            "sentences": sents,
+            "shingles": {prose[i:i + SHINGLE] for i in range(max(len(prose) - SHINGLE + 1, 1))},
         }
     return page["_info"]
 
 
-def related_pairs(pages: List[dict], raw_dir: Path) -> List[Tuple[dict, dict]]:
-    """Active content pages sharing a cited raw, an outbound link, or a slug
-    token of >= SLUG_TOKEN_MIN chars, via inverted indexes."""
-    retired = retired_slugs(pages)
-    active = [p for p in pages if slug_from_path(p["path"]) not in EXEMPT_PAGES | retired]
+def _numeric(page: dict) -> List[Tuple[str, str, List[str]]]:
+    """(sentence, normalized number-stripped text, numeric tokens) for each prose
+    sentence carrying a numeric token; cached on the page dict."""
+    if "_numeric" not in page:
+        out = []
+        for s in prose_sentences(page_body(page["text"])):
+            bare = CITATION_RE.sub("", s)
+            tokens = NUM_TOKEN_RE.findall(bare)
+            if tokens:
+                norm = " ".join(NUM_TOKEN_RE.sub("", bare).lower().split())
+                grams = {norm[i:i + 3] for i in range(max(len(norm) - 2, 1))}
+                out.append((s, norm, tokens, grams))
+        page["_numeric"] = out
+    return page["_numeric"]
+
+
+def active_pages(pages: List[dict]) -> List[dict]:
+    """Content pages compared by overlap/collision checks: not exempt, not retired."""
+    skip = EXEMPT_PAGES | retired_slugs(pages)
+    return [p for p in pages if slug_from_path(p["path"]) not in skip]
+
+
+def related_pairs(
+    pages: List[dict], raw_dir: Path, warnings: Optional[List[str]] = None
+) -> List[Tuple[dict, dict]]:
+    """Active content pages sharing a cited raw, a link key (outbound link or
+    own slug), or a slug token of >= SLUG_TOKEN_MIN chars, via inverted indexes."""
+    active = active_pages(pages)
     index: Dict[str, List[int]] = {}
     for i, page in enumerate(active):
         info = _info(page, raw_dir)
-        keys = {f"s:{s}" for s in info["sources"]} | {f"l:{l}" for l in info["links"]}
+        keys = {f"s:{s}" for s in info["sources"]}
+        keys |= {f"l:{l}" for l in info["links"] | {info["slug"]}}
         keys |= {f"t:{t}" for t in re.split(r"[-_/\s]+", info["slug"]) if len(t) >= SLUG_TOKEN_MIN}
         for k in keys:
             index.setdefault(k, []).append(i)
     seen = set()
-    for bucket in index.values():
-        # A key shared by very many pages (one raw cited everywhere) is not a
-        # signal and would make pairing O(n^2).
-        if len(bucket) <= MAX_BUCKET:
-            seen.update(combinations(bucket, 2))
+    for key, bucket in sorted(index.items()):
+        # A key shared by very many pages would make pairing O(n^2); the exact
+        # collision pass still covers these pages, and the skip is reported.
+        if len(bucket) > MAX_BUCKET:
+            if warnings is not None:
+                warnings.append(f"overlap: skipped hub key {key[2:]} shared by {len(bucket)} pages")
+            continue
+        seen.update(combinations(bucket, 2))
     return [(active[i], active[j]) for i, j in sorted(seen)]
 
 
@@ -662,16 +693,12 @@ def find_overlap(pairs: List[Tuple[dict, dict]], raw_dir: Path, limit: int) -> L
     out: List[dict] = []
     for pa, pb in pairs:
         a, b = sorted((_info(pa, raw_dir), _info(pb, raw_dir)), key=lambda x: x["slug"])
-        slug_sim = SequenceMatcher(None, a["slug"], b["slug"]).ratio()
-        base = (W_SOURCES * _jaccard(a["sources"], b["sources"])
-                + W_LINKS * _jaccard(a["links"], b["links"]) + W_SLUG * slug_sim)
-        sm = SequenceMatcher(None, a["prose"], b["prose"])
-        # quick_ratio is an upper bound: skip the costly ratio() when it can't clear the bar.
-        text_sim = sm.quick_ratio()
-        if base + W_TEXT * text_sim < OVERLAP_THRESHOLD:
-            continue
-        text_sim = sm.ratio()
-        score = base + W_TEXT * text_sim
+        slug_sim = SequenceMatcher(None, a["slug"], b["slug"], autojunk=False).ratio()
+        # Character-shingle Jaccard: linear, symmetric, order-insensitive, language-agnostic.
+        text_sim = _jaccard(a["shingles"], b["shingles"])
+        score = (W_SOURCES * _jaccard(a["sources"], b["sources"])
+                 + W_LINKS * _jaccard(a["links"], b["links"])
+                 + W_SLUG * slug_sim + W_TEXT * text_sim)
         if score < OVERLAP_THRESHOLD:
             continue
         out.append({
@@ -686,35 +713,75 @@ def find_overlap(pairs: List[Tuple[dict, dict]], raw_dir: Path, limit: int) -> L
     return out[:limit]
 
 
-def find_fact_collisions(pairs: List[Tuple[dict, dict]]) -> List[dict]:
-    """Near-identical prose sentences (numbers removed) whose numbers differ."""
-    def numeric(sents: List[str]) -> List[Tuple[str, str, List[str]]]:
-        out = []
-        for s in sents:
-            bare = CITATION_RE.sub("", s)
-            tokens = NUM_TOKEN_RE.findall(bare)
-            if tokens:
-                out.append((s, NUM_TOKEN_RE.sub("", bare), tokens))
+def _differing(ka: List[str], kb: List[str]) -> List[List[str]]:
+    """Tokens each side has that the other lacks (multiset); positional
+    differences when both hold the same tokens in another order."""
+    def minus(xs: List[str], other: List[str]) -> List[str]:
+        left, out = Counter(other), []
+        for t in xs:
+            if left[t]:
+                left[t] -= 1
+            else:
+                out.append(t)
         return out
 
+    da, db = minus(ka, kb), minus(kb, ka)
+    if not da and not db:  # same multiset, so same length
+        da = [x for x, y in zip(ka, kb) if x != y]
+        db = [y for x, y in zip(ka, kb) if x != y]
+    return [da, db]
+
+
+def find_fact_collisions(
+    pairs: List[Tuple[dict, dict]], pages: Iterable[dict] = (), stop_after: int = COLLISION_SCAN_LIMIT
+) -> List[dict]:
+    """Prose sentences that agree once numbers are removed but whose numbers differ.
+
+    Exact pass (wiki-wide over `pages`, independent of pairing): sentences with
+    identical normalized number-stripped text. Fuzzy pass (related `pairs`
+    only): SequenceMatcher ratio >= SENTENCE_SIM_THRESHOLD. Exact hits first,
+    de-duplicated; scanning stops once `stop_after` collisions are found.
+    """
     found: List[dict] = []
+    seen = set()
+
+    def add(pa: str, sa: str, ka: List[str], pb: str, sb: str, kb: List[str]) -> None:
+        if pa > pb:
+            pa, sa, ka, pb, sb, kb = pb, sb, kb, pa, sa, ka
+        key = (pa, pb, sa, sb)
+        if key not in seen:
+            seen.add(key)
+            found.append({"pages": [pa, pb], "sentences": [sa, sb], "differing": _differing(ka, kb)})
+
+    exact: Dict[str, Dict[Tuple[str, Tuple[str, ...]], str]] = {}
+    for page in active_pages(list(pages)):
+        slug = slug_from_path(page["path"])
+        for s, norm, tokens, _ in _numeric(page):
+            exact.setdefault(norm, {}).setdefault((slug, tuple(tokens)), s)
+    for norm in sorted(exact):
+        for ((pa, ka), sa), ((pb, kb), sb) in combinations(sorted(exact[norm].items()), 2):
+            if pa != pb and ka != kb:
+                add(pa, sa, list(ka), pb, sb, list(kb))
+                if len(found) >= stop_after:
+                    return found
+
+    sm = SequenceMatcher(autojunk=False)
     for pa, pb in pairs:
-        a, b = sorted(
-            ((slug_from_path(p["path"]), p["_info"]["sentences"] if "_info" in p
-              else prose_sentences(page_body(p["text"]))) for p in (pa, pb)),
-            key=lambda x: x[0],
-        )
-        for sa, ta, ka in numeric(a[1]):
-            for sb, tb, kb in numeric(b[1]):
-                if ka == kb:
+        a, b = sorted((pa, pb), key=lambda p: slug_from_path(p["path"]))
+        na, nb = _numeric(a), _numeric(b)
+        for sb, tb, kb, gb in nb:
+            sm.set_seq2(tb)
+            for sa, ta, ka, ga in na:
+                if ka == kb or ta == tb:  # identical text is the exact pass's job
                     continue
-                sm = SequenceMatcher(None, ta, tb)
-                if sm.quick_ratio() >= SENTENCE_SIM_THRESHOLD and sm.ratio() >= SENTENCE_SIM_THRESHOLD:
-                    found.append({
-                        "pages": [a[0], b[0]],
-                        "sentences": [sa, sb],
-                        "differing": [[t for t in ka if t not in kb], [t for t in kb if t not in ka]],
-                    })
+                # Trigram-set Jaccard (C-speed set ops) prunes before pure-Python SequenceMatcher.
+                if len(ga & gb) < SENTENCE_GATE * len(ga | gb):
+                    continue
+                sm.set_seq1(ta)
+                if sm.ratio() >= SENTENCE_SIM_THRESHOLD:
+                    add(slug_from_path(a["path"]), sa, ka, slug_from_path(b["path"]), sb, kb)
+                    if len(found) >= stop_after:
+                        return found
     return found
 
 
@@ -809,9 +876,13 @@ def main() -> int:
     missing_sources = find_missing_sources(pages, raw_dir)
     cited = cited_raw_slugs(pages, raw_dir)
     empty_raw = find_empty_raw(raw_dir, cited)
-    pairs = related_pairs(pages, raw_dir)
+    pairs = related_pairs(pages, raw_dir, warnings)
     overlap = find_overlap(pairs, raw_dir, args.max_candidates)
-    collisions = find_fact_collisions(pairs)
+    collisions = find_fact_collisions(pairs, pages)
+    if len(collisions) > MAX_COLLISIONS:
+        total = f"at least {len(collisions)}" if len(collisions) >= COLLISION_SCAN_LIMIT else len(collisions)
+        warnings.append(f"fact_collisions: showing {MAX_COLLISIONS} of {total} found")
+        collisions = collisions[:MAX_COLLISIONS]
 
     report = {
         "wiki_root": str(wiki_root),
