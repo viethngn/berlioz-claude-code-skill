@@ -47,7 +47,6 @@ from typing import Dict, Iterable, List, Optional, Tuple
 MAX_CANDIDATES = 20
 OVERLAP_THRESHOLD = 0.5
 SENTENCE_SIM_THRESHOLD = 0.8
-SENTENCE_GATE = 0.5  # trigram Jaccard a sentence pair needs before ratio() is computed
 W_SOURCES = 0.2
 W_LINKS = 0.1
 W_SLUG = 0.2
@@ -56,7 +55,7 @@ SLUG_TOKEN_MIN = 4
 SHINGLE = 5  # character n-gram size for page-level text_sim
 MAX_BUCKET = 50  # index keys shared by more pages generate no pairs (warned)
 MAX_COLLISIONS = 50
-COLLISION_SCAN_LIMIT = 20 * MAX_COLLISIONS  # stop scanning here; the warning then says "at least"
+COLLISION_SCAN_LIMIT = 20 * MAX_COLLISIONS  # per pass (exact, fuzzy); past it the warning says "at least"
 
 WIKI_LINK_RE = re.compile(r"\[\[([^\]\|]+?)(?:\|[^\]]+)?\]\]")
 H1_RE = re.compile(r"^#\s+.+", re.MULTILINE)
@@ -648,9 +647,7 @@ def _numeric(page: dict) -> List[Tuple[str, str, List[str]]]:
             bare = CITATION_RE.sub("", s)
             tokens = NUM_TOKEN_RE.findall(bare)
             if tokens:
-                norm = " ".join(NUM_TOKEN_RE.sub("", bare).lower().split())
-                grams = {norm[i:i + 3] for i in range(max(len(norm) - 2, 1))}
-                out.append((s, norm, tokens, grams))
+                out.append((s, " ".join(NUM_TOKEN_RE.sub("", bare).lower().split()), tokens))
         page["_numeric"] = out
     return page["_numeric"]
 
@@ -735,14 +732,18 @@ def _differing(ka: List[str], kb: List[str]) -> List[List[str]]:
 
 
 def find_fact_collisions(
-    pairs: List[Tuple[dict, dict]], pages: Iterable[dict] = (), stop_after: int = COLLISION_SCAN_LIMIT
+    pairs: List[Tuple[dict, dict]],
+    pages: Iterable[dict] = (),
+    stop_after: int = COLLISION_SCAN_LIMIT,
+    stats: Optional[dict] = None,
 ) -> List[dict]:
     """Prose sentences that agree once numbers are removed but whose numbers differ.
 
     Exact pass (wiki-wide over `pages`, independent of pairing): sentences with
     identical normalized number-stripped text. Fuzzy pass (related `pairs`
     only): SequenceMatcher ratio >= SENTENCE_SIM_THRESHOLD. Exact hits first,
-    de-duplicated; scanning stops once `stop_after` collisions are found.
+    de-duplicated. Each pass stops after `stop_after` hits of its own; a
+    `stats` dict, if given, gets `truncated = True` when either pass stopped.
     """
     found: List[dict] = []
     seen = set()
@@ -758,32 +759,41 @@ def find_fact_collisions(
     exact: Dict[str, Dict[Tuple[str, Tuple[str, ...]], str]] = {}
     for page in active_pages(list(pages)):
         slug = slug_from_path(page["path"])
-        for s, norm, tokens, _ in _numeric(page):
+        for s, norm, tokens in _numeric(page):
             exact.setdefault(norm, {}).setdefault((slug, tuple(tokens)), s)
-    for norm in sorted(exact):
-        for ((pa, ka), sa), ((pb, kb), sb) in combinations(sorted(exact[norm].items()), 2):
-            if pa != pb and ka != kb:
-                add(pa, sa, list(ka), pb, sb, list(kb))
-                if len(found) >= stop_after:
-                    return found
-
-    sm = SequenceMatcher(autojunk=False)
-    for pa, pb in pairs:
-        a, b = sorted((pa, pb), key=lambda p: slug_from_path(p["path"]))
-        na, nb = _numeric(a), _numeric(b)
-        for sb, tb, kb, gb in nb:
-            sm.set_seq2(tb)
-            for sa, ta, ka, ga in na:
-                if ka == kb or ta == tb:  # identical text is the exact pass's job
-                    continue
-                # Trigram-set Jaccard (C-speed set ops) prunes before pure-Python SequenceMatcher.
-                if len(ga & gb) < SENTENCE_GATE * len(ga | gb):
-                    continue
-                sm.set_seq1(ta)
-                if sm.ratio() >= SENTENCE_SIM_THRESHOLD:
-                    add(slug_from_path(a["path"]), sa, ka, slug_from_path(b["path"]), sb, kb)
+    def exact_pass() -> bool:
+        for norm in sorted(exact):
+            for ((pa, ka), sa), ((pb, kb), sb) in combinations(sorted(exact[norm].items()), 2):
+                if pa != pb and ka != kb:
+                    add(pa, sa, list(ka), pb, sb, list(kb))
                     if len(found) >= stop_after:
-                        return found
+                        return True
+        return False
+
+    def fuzzy_pass(budget_end: int) -> bool:
+        sm = SequenceMatcher(autojunk=False)
+        for pa, pb in pairs:
+            a, b = sorted((pa, pb), key=lambda p: slug_from_path(p["path"]))
+            na, nb = _numeric(a), _numeric(b)
+            for sb, tb, kb in nb:
+                sm.set_seq2(tb)
+                for sa, ta, ka in na:
+                    if ka == kb or ta == tb:  # identical text is the exact pass's job
+                        continue
+                    sm.set_seq1(ta)
+                    # real_quick_ratio and quick_ratio are upper bounds on ratio().
+                    if (sm.real_quick_ratio() >= SENTENCE_SIM_THRESHOLD
+                            and sm.quick_ratio() >= SENTENCE_SIM_THRESHOLD
+                            and sm.ratio() >= SENTENCE_SIM_THRESHOLD):
+                        add(slug_from_path(a["path"]), sa, ka, slug_from_path(b["path"]), sb, kb)
+                        if len(found) >= budget_end:
+                            return True
+        return False
+
+    truncated = exact_pass()
+    truncated = fuzzy_pass(len(found) + stop_after) or truncated
+    if stats is not None:
+        stats["truncated"] = truncated
     return found
 
 
@@ -880,9 +890,10 @@ def main() -> int:
     empty_raw = find_empty_raw(raw_dir, cited)
     pairs = related_pairs(pages, raw_dir, warnings)
     overlap = find_overlap(pairs, raw_dir, args.max_candidates)
-    collisions = find_fact_collisions(pairs, pages)
+    scan: dict = {}
+    collisions = find_fact_collisions(pairs, pages, stats=scan)
     if len(collisions) > MAX_COLLISIONS:
-        total = f"at least {len(collisions)}" if len(collisions) >= COLLISION_SCAN_LIMIT else len(collisions)
+        total = f"at least {len(collisions)}" if scan["truncated"] else len(collisions)
         warnings.append(f"fact_collisions: showing {MAX_COLLISIONS} of {total} found")
         collisions = collisions[:MAX_COLLISIONS]
 

@@ -223,6 +223,7 @@ def test_pair_generation_scales(tmp):                    # Review Focus 3
     _assert(elapsed < 30, f"300 pages under 30s: {elapsed:.1f}s")
     _assert(len(r["overlap_candidates"]) <= 20, "candidate cap respected")
     _assert(len(r["fact_collisions"]) <= 50, "collision cap respected")
+    _assert(r["overlap_candidates"] and r["fact_collisions"], "pair scoring actually ran")
 
 
 NEAR_DUP_A = (
@@ -274,6 +275,17 @@ def test_hub_key_exact_collision_and_warning(tmp):
     fc = [c for c in r["fact_collisions"] if c["pages"] == ["alpha", "beta"]]
     _assert(len(fc) == 1 and fc[0]["differing"] == [["1000"], ["5000"]], f"hub collision: {fc}")
     _assert(any("raw/hub.md" in w and "60" in w for w in r["warnings"]), f"hub warning: {r['warnings']}")
+
+
+def test_collision_short_key_value_sentences(tmp):
+    for one, two in (("SLA is 99.9% uptime.", "SLA: 99.95% uptime."),
+                     ("Timeout is 30 s.", "Timeout: 60 s.")):
+        root = make_wiki(tmp / one[:3])
+        write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
+        write_page(root, "page-one", one)
+        write_page(root, "page-two", two)
+        fc = run_lint(root)["fact_collisions"]
+        _assert(len(fc) == 1 and fc[0]["sentences"] == [one, two], f"{one!r} vs {two!r}: {fc}")
 
 
 def test_collision_reordered_numbers_and_self_link(tmp):
