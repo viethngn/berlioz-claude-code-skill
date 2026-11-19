@@ -9,36 +9,31 @@ This wiki is a structured, interlinked knowledge base. Claude maintains
 the wiki. The human curates sources, asks questions, and guides the
 analysis.
 
+<!-- llm-wiki:begin -->
+<!-- Managed by the llm-wiki plugin. `bootstrap.py --upgrade` rewrites everything
+between these markers; put your own instructions outside them. -->
+
 ## Folder structure
 
 ```
-raw/       -- source documents (immutable -- never modify these)
-wiki/      -- markdown pages maintained by Claude
+raw/          -- source documents (immutable -- never modify these)
+wiki/         -- markdown pages maintained by Claude
+wiki/archive/ -- retired pages (moved here by /lint, still linkable)
 wiki/index.md -- table of contents for the entire wiki
 wiki/log.md   -- append-only record of all operations
-templates/ -- page template
+templates/    -- page template
 ```
 
-## Ingest workflow
+## Skills
 
-When the user adds a new source to `raw/` and asks you to ingest it, or
-provides a Confluence/Jira URL or local file to the `/ingest` skill:
+To ingest a source (Confluence, Jira, Slack, a web page or site, a local
+file — or a bare `/ingest` to refresh every tracked source), use `/ingest`.
+To lint or audit the wiki, use `/lint`. To record notes or decisions in the
+diary, use `/log`. Their instructions take precedence over anything here.
 
-1. Read the full source document (or let `/ingest` fetch it)
-2. Summarize key takeaways for the user's awareness (non-blocking — do not
-   wait for approval), then proceed automatically
-3. Create a summary page in `wiki/` named after the source
-4. Create or update concept pages for each major idea or entity
-5. Add wiki-links ([[page-name]]) to connect related pages
-6. Update `wiki/index.md` with new pages and one-line descriptions
-7. Append an entry to `wiki/log.md` with the date, source name, and what
-   changed
-8. Commit and push raw + wiki together — run
-   `ingest.py --commit-only --slug <slug>`, which commits both and pushes when
-   `auto_push` is enabled. Do not use a bare `git commit` (it skips the push).
-
-The full flow runs end-to-end without pausing: fetch → synthesize → commit →
-push. A single source may touch 10-15 wiki pages. That is normal.
+Ingest updates the existing pages a source touches first and creates a new
+page only for a concept no page covers yet. Images are described only when
+image description is enabled, by the session model.
 
 ## Page format
 
@@ -83,7 +78,7 @@ as the first body line so readers are redirected to the latest page:
 ## Citation rules
 
 - Every factual claim should reference its source file
-- Use the format (source: filename.md) after the claim
+- Use the format `(source: raw/<file>)` after the claim
 - If two sources disagree, note the contradiction explicitly
 - If a claim has no source, mark it as needing verification
 
@@ -101,32 +96,6 @@ When the user asks a question:
 
 Good answers should be filed back into the wiki so they compound over time.
 
-## Lint
-
-When the user asks you to lint or audit the wiki, use the `/lint` skill. It
-keeps the knowledge base clean so future reads always surface the latest
-information:
-
-- **Automatic structural cleanup** (no approval): delete empty/stub pages, fix
-  broken `[[links]]`, triage orphans (integrate valuable ones back into the
-  graph, delete duplicates, archive the rest), fix format violations and broken
-  `Sources` paths.
-- **Conflicts + raw deletions verified with the user**: contradictions,
-  outdated facts, and empty non-contributing `raw/` files proposed for deletion
-  are collected into ONE report; the user confirms before they're applied.
-- **Archive retired pages by moving them to `wiki/archive/`**: the page leaves
-  active lint scope but stays in git and linkable (references to it don't
-  break); list it under an `## Archive` section of `index.md`. (The older
-  in-place `Superseded`/`Archived` banner is still supported.)
-- **Prune empty raw sources (gated)**: title-only raw container pages that no
-  wiki page cites may be deleted (with their `.source.json` + any images dir)
-  after the user confirms. `raw/` file contents are never edited; non-empty or
-  cited raws are never deleted.
-- **Logs**: append a `## <date> (lint)` entry to `wiki/log.md`, and update
-  `index.md`.
-- **Commit + push**: grouped commits per category, then push (via
-  `ingest.py --push-only`).
-
 ## Rules
 
 - Never edit the *contents* of anything in the `raw/` folder. Two exceptions,
@@ -137,7 +106,10 @@ information:
     which bulk queries (space / CQL / JQL / sitemap / crawl) this wiki tracks,
     so a bare `/ingest` knows what to re-check. `/ingest` maintains it; don't
     hand-edit it, and don't treat it as a source when answering questions.
-- Always update `wiki/index.md` and `wiki/log.md` after changes
+- Don't hand-edit `wiki/index.md` or `wiki/log.md`: they are maintained by
+  `wiki_tools.py` (`index-sync`, `log`), which the skills run. The `## Diary`
+  section and the day pages belong to `/log`.
 - Keep page names lowercase with hyphens (e.g. `machine-learning.md`)
 - Write in clear, plain language
 - When uncertain about how to categorize something, ask the user
+<!-- llm-wiki:end -->

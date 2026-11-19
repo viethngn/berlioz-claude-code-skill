@@ -17,11 +17,13 @@ Usage:
     python3 bootstrap.py --target ... --no-git       # skip git init
     python3 bootstrap.py --target ... --skip-deps     # skip dep install/verify (CI/air-gapped)
     python3 bootstrap.py --target ... --marketplace /path/to/berlioz-claude-code-skill
+    python3 bootstrap.py --upgrade --target /path/to/wiki  # refresh CLAUDE.md managed block
 """
 
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import shutil
@@ -81,6 +83,71 @@ def render_template(template_path: Path, context: dict) -> str:
     for key, value in context.items():
         text = text.replace("{{ " + key + " }}", str(value))
     return text
+
+
+BEGIN_MARKER = "<!-- llm-wiki:begin -->"
+END_MARKER = "<!-- llm-wiki:end -->"
+# Sections the pre-marker template wrote; --upgrade replaces them with the block.
+OLD_SECTIONS = {
+    "## Folder structure", "## Ingest workflow", "## Page format", "## Citation rules",
+    "## Question answering", "## Lint", "## Rules",
+}
+
+
+def managed_block(context: dict) -> str:
+    """The template CLAUDE.md's marker-to-marker text (markers included)."""
+    text = render_template(TEMPLATE_DIR / "CLAUDE.md", context)
+    return text[text.index(BEGIN_MARKER):text.index(END_MARKER) + len(END_MARKER)]
+
+
+def upgrade_claude_md(text: str, block: str) -> str:
+    """Return `text` with the llm-wiki managed block replaced or inserted."""
+    if BEGIN_MARKER in text:
+        start = text.index(BEGIN_MARKER)
+        end = text.find(END_MARKER, start)
+        if end == -1:
+            raise ValueError(f"{BEGIN_MARKER} has no matching {END_MARKER}")
+        return text[:start] + block + text[end + len(END_MARKER):]
+
+    lines = text.splitlines(keepends=True)
+    kept: list[str] = []
+    insert_at: Optional[int] = None
+    dropping = in_fence = False
+    for line in lines:
+        if line.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+        elif not in_fence and line.startswith("## "):
+            dropping = line.rstrip() in OLD_SECTIONS
+            if dropping and insert_at is None:
+                insert_at = len(kept)
+        if not dropping:
+            kept.append(line)
+
+    if insert_at is None:
+        return text.rstrip("\n") + "\n\n" + block + "\n"
+    kept.insert(insert_at, block + "\n\n")
+    return "".join(kept).rstrip("\n") + "\n"
+
+
+def _upgrade(target: Path, context: dict) -> int:
+    path = target.expanduser().resolve() / "CLAUDE.md"
+    if not path.is_file():
+        print(f"ERROR: {path} not found — is --target a wiki root?", file=sys.stderr)
+        return 1
+    old = path.read_text(encoding="utf-8")
+    try:
+        new = upgrade_claude_md(old, managed_block(context))
+    except ValueError as e:
+        print(f"ERROR: {path}: {e}", file=sys.stderr)
+        return 1
+    if new == old:
+        print("CLAUDE.md already up to date")
+        return 0
+    path.write_text(new, encoding="utf-8")
+    sys.stdout.writelines(difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        "a/CLAUDE.md", "b/CLAUDE.md"))
+    return 0
 
 
 def merge_claude_settings(existing: dict, marketplace: Optional[Path]) -> dict:
@@ -414,9 +481,19 @@ def main() -> int:
         action="store_true",
         help="skip automatic dependency install/verify (CI / air-gapped)",
     )
+    parser.add_argument(
+        "--upgrade",
+        action="store_true",
+        help="rewrite only the llm-wiki managed block of <target>/CLAUDE.md; prints a diff, no commit",
+    )
     args = parser.parse_args()
 
     marketplace = resolve_marketplace(args.marketplace)
+    if args.upgrade:
+        return _upgrade(args.target, {
+            "title": args.title,
+            "marketplace_path": str(marketplace) if marketplace else "REPLACE_ME",
+        })
     summary = _bootstrap(
         target=args.target,
         title=args.title,
