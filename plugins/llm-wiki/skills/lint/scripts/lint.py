@@ -1092,6 +1092,13 @@ def main() -> int:
     wiki_dir = wiki_root / wiki_subdir
     raw_dir = wiki_root / raw_subdir
 
+    claude_md = wiki_root / "CLAUDE.md"
+    if claude_md.is_file() and "<!-- llm-wiki:begin -->" not in (
+        line.strip() for line in claude_md.read_text(encoding="utf-8", errors="replace").splitlines()
+    ):
+        warnings.append("CLAUDE.md has no llm-wiki managed block — "
+                        f"run bootstrap.py --upgrade --target {wiki_root}")
+
     if not wiki_dir.exists():
         print(f"ERROR: wiki dir not found: {wiki_dir}", file=sys.stderr)
         return 1

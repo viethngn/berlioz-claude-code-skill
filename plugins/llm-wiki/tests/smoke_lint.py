@@ -474,6 +474,13 @@ def test_fix_journal_crosswiki_log_traversal(tmp):
     _assert(out.returncode == 2 and "not allowed" in out.stderr, f"--fix with --mark-reviewed: {out.stderr}")
 
 
+def test_claude_md_warning(tmp):
+    root = make_wiki(tmp); (root / "CLAUDE.md").write_text("# W\n\n## Rules\n- old\n")
+    _assert(any("--upgrade" in w for w in run_lint(root)["warnings"]), "warns without managed block")
+    (root / "CLAUDE.md").write_text("# W\n<!-- llm-wiki:begin -->\nx\n<!-- llm-wiki:end -->\n")
+    _assert(not any("--upgrade" in w for w in run_lint(root)["warnings"]), "no warning with block")
+
+
 def main() -> int:
     tests =[v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed = 0
