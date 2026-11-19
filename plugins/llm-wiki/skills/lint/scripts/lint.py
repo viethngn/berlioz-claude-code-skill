@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -1160,6 +1161,29 @@ def scan_raw(raw_dir: Path) -> List[dict]:
     return out
 
 
+def resolve_dirs(
+    wiki_root: Path,
+    wiki_dir_arg: Optional[str] = None,
+    raw_dir_arg: Optional[str] = None,
+    warnings: Optional[List[str]] = None,
+) -> Tuple[Path, Path]:
+    """(wiki_dir, raw_dir): CLI override, else `.wikirc.json` value, else wiki/raw.
+    An unreadable `.wikirc.json` is ignored with a note in `warnings`."""
+    wiki_subdir = wiki_dir_arg or "wiki"
+    raw_subdir = raw_dir_arg or "raw"
+    config_path = wiki_root / ".wikirc.json"
+    if config_path.exists():
+        try:
+            with config_path.open("r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            wiki_subdir = wiki_dir_arg or cfg.get("wiki_dir") or wiki_subdir
+            raw_subdir = raw_dir_arg or cfg.get("raw_dir") or raw_subdir
+        except (json.JSONDecodeError, OSError) as e:
+            if warnings is not None:
+                warnings.append(f"ignored unreadable {config_path.name}: {e}")
+    return wiki_root / wiki_subdir, wiki_root / raw_subdir
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Deterministic wiki linter")
     parser.add_argument("--wiki-root", type=Path, required=True)
@@ -1208,22 +1232,8 @@ def main() -> int:
     warnings: List[str] = []
 
     wiki_root = args.wiki_root.resolve()
-
-    wiki_subdir = args.wiki_dir or "wiki"
-    raw_subdir = args.raw_dir or "raw"
-
-    config_path = wiki_root / ".wikirc.json"
-    if config_path.exists():
-        try:
-            with config_path.open("r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            wiki_subdir = args.wiki_dir or cfg.get("wiki_dir") or wiki_subdir
-            raw_subdir = args.raw_dir or cfg.get("raw_dir") or raw_subdir
-        except (json.JSONDecodeError, OSError) as e:
-            warnings.append(f"ignored unreadable {config_path.name}: {e}")
-
-    wiki_dir = wiki_root / wiki_subdir
-    raw_dir = wiki_root / raw_subdir
+    wiki_dir, raw_dir = resolve_dirs(wiki_root, args.wiki_dir, args.raw_dir, warnings)
+    wiki_subdir = os.path.relpath(wiki_dir, wiki_root)
 
     claude_md = wiki_root / "CLAUDE.md"
     if claude_md.is_file() and "<!-- llm-wiki:begin -->" not in (
