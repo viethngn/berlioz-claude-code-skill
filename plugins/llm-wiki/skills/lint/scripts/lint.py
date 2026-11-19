@@ -3,7 +3,7 @@
 
 Scans wiki/*.md and emits a JSON report of:
     orphans, broken_links, missing_pages, archive_links_without_banner,
-    format_violations, empty_pages, stale_pages, unsourced_claims,
+    format_violations, empty_pages, source_drift, unsourced_claims,
     status_pages, missing_sources, empty_raw, warnings; plus edges /
     inbound_counts (wiki-link graph) with --graph
 
@@ -11,10 +11,10 @@ Scans wiki/*.md and emits a JSON report of:
 check, and their links do not count as inbound links for orphan detection.
 
 Pages carrying `**Status**: Archived` or `**Status**: Superseded by [[...]]`
-are excluded from the orphan and stale checks (intentionally retired).
+are excluded from the orphan check (intentionally retired).
 
 Pages under `wiki/archive/` are the primary archival namespace: they are NOT
-collected as active pages (so they're never re-flagged as orphan/stale), but
+collected as active pages (so they're never re-flagged as orphans), but
 their slugs ARE resolvable link targets so references into the archive don't
 read as broken links.
 
@@ -23,7 +23,7 @@ AND which no wiki page cites — safe-to-prune candidates. The linter only
 REPORTS them; the /lint skill deletes them after user confirmation.
 
 Usage:
-    python3 lint.py --wiki-root PATH [--stale-days DAYS] [--sources] [--graph]
+    python3 lint.py --wiki-root PATH [--sources] [--graph]
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,7 +39,6 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 
 WIKI_LINK_RE = re.compile(r"\[\[([^\]\|]+?)(?:\|[^\]]+)?\]\]")
-DATE_RE = re.compile(r"(20\d{2}-\d{2}-\d{2})")
 H1_RE = re.compile(r"^#\s+.+", re.MULTILINE)
 
 REQUIRED_FIELDS = ("Summary", "Sources", "Last updated")
@@ -58,7 +58,7 @@ STUB_MARKERS = (
     "tbd — mentioned in",
     "tbd - mentioned in",
 )
-# Status values that retire a page from orphan/stale nagging.
+# Status values that retire a page from orphan nagging.
 RETIRED_STATUSES = ("archived", "superseded")
 # Subdirectory under wiki/ holding archived pages. Files here are NOT linted as
 # active pages, but their slugs are valid link targets (references into the
@@ -78,20 +78,6 @@ def wiki_links_in(text: str) -> List[str]:
 def has_field(text: str, name: str) -> bool:
     pattern = rf"^\*\*{re.escape(name)}\*\*\s*:"
     return bool(re.search(pattern, text, re.MULTILINE))
-
-
-def parse_last_updated(text: str) -> Optional[datetime]:
-    m = re.search(r"\*\*Last updated\*\*\s*:\s*(\S+)", text)
-    if not m:
-        return None
-    raw = m.group(1).strip().rstrip(",")
-    md = DATE_RE.search(raw)
-    if not md:
-        return None
-    try:
-        return datetime.strptime(md.group(1), "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
 
 
 def parse_sources(text: str) -> List[str]:
@@ -201,7 +187,7 @@ def find_status_pages(pages: List[dict]) -> List[dict]:
 
 
 def retired_slugs(pages: List[dict]) -> set:
-    """Slugs of pages whose Status retires them from orphan/stale nagging."""
+    """Slugs of pages whose Status retires them from orphan nagging."""
     retired = set()
     for page in pages:
         status, _ = parse_status(page["text"])
@@ -490,62 +476,83 @@ def find_unbannered_archive_links(
     return out
 
 
-def find_stale(
-    pages: List[dict],
-    raw_dir: Path,
-    stale_days: int,
-    retired: Optional[set] = None,
-) -> List[dict]:
-    retired = retired or set()
-    now = datetime.now(timezone.utc)
-    stale: List[dict] = []
-    raw_files: List[dict] = []
-    if raw_dir.exists():
-        for p in raw_dir.iterdir():
-            if p.is_file() and p.suffix.lower() == ".md":
-                raw_files.append(
-                    {
-                        "name": p.name,
-                        "stem": p.stem,
-                        "mtime": datetime.fromtimestamp(
-                            p.stat().st_mtime, tz=timezone.utc
-                        ),
-                    }
-                )
+_COMMIT_CACHE: Dict[Tuple[str, bool], Optional[Tuple[str, int]]] = {}
 
-    for page in pages:
-        text = page["text"]
-        slug = slug_from_path(page["path"])
-        if slug in retired:
-            continue
-        last_updated = parse_last_updated(text)
-        if last_updated is None:
-            continue
-        age_days = (now - last_updated).days
-        if age_days < stale_days:
-            continue
 
-        related_raws: List[str] = []
-        for rf in raw_files:
-            if rf["mtime"] <= last_updated:
-                continue
-            if slug in rf["stem"] or any(
-                token in rf["stem"] for token in slug.split("-") if len(token) > 3
-            ):
-                related_raws.append(rf["name"])
-
-        if not related_raws:
-            continue
-
-        stale.append(
-            {
-                "page": slug,
-                "last_updated": last_updated.date().isoformat(),
-                "age_days": age_days,
-                "newer_raw_files": sorted(related_raws),
-            }
+def _git(wiki_root: Path, *args: str) -> Optional[str]:
+    """stdout of `git -C wiki_root <args>`, or None if git is missing or fails."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(wiki_root), *args], capture_output=True, text=True
         )
-    return stale
+    except OSError:
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def last_commit(
+    wiki_root: Path, rel_path: str, skip_lint: bool = False
+) -> Optional[Tuple[str, int]]:
+    """(sha, committer_unix_time) of the newest commit touching rel_path.
+
+    With skip_lint, commits whose subject starts with `lint:` are ignored, so a
+    lint link-fix never counts as the page catching up with its sources.
+    """
+    key = (rel_path, skip_lint)
+    if key not in _COMMIT_CACHE:
+        found = None
+        log = _git(wiki_root, "log", "--format=%H%x09%ct%x09%s", "--", rel_path) or ""
+        for line in log.splitlines():
+            sha, ct, subject = (line.split("\t", 2) + [""])[:3]
+            if skip_lint and subject.startswith("lint:"):
+                continue
+            found = (sha, int(ct))
+            break
+        _COMMIT_CACHE[key] = found
+    return _COMMIT_CACHE[key]
+
+
+def find_source_drift(
+    pages: List[dict],
+    wiki_root: Path,
+    wiki_subdir: str,
+    raw_dir: Path,
+    warnings: List[str],
+) -> List[dict]:
+    """Pages whose cited raws changed in git after the page's last non-lint commit.
+
+    A cited raw with uncommitted changes (modified or untracked) is always drift.
+    An untracked page is never drifted. No repo / no commits -> [] + warning.
+    """
+    if _git(wiki_root, "rev-parse", "--verify", "-q", "HEAD") is None:
+        warnings.append("source_drift skipped: wiki root is not a git repo with commits")
+        return []
+    # ls-files prints paths relative to wiki_root (git status --porcelain would
+    # print them relative to the repo top, which differs for a nested wiki).
+    dirty = set(
+        (_git(wiki_root, "ls-files", "-m", "-o", "--exclude-standard", "--", raw_dir.name) or "")
+        .splitlines()
+    )
+    out: List[dict] = []
+    for page in pages:
+        slug = slug_from_path(page["path"])
+        page_c = last_commit(wiki_root, f"{wiki_subdir}/{page['path'].name}", skip_lint=True)
+        if page_c is None:
+            continue
+        drifted = []
+        for raw in dict.fromkeys(resolve_source_paths(page["text"], raw_dir)):
+            raw_c = last_commit(wiki_root, raw)
+            uncommitted = raw in dirty
+            if uncommitted or (raw_c and raw_c[0] != page_c[0] and raw_c[1] > page_c[1]):
+                drifted.append({
+                    "raw": raw,
+                    "page_commit": page_c[0],
+                    "raw_commit": raw_c[0] if raw_c else None,
+                    "uncommitted": uncommitted,
+                })
+        if drifted:
+            out.append({"page": slug, "drifted": drifted})
+    return out
 
 
 def find_unsourced(pages: List[dict]) -> List[dict]:
@@ -589,7 +596,6 @@ def scan_raw(raw_dir: Path) -> List[dict]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Deterministic wiki linter")
     parser.add_argument("--wiki-root", type=Path, required=True)
-    parser.add_argument("--stale-days", type=int, default=90)
     parser.add_argument(
         "--sources",
         action="store_true",
@@ -646,7 +652,7 @@ def main() -> int:
     broken, missing = find_broken_links(pages, edges, archived)
     unbannered_archive_links = find_unbannered_archive_links(edges, wiki_dir, archived)
     format_violations = find_format_violations(pages)
-    stale = find_stale(pages, raw_dir, args.stale_days, retired)
+    source_drift = find_source_drift(pages, wiki_root, wiki_subdir, raw_dir, warnings)
     unsourced = find_unsourced(pages)
     empty_pages = find_empty_pages(pages)
     status_pages = find_status_pages(pages)
@@ -666,7 +672,7 @@ def main() -> int:
         "archive_links_without_banner": unbannered_archive_links,
         "format_violations": format_violations,
         "empty_pages": empty_pages,
-        "stale_pages": stale,
+        "source_drift": source_drift,
         "unsourced_claims": unsourced,
         "status_pages": status_pages,
         "missing_sources": missing_sources,

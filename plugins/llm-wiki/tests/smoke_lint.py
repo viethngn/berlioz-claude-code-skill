@@ -11,9 +11,11 @@ Stdlib only.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -113,6 +115,42 @@ def test_bare_source_custom_raw_dir(tmp):
     r = run_lint(root, "--raw-dir", "sources")
     _assert(r["missing_sources"] == [], f"missing_sources: {r['missing_sources']}")
     _assert(r["empty_raw"] == [], f"bare-cited stub in custom raw dir is cited: {r['empty_raw']}")
+
+
+def test_source_drift(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\nlimit is 1000 per minute for everyone here.\n")
+    write_raw(root, "b.md", "# b\n\nother source content that is long enough.\n")
+    write_page(root, "together", "Committed with its raw. " * 4, sources=("raw/b.md",))
+    write_page(root, "drifts", "Cites a. " * 8, sources=("raw/a.md",))
+    commit(root, "ingest: initial")
+    time.sleep(1.1)
+    write_raw(root, "a.md", "# a\n\nlimit is 5000 per minute for everyone here.\n")
+    commit(root, "ingest: a changed")
+    r = run_lint(root)
+    _assert([d["page"] for d in r["source_drift"]] == ["drifts"], f"drift: {r['source_drift']}")
+    _assert(r["source_drift"][0]["drifted"][0]["raw"] == "raw/a.md", "names the raw")
+    _assert("stale_pages" not in r, "stale_pages removed")
+    # a lint: commit touching the page must not clear drift
+    p = root / "wiki/drifts.md"; p.write_text(p.read_text() + "\nlink fix\n")
+    time.sleep(1.1); commit(root, "lint: unlink")
+    _assert([d["page"] for d in run_lint(root)["source_drift"]] == ["drifts"], "lint: commit does not clear drift")
+    # a non-lint commit touching the page clears it
+    p.write_text(p.read_text() + "\nrewritten\n"); time.sleep(1.1); commit(root, "ingest: rewrite")
+    _assert(run_lint(root)["source_drift"] == [], "page commit clears drift")
+
+
+def test_drift_uncommitted_and_no_git(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\noriginal content long enough to count here.\n")
+    write_page(root, "p", "Cites a. " * 8)
+    commit(root, "ingest: initial")
+    write_raw(root, "a.md", "# a\n\nmodified but not committed content here.\n")
+    d = run_lint(root)["source_drift"]
+    _assert(d and d[0]["drifted"][0]["uncommitted"] is True, "modified cited raw is drift")
+    shutil.rmtree(root / ".git")
+    r = run_lint(root)
+    _assert(r["source_drift"] == [] and any("git" in w for w in r["warnings"]), "no git → empty + warning")
 
 
 def main() -> int:
