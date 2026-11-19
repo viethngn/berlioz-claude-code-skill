@@ -113,7 +113,7 @@ def wiki_links_in(text: str) -> List[str]:
 
 
 def is_journal_slug(slug: str) -> bool:
-    return bool(JOURNAL_SLUG_RE.match(slug))
+    return bool(JOURNAL_SLUG_RE.fullmatch(slug))
 
 
 def skip_judgment(slug: str) -> bool:
@@ -123,10 +123,14 @@ def skip_judgment(slug: str) -> bool:
 
 def link_target(raw: str) -> Optional[str]:
     """Resolvable page slug of a wiki-link target: `#anchor` stripped; None for
-    a cross-wiki link (`label/slug`, not `archive/...`) or a pure `[[#anchor]]`."""
+    a cross-wiki link (`label/slug`, not `archive/...`) or a pure `[[#anchor]]`.
+    The `archive` segment matches in any case and is returned lower-case."""
     target = raw.split("#", 1)[0].strip()
-    if "/" in target and target.split("/", 1)[0] != ARCHIVE_SUBDIR:
-        return None
+    if "/" in target:
+        head, rest = target.split("/", 1)
+        if head.lower() != ARCHIVE_SUBDIR:
+            return None
+        target = f"{ARCHIVE_SUBDIR}/{rest}"
     return target or None
 
 

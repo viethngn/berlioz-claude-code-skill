@@ -335,14 +335,27 @@ def test_journal_pages_exempt(tmp):
     write_page(root, "2026-01-index", "- [[2026-01-02]]\n- [[2026-01-03]]\n")
     write_page(root, "only-from-diary", "Linked only from a day page. " * 4)
     p = root / "wiki/2026-01-02.md"; p.write_text(p.read_text() + "\nSee [[only-from-diary]].\n")
+    # A day-page and a control page with the same defects: no Summary/Last
+    # updated, a needs-verification marker, and a cited raw changed later.
+    bare = ("# {}\n\n**Sources**: `raw/b.md`\n\n## 10:00 — Open question\n\n"
+            "Retries may be capped at three (source: needs verification).\n")
+    write_raw(root, "b.md", "# b\n\noriginal source body that is long enough.\n")
+    (root / "wiki/2026-01-04.md").write_text(bare.format("2026-01-04"))
+    (root / "wiki/control.md").write_text(bare.format("control"))
+    commit(root, "ingest: initial")
+    time.sleep(1.1)
+    write_raw(root, "b.md", "# b\n\nchanged source body that is long enough.\n")
+    commit(root, "ingest: b changed")
     r = run_lint(root)
-    journal = {"2026-01-02", "2026-01-03", "2026-01-index"}
+    journal = {"2026-01-02", "2026-01-03", "2026-01-04", "2026-01-index"}
     _assert(not journal & set(r["orphans"]), f"journal not orphans: {r['orphans']}")
     _assert("only-from-diary" not in r["orphans"], "day-page link counts as inbound")
-    _assert(r["fact_collisions"] == [] and r["overlap_candidates"] == [], "journal pages never compared")
-    for key in ("empty_pages", "format_violations", "unsourced_claims"):
+    _assert(not any(journal & set(c["pages"]) for c in r["fact_collisions"] + r["overlap_candidates"]),
+            "journal pages never compared")
+    for key in ("empty_pages", "format_violations", "unsourced_claims", "source_drift"):
         _assert(not any(e["page"] in journal for e in r[key]), f"journal exempt from {key}")
-    _assert(not any(d["page"] in journal for d in r["source_drift"]), "journal exempt from drift")
+    for key in ("format_violations", "unsourced_claims", "source_drift"):
+        _assert(any(e["page"] == "control" for e in r[key]), f"control reported in {key}: {r[key]}")
 
 
 def test_link_resolution(tmp):
@@ -358,6 +371,16 @@ def test_link_resolution(tmp):
     _assert(any(b["from"] == "linker" and b["to"].startswith("ghost") for b in r["broken_links"]), "missing page with anchor is broken")
     _assert(any(b["from"] == "2026-02-01" and b["to"] == "ghost2" for b in r["broken_links"]), "journal links still checked")
     _assert(not any("/" in b["to"] and not b["to"].startswith("archive/") for b in r["broken_links"]), "cross-wiki never broken")
+
+
+def test_archive_link_case_insensitive(tmp):
+    root = make_wiki(tmp)
+    write_page(root, "archive/old", "Old content kept for history.")
+    write_page(root, "user", "See [[Archive/old]] and [[ARCHIVE/old#Part]]. " * 2)
+    r = run_lint(root, "--fix")
+    _assert(not any(b["from"] == "user" for b in r["broken_links"]), f"Archive/ resolves: {r['broken_links']}")
+    _assert("[[Archive/old]]" in (root / "wiki/user.md").read_text(), "--fix keeps Archive/ link")
+    _assert([l["to"] for l in r["archive_links_without_banner"]] == ["archive/old"], f"{r['archive_links_without_banner']}")
 
 
 def test_review_memory(tmp):
