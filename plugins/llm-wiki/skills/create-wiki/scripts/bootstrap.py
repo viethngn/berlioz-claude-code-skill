@@ -26,6 +26,7 @@ import argparse
 import difflib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -100,23 +101,38 @@ def managed_block(context: dict) -> str:
     return text[text.index(BEGIN_MARKER):text.index(END_MARKER) + len(END_MARKER)]
 
 
-def upgrade_claude_md(text: str, block: str) -> str:
-    """Return `text` with the llm-wiki managed block replaced or inserted."""
-    if BEGIN_MARKER in text:
-        start = text.index(BEGIN_MARKER)
-        end = text.find(END_MARKER, start)
-        if end == -1:
-            raise ValueError(f"{BEGIN_MARKER} has no matching {END_MARKER}")
-        return text[:start] + block + text[end + len(END_MARKER):]
+_FENCE_RE = re.compile(r"(`{3,}|~{3,})(.*)$")
+_HEADING_RE = re.compile(r"#{1,2} ")
 
+
+def _upgrade_text(text: str, block: str) -> tuple[str, bool]:
+    """Return (new text, appended) — appended is True when no marker and no
+    known template section was found, so the block went to the end."""
+    crlf = text.count("\r\n")
+    nl = "\r\n" if crlf > text.count("\n") - crlf else "\n"
+    block = block.replace("\n", nl)
     lines = text.splitlines(keepends=True)
+
+    begin = next((i for i, l in enumerate(lines) if l.strip() == BEGIN_MARKER), None)
+    if begin is not None:
+        end = next((i for i in range(begin + 1, len(lines)) if lines[i].strip() == END_MARKER), None)
+        if end is None:
+            raise ValueError(f"{BEGIN_MARKER} has no matching {END_MARKER} line")
+        ending = lines[end][len(lines[end].rstrip("\r\n")):]
+        return "".join(lines[:begin] + [block + ending] + lines[end + 1:]), False
+
     kept: list[str] = []
     insert_at: Optional[int] = None
-    dropping = in_fence = False
+    dropping = False
+    fence: Optional[str] = None  # opening fence string while inside a code block
     for line in lines:
-        if line.lstrip().startswith(("```", "~~~")):
-            in_fence = not in_fence
-        elif not in_fence and line.startswith("## "):
+        m = _FENCE_RE.match(line.strip())
+        if m and fence is None:
+            fence = m.group(1)
+        elif m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
+            fence = None
+        elif fence is None and _HEADING_RE.match(line):
+            # Any # / ## heading ends a dropped section; only known ## ones start one.
             dropping = line.rstrip() in OLD_SECTIONS
             if dropping and insert_at is None:
                 insert_at = len(kept)
@@ -124,9 +140,14 @@ def upgrade_claude_md(text: str, block: str) -> str:
             kept.append(line)
 
     if insert_at is None:
-        return text.rstrip("\n") + "\n\n" + block + "\n"
-    kept.insert(insert_at, block + "\n\n")
-    return "".join(kept).rstrip("\n") + "\n"
+        return text.rstrip("\r\n") + nl + nl + block + nl, True
+    kept.insert(insert_at, block + nl + nl)
+    return "".join(kept).rstrip("\r\n") + nl, False
+
+
+def upgrade_claude_md(text: str, block: str) -> str:
+    """Return `text` with the llm-wiki managed block replaced or inserted."""
+    return _upgrade_text(text, block)[0]
 
 
 def _upgrade(target: Path, context: dict) -> int:
@@ -134,16 +155,21 @@ def _upgrade(target: Path, context: dict) -> int:
     if not path.is_file():
         print(f"ERROR: {path} not found — is --target a wiki root?", file=sys.stderr)
         return 1
-    old = path.read_text(encoding="utf-8")
+    with path.open(encoding="utf-8", newline="") as f:  # keep CRLF as-is
+        old = f.read()
     try:
-        new = upgrade_claude_md(old, managed_block(context))
+        new, appended = _upgrade_text(old, managed_block(context))
     except ValueError as e:
         print(f"ERROR: {path}: {e}", file=sys.stderr)
         return 1
     if new == old:
         print("CLAUDE.md already up to date")
         return 0
-    path.write_text(new, encoding="utf-8")
+    if appended:
+        print("note: no known template sections found — managed block appended at the end; "
+              "check CLAUDE.md for leftover old instructions", file=sys.stderr)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        f.write(new)
     sys.stdout.writelines(difflib.unified_diff(
         old.splitlines(keepends=True), new.splitlines(keepends=True),
         "a/CLAUDE.md", "b/CLAUDE.md"))

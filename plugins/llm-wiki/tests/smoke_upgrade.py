@@ -77,13 +77,62 @@ def test_upgrade_replaces_existing_block(tmp: Path) -> None:
 
 def test_upgrade_no_known_sections(tmp: Path) -> None:
     (tmp / "CLAUDE.md").write_text("# W\n\n## Mine\n\nkeep\n")
-    run_bootstrap("--upgrade", "--target", str(tmp))
+    rc = run_bootstrap("--upgrade", "--target", str(tmp))
     text = (tmp / "CLAUDE.md").read_text()
+    _assert(rc.returncode == 0, rc.stderr)
     _assert(text.startswith("# W\n\n## Mine\n\nkeep\n") and text.rstrip().endswith(END), "block appended")
+    _assert("no known template sections" in rc.stderr, "appended note on stderr")
 
 
 def test_upgrade_missing_file(tmp: Path) -> None:
     _assert(run_bootstrap("--upgrade", "--target", str(tmp)).returncode == 1, "missing CLAUDE.md -> exit 1")
+    _assert(not (tmp / "CLAUDE.md").exists(), "missing CLAUDE.md is not created")
+
+
+def test_upgrade_begin_without_end(tmp: Path) -> None:
+    src = f"# W\n\n{BEGIN}\nhalf a block\n\n## Mine\n\nkeep\n"
+    (tmp / "CLAUDE.md").write_text(src)
+    rc = run_bootstrap("--upgrade", "--target", str(tmp))
+    _assert(rc.returncode == 1 and (tmp / "CLAUDE.md").read_text() == src, "begin without end -> exit 1, unchanged")
+
+
+def test_upgrade_level1_heading_ends_drop(tmp: Path) -> None:
+    tail = "# Appendix\n\nMY TEXT\n\n### Sub\n\nmore\n"
+    (tmp / "CLAUDE.md").write_text("# W\n\n## Rules\n- old\n\n### old sub\n\nold detail\n\n" + tail)
+    rc = run_bootstrap("--upgrade", "--target", str(tmp))
+    text = (tmp / "CLAUDE.md").read_text()
+    _assert(rc.returncode == 0 and text.endswith(END + "\n\n" + tail), "# section after ## Rules kept byte-for-byte")
+    _assert("old detail" not in text and "- old\n" not in text, "### subsection dropped with its section")
+
+
+def test_upgrade_inline_marker_mention(tmp: Path) -> None:
+    above = f"# W\n\nThe plugin owns everything between `{BEGIN}` and `{END}`.\n\n"
+    (tmp / "CLAUDE.md").write_text(above + f"{BEGIN}\nstale\n{END}\n")
+    rc = run_bootstrap("--upgrade", "--target", str(tmp))
+    text = (tmp / "CLAUDE.md").read_text()
+    _assert(rc.returncode == 0 and text.startswith(above + BEGIN + "\n"), "inline mention untouched")
+    _assert("stale" not in text and text.count(BEGIN) == 2, "only the real block replaced")
+
+
+def test_upgrade_crlf(tmp: Path) -> None:
+    user = "# W\r\n\r\n## Purpose\r\n\r\nMine.\r\n\r\n"
+    (tmp / "CLAUDE.md").write_bytes((user + "## Rules\r\n\r\n- old\r\n\r\n## Team\r\n\r\nKeep.\r\n").encode())
+    rc = run_bootstrap("--upgrade", "--target", str(tmp))
+    raw = (tmp / "CLAUDE.md").read_bytes().decode()
+    _assert(rc.returncode == 0 and raw.replace("\r\n", "") .count("\n") == 0, "no bare LF introduced")
+    _assert(raw.startswith(user + BEGIN + "\r\n") and raw.endswith(END + "\r\n\r\n## Team\r\n\r\nKeep.\r\n"),
+            "user lines unchanged")
+    _assert("-# W" not in rc.stdout and "-## Purpose" not in rc.stdout, "diff shows only real changes")
+    rc2 = run_bootstrap("--upgrade", "--target", str(tmp))
+    _assert("already up to date" in rc2.stdout, "CRLF idempotent")
+
+
+def test_upgrade_nested_fence(tmp: Path) -> None:
+    fenced = "````md\n```\n## Rules\nINSIDE\n```\n````\n"
+    (tmp / "CLAUDE.md").write_text("# W\n\n## Mine\n\n" + fenced)
+    rc = run_bootstrap("--upgrade", "--target", str(tmp))
+    text = (tmp / "CLAUDE.md").read_text()
+    _assert(rc.returncode == 0 and text.startswith("# W\n\n## Mine\n\n" + fenced), "nothing inside the outer fence dropped")
 
 
 def test_fresh_bootstrap_has_block(tmp: Path) -> None:
@@ -95,7 +144,9 @@ def test_fresh_bootstrap_has_block(tmp: Path) -> None:
 
 def main() -> int:
     tests = [test_upgrade_old_style, test_upgrade_fenced_heading, test_upgrade_replaces_existing_block,
-             test_upgrade_no_known_sections, test_upgrade_missing_file, test_fresh_bootstrap_has_block]
+             test_upgrade_no_known_sections, test_upgrade_missing_file, test_upgrade_begin_without_end,
+             test_upgrade_level1_heading_ends_drop, test_upgrade_inline_marker_mention, test_upgrade_crlf,
+             test_upgrade_nested_fence, test_fresh_bootstrap_has_block]
     for t in tests:
         with tempfile.TemporaryDirectory() as d:
             t(Path(d))
