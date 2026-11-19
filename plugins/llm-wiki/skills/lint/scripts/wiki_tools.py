@@ -9,7 +9,9 @@ Usage:
 
 `index`, `log`, README and journal pages (`YYYY-MM-DD`, `YYYY-MM-index`, owned
 by the `log` skill) are never located, cited, or added/removed/moved in
-`index.md`; its `## Diary` section is never modified.
+`index.md`; its `## Diary` section is never modified. `index.md` and `log.md`
+are edited without newline translation: added lines use the file's own line
+ending and untouched lines stay byte-identical.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ import re
 import sys
 from datetime import date
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lint import (  # noqa: E402
@@ -94,30 +96,90 @@ def citing(wiki_dir: Path, raw_slug: str, raw_dir: Optional[Path] = None) -> Lis
     )
 
 
-def _insert_in_section(lines: List[str], heading: str, new: List[str], before: Optional[str] = None) -> None:
-    """Append `new` at the end of section `heading`; create it (before `before`, else at the end) if absent."""
-    if heading in lines:
-        end = next((i for i in range(lines.index(heading) + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
-        while lines[end - 1].strip() == "" and end - 1 > lines.index(heading):
-            end -= 1
-        lines[end:end] = new
-        return
-    at = lines.index(before) if before in lines else len(lines)
-    while at > 0 and lines[at - 1].strip() == "":
-        at -= 1
-    block = ["", heading, *new]
-    if at < len(lines):
-        block.append("")
+# ------------------------- line-preserving file edits -------------------------
+
+
+def _read_lines(path: Path, default: str = "") -> Tuple[List[str], str]:
+    """Lines with their own endings (no newline translation) and the file's
+    dominant line ending, used for every added line."""
+    text = default
+    if path.exists():
+        with path.open("r", encoding="utf-8", newline="") as f:
+            text = f.read()
+    crlf = text.count("\r\n")
+    eol = "\r\n" if crlf and crlf >= text.count("\n") - crlf else "\n"
+    return re.findall(r"[^\n]*\n|[^\n]+$", text), eol
+
+
+def _write_lines(path: Path, lines: List[str]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as f:
+        f.write("".join(lines))
+
+
+def _bare(line: str) -> str:
+    return line.rstrip("\r\n")
+
+
+def _blank(line: str) -> bool:
+    return not line.strip()
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _terminate_last(lines: List[str], at: int, eol: str) -> None:
+    """Give the last line an ending before something is inserted after it."""
+    if at == len(lines) and lines and not lines[-1].endswith("\n"):
+        lines[-1] += eol
+
+
+def _insert_block(lines: List[str], at: int, new: List[str], eol: str) -> None:
+    """Insert `new` (bare lines) at `at`, separated from non-blank neighbours by a blank line."""
+    _terminate_last(lines, at, eol)
+    block = [n + eol for n in new]
+    if at > 0 and not _blank(lines[at - 1]):
+        block.insert(0, eol)
+    if at < len(lines) and not _blank(lines[at]):
+        block.append(eol)
     lines[at:at] = block
+
+
+def _section_end(lines: List[str], start: int) -> int:
+    """Index after the last non-blank line of the `## ` section starting at `start`."""
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    while end - 1 > start and _blank(lines[end - 1]):
+        end -= 1
+    return end
+
+
+def _insert_in_section(lines: List[str], heading: str, new: List[str], eol: str,
+                       before: Optional[str] = None) -> None:
+    """Append `new` at the end of section `heading`; create it (before `before`, else at the end) if absent."""
+    bare = [_bare(line).rstrip() for line in lines]
+    if heading in bare:
+        end = _section_end(lines, bare.index(heading))
+        _terminate_last(lines, end, eol)
+        lines[end:end] = [n + eol for n in new]
+        return
+    at = bare.index(before) if before in bare else len(lines)
+    while at > 0 and _blank(lines[at - 1]):
+        at -= 1
+    _insert_block(lines, at, [heading, *new], eol)
+
+
+def _targets(text: str) -> set:
+    return {t for t in map(link_target, (m.group(1) for m in WIKI_LINK_RE.finditer(text))) if t}
 
 
 def index_sync(wiki_dir: Path) -> dict:
     """Add unlisted pages under `## Uncategorized`, drop list lines to deleted
-    pages, and move lines to archived pages under `## Archive`."""
+    pages, and move lines to archived pages under `## Archive`. An entry with
+    nested lines under it is left alone and named on stderr."""
     index_path = wiki_dir / "index.md"
-    original = index_path.read_text(encoding="utf-8") if index_path.exists() else "# Wiki Index\n"
-    lines = original.splitlines()
-    existing = {slug_from_path(p) for p in collect_pages(wiki_dir)}
+    lines, eol = _read_lines(index_path, default="# Wiki Index\n")
+    original = "".join(lines)
+    existing = {slug_from_path(p).lower() for p in collect_pages(wiki_dir)}
     archived = archived_slugs(wiki_dir)
     content = {slug_from_path(p["path"]): p["text"] for p in _content_pages(wiki_dir)}
 
@@ -126,57 +188,86 @@ def index_sync(wiki_dir: Path) -> dict:
     removed: List[str] = []
     moved: List[str] = []
     in_diary = False
-    for line in lines:
+    just_removed = False
+    for i, line in enumerate(lines):
+        if just_removed and _blank(line) and kept and _blank(kept[-1]):
+            continue  # no double blank line where an entry was taken out
+        just_removed = False
         if line.startswith("## "):
-            in_diary = line.strip() == "## Diary"
-        targets = {t for t in map(link_target, (m.group(1) for m in WIKI_LINK_RE.finditer(line))) if t}
+            in_diary = _bare(line).strip() == "## Diary"
+        targets = _targets(line)
         if in_diary or not LIST_LINE_RE.match(line) or len(targets) != 1:
             kept.append(line)
             continue
         target = targets.pop()
-        if target in existing or target.startswith(ARCHIVE_SUBDIR + "/") or is_journal_slug(target):
+        # Case-insensitive: `[[Alpha]]` already lists page `alpha`.
+        if target.lower() in existing or target.startswith(ARCHIVE_SUBDIR + "/") or is_journal_slug(target):
             kept.append(line)
-        elif target in archived:
+            continue
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        if not _blank(nxt) and _indent(nxt) > _indent(line):
+            print(f"index-sync: left [[{target}]] at index.md line {i + 1} untouched: "
+                  "it has nested lines, review it by hand", file=sys.stderr)
+            kept.append(line)
+            continue
+        just_removed = True
+        if target in archived:
             moved.append(target)
             to_archive.append(WIKI_LINK_RE.sub(
                 lambda m: m.group(0).replace("[[", f"[[{ARCHIVE_SUBDIR}/", 1)
                 if link_target(m.group(1)) == target else m.group(0),
-                line,
+                _bare(line),
             ))
         else:
             removed.append(target)
 
-    listed = {t for t in map(link_target, (m.group(1) for m in WIKI_LINK_RE.finditer("\n".join(kept)))) if t}
-    added = sorted(set(content) - listed)
+    listed = {t.lower() for t in _targets("".join(kept))}
+    added = sorted(s for s in content if s.lower() not in listed)
     if added:
         new = [f"- [[{s}]] — {_summary(content[s])}" if _summary(content[s]) else f"- [[{s}]]" for s in added]
-        _insert_in_section(kept, "## Uncategorized", new, before="## Archive")
+        _insert_in_section(kept, "## Uncategorized", new, eol, before="## Archive")
     if to_archive:
-        _insert_in_section(kept, "## Archive", to_archive)
+        _insert_in_section(kept, "## Archive", to_archive, eol)
 
-    text = "\n".join(kept) + "\n"
-    if text != original:
-        index_path.write_text(text, encoding="utf-8")
+    if "".join(kept) != original or not index_path.exists():
+        _write_lines(index_path, kept)
     return {"added": added, "removed": sorted(set(removed)), "archived": sorted(set(moved))}
 
 
+def _one_line(text: str) -> str:
+    return re.sub(r"\s*[\r\n]+\s*", " ", text).strip()
+
+
 def append_log(wiki_dir: Path, op: str, title: str, bullets: List[str], today: Optional[str] = None) -> None:
-    """Insert a dated entry directly under log.md's H1 (newest first)."""
+    """Insert a dated entry as the newest one: before the first `## ` heading
+    after the H1, else after the first `---` line, else at the end. A newest
+    entry with the same day and op gets the new lines appended instead."""
     if op not in LOG_OPS:
         raise ValueError(f"unknown op {op!r}; expected one of {', '.join(LOG_OPS)}")
     day = today or date.today().isoformat()
     header = f"## {day}" if op == "ingest" else f"## {day} ({op})"
+    items = [f"- {_one_line(title)}", *(f"- {_one_line(b)}" for b in bullets)]
     log_path = wiki_dir / "log.md"
-    lines = log_path.read_text(encoding="utf-8").splitlines() if log_path.exists() else []
+    lines, eol = _read_lines(log_path)
     h1 = next((i for i, line in enumerate(lines) if line.startswith("# ")), None)
     if h1 is None:
-        lines.insert(0, "# Wiki Log")
         h1 = 0
-    block = ["", header, f"- {title}", *(f"- {b}" for b in bullets)]
-    if h1 + 1 < len(lines) and lines[h1 + 1].strip():
-        block.append("")
-    lines[h1 + 1:h1 + 1] = block
-    log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if lines and _bare(lines[0]).strip() == "---":  # YAML front matter: H1 goes after it
+            close = next((i for i in range(1, len(lines)) if _bare(lines[i]).strip() == "---"), None)
+            h1 = close + 1 if close is not None else 0
+        _terminate_last(lines, h1, eol)
+        lines.insert(h1, "# Wiki Log" + eol)
+    first = next((i for i in range(h1 + 1, len(lines)) if lines[i].startswith("## ")), None)
+    if first is not None and _bare(lines[first]).rstrip() == header:
+        end = _section_end(lines, first)
+        _terminate_last(lines, end, eol)
+        lines[end:end] = [item + eol for item in items]
+    else:
+        if first is None:
+            rule = next((i for i in range(h1 + 1, len(lines)) if _bare(lines[i]).strip() == "---"), None)
+            first = rule + 1 if rule is not None else len(lines)
+        _insert_block(lines, first, [header, *items], eol)
+    _write_lines(log_path, lines)
 
 
 def main() -> int:
@@ -189,13 +280,16 @@ def main() -> int:
     p = sub.add_parser("citing", parents=[common], help="Pages citing raw/<RAW_SLUG>")
     p.add_argument("raw_slug")
     sub.add_parser("index-sync", parents=[common], help="Sync wiki/index.md with the pages on disk")
-    p = sub.add_parser("log", parents=[common], help="Prepend an entry to wiki/log.md")
+    p = sub.add_parser("log", parents=[common], help="Add an entry to wiki/log.md")
     p.add_argument("--op", choices=LOG_OPS, required=True)
     p.add_argument("--title", required=True)
     p.add_argument("--bullet", action="append", default=[])
     args = parser.parse_args()
 
-    wiki_dir, raw_dir = resolve_dirs(args.wiki_root.resolve())
+    warnings: List[str] = []
+    wiki_dir, raw_dir = resolve_dirs(args.wiki_root.resolve(), warnings=warnings)
+    for w in warnings:
+        print(f"warning: {w}", file=sys.stderr)
     if not wiki_dir.exists():
         print(f"ERROR: wiki dir not found: {wiki_dir}", file=sys.stderr)
         return 1

@@ -23,13 +23,28 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 TOOL = REPO_ROOT / "plugins" / "llm-wiki" / "skills" / "lint" / "scripts" / "wiki_tools.py"
 
 
-def run_tool(root: Path, *args: str):
+LOG_TEMPLATE = REPO_ROOT / "plugins" / "llm-wiki" / "skills" / "create-wiki" / "templates" / "log.md"
+
+
+def run_proc(root: Path, *args: str) -> subprocess.CompletedProcess:
     out = subprocess.run(
         [sys.executable, str(TOOL), args[0], "--wiki-root", str(root), *args[1:]],
         capture_output=True, text=True,
     )
     _assert(out.returncode == 0, f"wiki_tools.py exit {out.returncode}: {out.stderr.strip()}")
-    return json.loads(out.stdout)
+    return out
+
+
+def run_tool(root: Path, *args: str):
+    return json.loads(run_proc(root, *args).stdout)
+
+
+def read_bytes_text(path: Path) -> str:
+    return path.read_bytes().decode("utf-8")
+
+
+def no_bare_lf(text: str) -> bool:
+    return "\n" not in text.replace("\r\n", "")
 
 
 def test_locate_and_citing(tmp):
@@ -107,6 +122,97 @@ def test_log_creates_file(tmp):
     lines = (root / "wiki/log.md").read_text().splitlines()
     _assert(lines[0] == "# Wiki Log" and lines[2].startswith("## 20") and "(" not in lines[2]
             and lines[3] == "- Ingested x", f"new log: {lines}")
+
+
+def test_log_template_shape(tmp):
+    root = make_wiki(tmp)
+    template = LOG_TEMPLATE.read_text(encoding="utf-8")
+    (root / "wiki/log.md").write_text(template)
+    run_tool(root, "log", "--op", "ingest", "--title", "Ingested x")
+    text = (root / "wiki/log.md").read_text()
+    head, _, rest = text.partition("\n---\n")
+    _assert(head == template.partition("\n---\n")[0], f"page header untouched: {head!r}")
+    _assert(rest.startswith("\n## 20") and "- Ingested x\n\n## Wiki created" in rest, f"entry after ---: {rest!r}")
+
+
+def test_log_intro_and_front_matter(tmp):
+    root = make_wiki(tmp)
+    log = root / "wiki/log.md"
+    log.write_text("# Wiki Log\n\nIntro paragraph.\n\n## 2026-01-01\n- old\n")
+    run_tool(root, "log", "--op", "lint", "--title", "t")
+    _assert(log.read_text().startswith("# Wiki Log\n\nIntro paragraph.\n\n## "), f"intro kept: {log.read_text()!r}")
+    log.write_text("---\ntitle: x\n---\n")
+    run_tool(root, "log", "--op", "lint", "--title", "t")
+    lines = log.read_text().splitlines()
+    _assert(lines[:4] == ["---", "title: x", "---", "# Wiki Log"] and lines[5].endswith("(lint)"), f"front matter: {lines}")
+
+
+def test_log_same_day_and_newlines(tmp):
+    root = make_wiki(tmp)
+    (root / "wiki/log.md").write_text("# Wiki Log\n\n## 2026-01-01\n- old\n")
+    run_tool(root, "log", "--op", "lint", "--title", "First", "--bullet", "a")
+    run_tool(root, "log", "--op", "lint", "--title", "Second\nline", "--bullet", "b\r\n  c")
+    text = (root / "wiki/log.md").read_text()
+    _assert(text.count("(lint)") == 1, f"one header per day+op: {text!r}")
+    _assert("(lint)\n- First\n- a\n- Second line\n- b c\n\n## 2026-01-01" in text, f"merged + collapsed: {text!r}")
+
+
+def test_log_crlf(tmp):
+    root = make_wiki(tmp)
+    log = root / "wiki/log.md"
+    original = "# Wiki Log\r\n\r\n## 2026-01-01\r\n- old entry\r\n"
+    log.write_bytes(original.encode())
+    run_tool(root, "log", "--op", "lint", "--title", "t", "--bullet", "b")
+    text = read_bytes_text(log)
+    _assert(no_bare_lf(text), f"no bare LF: {text!r}")
+    _assert(text.startswith("# Wiki Log\r\n\r\n") and text.endswith("## 2026-01-01\r\n- old entry\r\n"), f"crlf: {text!r}")
+
+
+def test_index_sync_crlf(tmp):
+    root = make_wiki(tmp)
+    write_page(root, "alpha", "alpha body text. " * 6, summary="About alpha.")
+    write_page(root, "beta", "beta body text. " * 6, summary="About beta.")
+    index = root / "wiki/index.md"
+    index.write_bytes("# Wiki Index\r\n\r\n## Concepts\r\n- [[alpha]] — kept\r\n- [[gone]] — x\r\n".encode())
+    out = run_tool(root, "index-sync")
+    _assert(out == {"added": ["beta"], "removed": ["gone"], "archived": []}, f"crlf sync: {out}")
+    text = read_bytes_text(index)
+    _assert(no_bare_lf(text), f"no bare LF: {text!r}")
+    _assert(text.startswith("# Wiki Index\r\n\r\n## Concepts\r\n- [[alpha]] — kept\r\n"), f"untouched lines: {text!r}")
+    _assert("## Uncategorized\r\n- [[beta]] — About beta.\r\n" in text, f"added crlf: {text!r}")
+
+
+def test_index_sync_nested_entry(tmp):
+    root = make_wiki(tmp)
+    write_page(root, "alpha", "alpha body text. " * 6)
+    index = root / "wiki/index.md"
+    original = "# Wiki Index\n\n- [[alpha]]\n- [[gone]] parent entry\n  - child note\n"
+    index.write_text(original)
+    proc = run_proc(root, "index-sync")
+    _assert(json.loads(proc.stdout) == {"added": [], "removed": [], "archived": []}, f"nested: {proc.stdout}")
+    _assert(index.read_text() == original, "file unchanged")
+    _assert("[[gone]]" in proc.stderr and "line 4" in proc.stderr, f"stderr note: {proc.stderr!r}")
+
+
+def test_index_sync_case_and_blank_lines(tmp):
+    root = make_wiki(tmp)
+    for s in ("alpha", "a", "b"):
+        write_page(root, s, f"{s} body text. " * 6)
+    index = root / "wiki/index.md"
+    original = "# Wiki Index\n\n- [[Alpha]] capitalised\n- [[a]]\n\n- [[b]]\n"
+    index.write_text(original)
+    _assert(run_tool(root, "index-sync") == {"added": [], "removed": [], "archived": []}, "case-insensitive listed")
+    _assert(index.read_text() == original, "case: file unchanged")
+    index.write_text("# Wiki Index\n\n- [[Alpha]]\n\n\n- [[a]]\n\n- [[gone]]\n\n- [[b]]\n")
+    run_tool(root, "index-sync")
+    _assert(index.read_text() == "# Wiki Index\n\n- [[Alpha]]\n\n\n- [[a]]\n\n- [[b]]\n", f"blank collapse: {index.read_text()!r}")
+
+
+def test_config_warning_on_stderr(tmp):
+    root = make_wiki(tmp)
+    (root / ".wikirc.json").write_text("{not json")
+    proc = run_proc(root, "index-sync")
+    _assert("ignored unreadable .wikirc.json" in proc.stderr, f"warning: {proc.stderr!r}")
 
 
 def main() -> int:
