@@ -32,7 +32,7 @@ from markdownify import markdownify
 
 from config import ConfigError, apply_ssl_env, load_config
 from rate_limiter import RateLimitFailure, get_limiter
-from raw_store import read_previous_source_metadata, write_raw_if_changed
+from raw_store import iso_date, read_previous_source_metadata, write_raw_if_changed
 
 
 ISSUE_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
@@ -338,7 +338,9 @@ def main() -> int:
         "image_hints": hints,
     }
 
-    result = write_raw_if_changed(cfg.raw_dir, filename_slug, markdown, metadata)
+    result = write_raw_if_changed(
+        cfg.raw_dir, filename_slug, markdown, metadata, source_date=iso_date(metadata["updated_at"])
+    )
 
     print(
         json.dumps(

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Smoke test for image handling in ingest.
+"""Smoke test for single-item ingest: synthesis context, source_date, images.
+
+`context` tells the session which wiki pages a source relates to and, for a
+changed source, which pages cite it and the raw diff. `source_date` never
+turns an unchanged source into `changed`.
 
 Images are off by default and no script calls a description endpoint. When
 enabled, `do_image_diff_loop` only reports which images still need a
@@ -7,7 +11,7 @@ description (`pending_images`); the session writes `<stem>.md` and records it
 with `image_manifest.py mark-described`.
 
 Run:
-    ~/.llm-wiki-venv/bin/python3 plugins/llm-wiki/tests/smoke_images.py
+    ~/.llm-wiki-venv/bin/python3 plugins/llm-wiki/tests/smoke_ingest.py
 
 Exits 0 on success, non-zero on failure.
 """
@@ -16,6 +20,8 @@ from __future__ import annotations
 
 import http.server
 import json
+import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -81,6 +87,23 @@ def serve(files: dict) -> tuple[http.server.HTTPServer, str]:
     server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def git(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(root), *args], check=True, capture_output=True, text=True
+    ).stdout
+
+
+def write_page(root: Path, slug: str, body: str, sources=("raw/a.md",), summary="s") -> Path:
+    path = root / "wiki" / f"{slug}.md"
+    src = "\n".join(f"- `{s}`" for s in sources)
+    path.write_text(
+        f"# {slug}\n\n**Summary**: {summary}\n\n**Sources**:\n{src}\n\n"
+        f"**Last updated**: 2026-01-01\n\n---\n\n{body}\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def run_ingest(root: Path, *flags: str) -> dict:
@@ -209,8 +232,93 @@ def test_remote_overwrite_becomes_changed(tmp: Path) -> None:
     print("[OK] remote image overwrite stays pending until mark-described")
 
 
+def test_context_new_and_changed(tmp: Path) -> None:
+    root = make_wiki(tmp)
+    write_page(root, "rate-limits", "The API rate limit is 1000 per minute (source: raw/api-guide.md). " * 2,
+               sources=("raw/api-guide.md",), summary="API rate limits.")
+    src = tmp / "api-guide.md"
+    src.write_text("# API Guide\n\n## Rate limits\n\nThe limit is 1000 per minute.\n")
+    out = run_ingest(root, "--source", str(src), "--no-commit")
+    ctx = out["context"]
+    _assert(ctx["status"] == "new" and ctx["related_pages"][0]["page"] == "rate-limits", f"ctx: {ctx}")
+    _assert(ctx["citing_pages"] == [] and ctx["raw_diff"] == "", "no diff for new source")
+    meta = json.loads((root / "raw/api-guide.source.json").read_text())
+    _assert(re.fullmatch(r"\d{4}-\d{2}-\d{2}", meta["source_date"]), "source_date present")
+    git(root, "add", "-A"); git(root, "commit", "-m", "ingest: api-guide")
+    src.write_text("# API Guide\n\n## Rate limits\n\nThe limit is 5000 per minute.\n")
+    ctx = run_ingest(root, "--source", str(src), "--no-commit")["context"]
+    _assert(ctx["status"] == "changed" and ctx["citing_pages"] == ["rate-limits"], f"changed ctx: {ctx}")
+    _assert("-The limit is 1000" in ctx["raw_diff"] and "+The limit is 5000" in ctx["raw_diff"], "diff shown")
+    _assert(ctx["raw_diff_truncated"] is False, "short diff not truncated")
+    git(root, "add", "-A"); git(root, "commit", "-m", "ingest: api-guide v2")
+    bulk = run_ingest(root, "--context", "--slug", "api-guide")
+    _assert(bulk["status"] == "changed" and "+The limit is 5000" in bulk["raw_diff"], "bulk context from git history")
+    _assert(bulk["citing_pages"] == ["rate-limits"], f"bulk citing: {bulk}")
+    _assert(not (root / ".wiki-state/bulk-jobs").exists(), "--context never creates a queue")
+    # Unchanged single ingest keeps its early return without context.
+    out = run_ingest(root, "--source", str(src), "--no-commit")
+    _assert(out["fetch"]["status"] == "unchanged" and "context" not in out, f"unchanged: {out}")
+    print("[OK] context: related pages, citing pages and raw diff for new / changed / bulk")
+
+
+def test_bulk_context_new_and_unchanged(tmp: Path) -> None:
+    root = make_wiki(tmp)
+    src = tmp / "notes.md"
+    src.write_text("# Notes\n\n## Deploy\n\nDeploy on Fridays never, only on weekdays.\n")
+    run_ingest(root, "--source", str(src), "--no-commit")
+    ctx = run_ingest(root, "--context", "--slug", "notes")
+    _assert(ctx["status"] == "new" and ctx["raw_diff"] == "", f"uncommitted first version: {ctx}")
+    git(root, "add", "-A"); git(root, "commit", "-m", "v1")
+    _assert(run_ingest(root, "--context", "--slug", "notes")["status"] == "new", "one clean commit -> new")
+    src.write_text("# Notes\n\n## Deploy\n\nDeploy on Mondays.\n" + "x" * 9000 + "\n")
+    run_ingest(root, "--source", str(src), "--no-commit")
+    ctx = run_ingest(root, "--context", "--slug", "notes")
+    _assert(ctx["status"] == "changed" and "+Deploy on Mondays." in ctx["raw_diff"], f"dirty: {ctx}")
+    _assert(ctx["raw_diff_truncated"] is True and len(ctx["raw_diff"]) == ingest.RAW_DIFF_MAX_CHARS, "truncated")
+    # A bulk item whose raw_status is unchanged: no diff, citing pages still listed.
+    write_page(root, "deploys", "Deploys happen on weekdays (source: raw/notes.md).", sources=("raw/notes.md",))
+    ctx = ingest.build_context(root, "notes", "unchanged")
+    _assert(ctx["status"] == "unchanged" and ctx["raw_diff"] == "" and ctx["citing_pages"] == ["deploys"], f"{ctx}")
+    print("[OK] bulk context: new / changed from git history, truncation, unchanged items")
+
+
+def test_source_date_never_triggers_changed(tmp: Path) -> None:
+    root = make_wiki(tmp)
+    src = tmp / "guide.md"
+    src.write_text("# Guide\n\nA guide with enough body text to matter here.\n")
+    run_ingest(root, "--source", str(src), "--no-commit")
+    meta_path = root / "raw/guide.source.json"
+    meta = json.loads(meta_path.read_text())
+    del meta["source_date"]  # a wiki ingested before source_date existed
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
+    git(root, "add", "-A"); git(root, "commit", "-m", "pre-change ingest")
+    before = meta_path.read_text()
+    out = run_ingest(root, "--source", str(src), "--no-commit")
+    _assert(out["fetch"]["status"] == "unchanged", f"legacy source.json: {out['fetch']}")
+    _assert(meta_path.read_text() == before, "unchanged source.json left alone")
+    os.utime(src, (1_000_000_000, 1_000_000_000))
+    out = run_ingest(root, "--source", str(src), "--no-commit")
+    _assert(out["fetch"]["status"] == "unchanged" and meta_path.read_text() == before, "touch changes nothing")
+    _assert(git(root, "status", "--porcelain", "--", "raw") == "", "raw/ clean")
+
+    # raw_store level: same content, different / missing source_date -> unchanged.
+    import raw_store
+    raw = root / "raw"
+    first = raw_store.write_raw_if_changed(raw, "x", "# X\n\nbody\n", {"type": "t"}, source_date="2026-01-01")
+    _assert(first["status"] == "new", f"{first}")
+    _assert(raw_store.write_raw_if_changed(raw, "x", "# X\n\nbody\n", {"type": "t"}, source_date="2026-02-02")["status"] == "unchanged", "date differs")
+    _assert(raw_store.write_raw_if_changed(raw, "x", "# X\n\nbody\n", {"type": "t"})["status"] == "unchanged", "date missing")
+    _assert(json.loads((raw / "x.source.json").read_text())["source_date"] == "2026-01-01", "kept first date")
+    _assert(raw_store.write_raw_if_changed(raw, "x", "# X\n\nnew\n", {"type": "t"}, source_date="2026-03-03")["status"] == "changed", "content")
+    _assert(json.loads((raw / "x.source.json").read_text())["source_date"] == "2026-03-03", "date refreshed on change")
+    print("[OK] source_date: legacy source.json and touch stay unchanged")
+
+
 def main() -> int:
     for test in (
+        test_context_new_and_changed,
+        test_bulk_context_new_and_unchanged,
+        test_source_date_never_triggers_changed,
         test_default_off_and_legacy_config,
         test_pending_then_marked,
         test_local_ingest_images_disabled,
@@ -219,7 +327,7 @@ def main() -> int:
     ):
         with tempfile.TemporaryDirectory() as d:
             test(Path(d))
-    print("ALL IMAGE SMOKE TESTS PASSED")
+    print("ALL INGEST SMOKE TESTS PASSED")
     return 0
 
 

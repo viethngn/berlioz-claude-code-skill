@@ -14,6 +14,9 @@ Bulk usage:
     python3 ingest.py --wiki-root PATH --crawl https://example.com --depth 2 --max-pages 100
     python3 ingest.py --wiki-root PATH --resume <job-id>
 
+Synthesis context for one raw source (bulk / refresh synthesis):
+    python3 ingest.py --wiki-root PATH --context --slug S [--job-id J]
+
 Refresh usage (no source at all):
     python3 ingest.py --wiki-root PATH                 # == --refresh-all
     python3 ingest.py --wiki-root PATH --refresh-all --yes
@@ -37,11 +40,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 # The orchestrator is stdlib-only so it doesn't need require([...]).
@@ -52,6 +56,11 @@ from web_url import SITEMAP_URL_RE
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR.parents[1] / "lint" / "scripts"))
+from wiki_tools import citing, locate  # noqa: E402  (stdlib-only, shares lint.py)
+
+RAW_DIFF_MAX_CHARS = 8000
+HEADING_RE = re.compile(r"^#{1,2} +(.+?)\s*#*\s*$", re.MULTILINE)
 JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
 CONFLUENCE_SPACE_URL_RE = re.compile(r"/spaces/([A-Za-z0-9._~-]+)(?:/|$)")
 
@@ -323,6 +332,78 @@ def do_image_diff_loop(wiki_root: Path, slug: str) -> dict:
                 }
             )
     return {"enabled": True, **counts, "pending_images": pending}
+
+
+def _git_lines(wiki_root: Path, *args: str) -> List[str]:
+    """Output lines of a git command, or [] when it fails (e.g. not a repo)."""
+    proc = subprocess.run(
+        ["git", "-C", str(wiki_root), *args], capture_output=True, text=True
+    )
+    return proc.stdout.splitlines() if proc.returncode == 0 else []
+
+
+def raw_commits(wiki_root: Path, raw_md: Path) -> List[str]:
+    """Commits that touched raw/<slug>.md, newest first."""
+    rel = os.path.relpath(raw_md, wiki_root)
+    return _git_lines(wiki_root, "log", "--format=%H", "--", rel)
+
+
+def build_context(wiki_root: Path, slug: str, status: Optional[str] = None) -> dict:
+    """What the session needs to synthesize raw/<slug>.md into existing pages.
+
+    `related_pages`: pages matching the raw file's H1 / `##` headings.
+    For a `changed` source also `citing_pages` (pages citing it) and
+    `raw_diff` (what changed, capped at RAW_DIFF_MAX_CHARS). `status` comes
+    from the fetcher (single ingest); None (bulk) derives it from git history.
+    An `unchanged` status keeps `citing_pages` but has no diff.
+    """
+    cfg = load_config(wiki_root)
+    raw_md = cfg.raw_dir / f"{slug}.md"
+    rel = os.path.relpath(raw_md, wiki_root)
+    text = raw_md.read_text(encoding="utf-8") if raw_md.exists() else ""
+    commits = raw_commits(wiki_root, raw_md)
+    diff = ""
+    if status is None:
+        dirty = bool(_git_lines(wiki_root, "status", "--porcelain", "--", rel))
+        status = "changed" if len(commits) >= 2 or (commits and dirty) else "new"
+        if status == "changed":
+            # Previous version vs current content.
+            diff = "\n".join(_git_lines(wiki_root, "diff", commits[0] if dirty else commits[1], "--", rel))
+    else:
+        if status == "forced":
+            status = "changed" if commits else "new"
+        if status == "changed":
+            diff = "\n".join(_git_lines(wiki_root, "diff", "HEAD", "--", rel))
+    terms = HEADING_RE.findall(text)
+    return {
+        "status": status,
+        "related_pages": locate(cfg.wiki_dir, terms) if terms else [],
+        "citing_pages": citing(cfg.wiki_dir, slug, cfg.raw_dir) if status in {"changed", "unchanged"} else [],
+        "raw_diff": diff[:RAW_DIFF_MAX_CHARS],
+        "raw_diff_truncated": len(diff) > RAW_DIFF_MAX_CHARS,
+    }
+
+
+def _cmd_context(args: argparse.Namespace) -> int:
+    wiki_root = args.wiki_root.resolve()
+    try:
+        load_config(wiki_root)
+    except ConfigError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    status = None
+    if args.job_id:
+        from bulk_queue import load_queue  # stdlib
+
+        try:
+            queue = load_queue(wiki_root, args.job_id)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 1
+        if any(i.slug == args.slug and i.raw_status == "unchanged" for i in queue.items):
+            status = "unchanged"
+    print(json.dumps(build_context(wiki_root, args.slug, status), indent=2, ensure_ascii=False))
+    return 0
 
 
 def _stream_prefetch(
@@ -674,6 +755,8 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
         "fetch": fetch_summary,
         "images": image_summary,
         "committed": None,
+        # Before the commit below, so the diff against HEAD is still visible.
+        "context": build_context(wiki_root, slug, fetch_status),
     }
 
     if do_commit:
@@ -827,7 +910,16 @@ def main() -> int:
         action="store_true",
         help="Only push already-made commits to the remote (gated on auto_push)",
     )
-    parser.add_argument("--slug", help="Slug for --commit-only")
+    parser.add_argument(
+        "--context",
+        action="store_true",
+        help="Print the synthesis context (related / citing pages, raw diff) for --slug",
+    )
+    parser.add_argument(
+        "--job-id",
+        help="With --context: the bulk job, so an item fetched as unchanged reports no diff",
+    )
+    parser.add_argument("--slug", help="Slug for --commit-only / --context")
     parser.add_argument("--message", help="Override commit message")
     parser.add_argument("--new-images", type=int, default=0, help="For --commit-only")
     parser.add_argument("--changed-images", type=int, default=0, help="For --commit-only")
@@ -837,8 +929,8 @@ def main() -> int:
     # Reject before dispatching: --commit-only / --push-only return below, so
     # without this an explicit --refresh-all alongside either would be silently
     # ignored and the user would think a refresh had run.
-    if args.refresh_all and (args.commit_only or args.push_only):
-        parser.error("--refresh-all cannot be combined with --commit-only or --push-only")
+    if args.refresh_all and (args.commit_only or args.push_only or args.context):
+        parser.error("--refresh-all cannot be combined with --commit-only, --push-only or --context")
 
     # An empty --source means a caller's variable was empty, not "refresh
     # everything". Falling through to refresh-all here would turn a typo into a
@@ -851,6 +943,12 @@ def main() -> int:
 
     if args.push_only:
         return _cmd_push_only(args)
+
+    # Before the no-source fallback below, which would start a refresh-all.
+    if args.context:
+        if not args.slug:
+            parser.error("--slug is required with --context")
+        return _cmd_context(args)
 
     if args.commit_only:
         if not args.slug:

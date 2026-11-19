@@ -482,7 +482,8 @@ class _VersionedConfluenceHandler(http.server.BaseHTTPRequestHandler):
                     "title": page["title"],
                     "version": {"number": page.get("version", 1)},
                     "space": {"key": "FOO"},
-                    "body": {"storage": {"value": f"<p>{page['body']}</p>"}},
+                    # Padded past EMPTY_BODY_CHARS so new items are not dropped as empty.
+                    "body": {"storage": {"value": f"<p>{page['body']}</p><p>Filler text long enough to be a real body.</p>"}},
                 },
             )
             return

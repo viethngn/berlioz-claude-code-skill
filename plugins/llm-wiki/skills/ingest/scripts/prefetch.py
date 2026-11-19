@@ -155,6 +155,23 @@ def _diff_images(wiki_root: Path, slug: str) -> dict:
     return do_image_diff_loop(wiki_root, slug)
 
 
+def _is_empty_new_source(wiki_root: Path, fetch_status: str, raw_md: Optional[str]) -> bool:
+    """A brand-new source (never committed) whose raw body is effectively empty.
+
+    A known source that becomes empty is not this: it keeps its files and is
+    synthesized like any other changed source.
+    """
+    from ingest import raw_commits  # also puts lint/scripts on sys.path
+    from lint import EMPTY_BODY_CHARS, body_after_h1
+
+    if fetch_status != "new" or not raw_md or not Path(raw_md).exists():
+        return False
+    body = body_after_h1(Path(raw_md).read_text(encoding="utf-8"))
+    if len("".join(body.split())) >= EMPTY_BODY_CHARS:
+        return False
+    return not raw_commits(wiki_root, Path(raw_md))
+
+
 def _prefetch_one(
     queue: Queue, item, wiki_root: Path, do_images: bool, force: bool = False
 ) -> dict:
@@ -203,6 +220,17 @@ def _prefetch_one(
     # does the same) would refetch, see "unchanged", and restore
     # wiki_status="done" for a page whose wiki side was never touched.
     item.prior_wiki_status = None
+
+    raw_md = fetch_result.get("raw_md")
+    if _is_empty_new_source(wiki_root, fetch_status, raw_md):
+        # Nothing to synthesize: drop the just-written raw files. raw_status
+        # stays "done" so the item never trips the circuit breaker.
+        Path(raw_md).unlink()
+        Path(raw_md).with_suffix(".source.json").unlink(missing_ok=True)
+        item.raw_status = "done"
+        item.wiki_status = "skipped"
+        item.last_error = "empty body"
+        return {"ref": item.ref, "status": "skipped", "slug": slug, "reason": "empty body"}
 
     # Download image_hints (Confluence / Jira attachments, web images)
     source_json = fetch_result.get("source_json")

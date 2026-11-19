@@ -4,8 +4,8 @@ Every fetcher (Confluence/Jira/local) hands `write_raw_if_changed` the
 rendered Markdown plus the git-tracked metadata block. This module:
 
 1. Byte-compares the new Markdown against the on-disk `raw/<slug>.md`.
-2. If unchanged AND the tracked metadata block (minus volatile fields)
-   is byte-identical → does nothing, returns status="unchanged".
+2. If unchanged AND the tracked metadata block (minus `UNCOMPARED_FIELDS`)
+   is identical → does nothing, returns status="unchanged".
 3. Otherwise → writes both files, returns status="new" or "changed".
 
 The tracked metadata block MUST NOT contain wall-clock timestamps like
@@ -36,13 +36,32 @@ def _canonical_json(obj: dict) -> str:
     return json.dumps(obj, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
 
 
+# Written to source.json but never compared: adding source_date (or a touch
+# of a local file) must not turn an otherwise-unchanged source into "changed".
+UNCOMPARED_FIELDS = ("source_date",)
+
+
+def _compared(src_text: str) -> str:
+    try:
+        data = json.loads(src_text)
+    except ValueError:
+        return src_text
+    if not isinstance(data, dict):
+        return src_text
+    return _canonical_json({k: v for k, v in data.items() if k not in UNCOMPARED_FIELDS})
+
+
 def write_raw_if_changed(
     raw_dir: Path,
     slug: str,
     markdown: str,
     metadata: dict,
+    source_date: Optional[str] = None,
 ) -> dict:
     """Write raw/<slug>.md and raw/<slug>.source.json only if they differ.
+
+    `source_date` (YYYY-MM-DD, when the source last changed upstream) is
+    stored in source.json when given, but ignored by the comparison.
 
     Returns a dict with:
         status: "new" | "changed" | "unchanged"
@@ -65,6 +84,8 @@ def write_raw_if_changed(
     content_sha = _sha256_text(md_normalized)
 
     metadata_with_hash = {**metadata, "content_sha256": content_sha}
+    if source_date:
+        metadata_with_hash["source_date"] = source_date
     src_normalized = _canonical_json(metadata_with_hash)
 
     existing_md = md_path.read_text(encoding="utf-8") if md_path.exists() else None
@@ -72,7 +93,7 @@ def write_raw_if_changed(
 
     if existing_md is None or existing_src is None:
         status = "new"
-    elif existing_md == md_normalized and existing_src == src_normalized:
+    elif existing_md == md_normalized and _compared(existing_src) == _compared(src_normalized):
         status = "unchanged"
     else:
         status = "changed"
@@ -87,6 +108,14 @@ def write_raw_if_changed(
         "source_json": str(src_path),
         "content_sha256": content_sha,
     }
+
+
+def iso_date(value: Optional[str]) -> Optional[str]:
+    """`YYYY-MM-DD` from an ISO-8601 timestamp string, or None."""
+    value = (value or "").strip()
+    if len(value) >= 10 and value[4] == "-" and value[7] == "-" and value[:4].isdigit():
+        return value[:10]
+    return None
 
 
 def read_previous_content_sha(raw_dir: Path, slug: str) -> Optional[str]:

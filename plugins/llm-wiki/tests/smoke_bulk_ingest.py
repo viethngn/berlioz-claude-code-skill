@@ -134,9 +134,10 @@ class MockConfluenceHandler(http.server.BaseHTTPRequestHandler):
                     "space": {"key": "FOO"},
                     "body": {
                         "storage": {
-                            "value": (
+                            "value": page.get("html")
+                            or (
                                 f"<p>{page['body']}</p>"
-                                "<p>Some more content for hashing.</p>"
+                                "<p>Some more content for hashing, long enough to count as a real body.</p>"
                             )
                         }
                     },
@@ -305,12 +306,20 @@ def test_discover_and_prefetch(pages: dict, wiki_root: Path, port: int) -> str:
     )
     _assert(counts["failed"] == 0, f"unexpected failures after resume: {q}")
 
-    # Every page should have a raw/<slug>.md
+    # Every page should have a raw/<slug>.md — except a new page that renders
+    # empty, which is dropped instead of queued for synthesis.
     for item in q["items"]:
         slug = item["slug"]
         _assert(slug, f"item {item['ref']} has no slug")
         md_path = wiki_root / "raw" / f"{slug}.md"
-        _assert(md_path.exists(), f"raw file missing: {md_path}")
+        if pages[item["ref"]].get("html"):
+            _assert(item["raw_status"] == "done" and item["wiki_status"] == "skipped", f"empty item: {item}")
+            _assert(item["last_error"] == "empty body", f"empty item: {item}")
+            _assert(not md_path.exists(), f"empty item's raw file kept: {md_path}")
+            _assert(not md_path.with_suffix(".source.json").exists(), "empty item's source.json kept")
+        else:
+            _assert(item["wiki_status"] == "pending", f"non-empty item: {item}")
+            _assert(md_path.exists(), f"raw file missing: {md_path}")
 
     # Confirm the rate limiter retried at least once for each page (server
     # returned 429 on hit #1, 200 on hit #2)
@@ -593,6 +602,11 @@ def test_rerun_is_resume_and_replace_is_refresh() -> None:
             _assert(st["10001"] == ("unchanged", "done"), f"unchanged keeps wiki status: {st}")
             _assert(st["10003"] == ("unchanged", "done"), f"unchanged keeps wiki status: {st}")
             _assert(_only_job(wiki) == job, "--replace reuses the job id")
+            slug = {i["ref"]: i["slug"] for i in _queue(wiki, job)["items"]}["10001"]
+            r = _ingest(wiki, "--context", "--slug", slug, "--job-id", job)
+            _assert(r.returncode == 0, f"--context failed: {r.stderr}")
+            ctx = json.loads(r.stdout)
+            _assert(ctx["status"] == "unchanged" and ctx["raw_diff"] == "", f"unchanged item context: {ctx}")
             _mark_wiki_done(wiki, job, "10002")
 
             # 10004 is still unsynthesized. A refresh with nothing new must not forget it.
@@ -634,6 +648,8 @@ def main() -> int:
         "10002": {"title": "Runbook: Alerts", "body": "alerts steps"},
         "10003": {"title": "Team Handbook", "body": "team handbook"},
         "10004": {"title": "Release Process", "body": "release notes"},
+        # Non-empty HTML (so the fetcher does not error) that renders to nothing.
+        "10005": {"title": "Empty Shell", "html": '<ac:structured-macro ac:name="toc"></ac:structured-macro><p> </p>'},
     }
     srv, port = _start_server(pages)
     try:

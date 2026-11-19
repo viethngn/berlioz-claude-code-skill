@@ -26,6 +26,7 @@ import re
 import shutil
 import sys
 import zipfile
+from datetime import date
 from pathlib import Path
 from typing import Optional
 
@@ -578,7 +579,11 @@ def main() -> int:
         "image_hints": image_hints,
     }
 
-    result = write_raw_if_changed(raw_dir, slug, markdown.strip() + "\n", metadata)
+    # The original's mtime at copy time: when this file last changed.
+    source_date = date.fromtimestamp(source.stat().st_mtime).isoformat()
+    result = write_raw_if_changed(
+        raw_dir, slug, markdown.strip() + "\n", metadata, source_date=source_date
+    )
 
     print(
         json.dumps(
