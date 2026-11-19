@@ -4,7 +4,11 @@
 Scans wiki/*.md and emits a JSON report of:
     orphans, broken_links, missing_pages, archive_links_without_banner,
     format_violations, empty_pages, stale_pages, unsourced_claims,
-    status_pages, missing_sources, empty_raw, edges (wiki-link graph)
+    status_pages, missing_sources, empty_raw, warnings; plus edges /
+    inbound_counts (wiki-link graph) with --graph
+
+`index`, `log` and README pages (EXEMPT_PAGES) are skipped by every per-page
+check, and their links do not count as inbound links for orphan detection.
 
 Pages carrying `**Status**: Archived` or `**Status**: Superseded by [[...]]`
 are excluded from the orphan and stale checks (intentionally retired).
@@ -19,7 +23,7 @@ AND which no wiki page cites — safe-to-prune candidates. The linter only
 REPORTS them; the /lint skill deletes them after user confirmation.
 
 Usage:
-    python3 lint.py --wiki-root PATH [--stale-days DAYS] [--sources]
+    python3 lint.py --wiki-root PATH [--stale-days DAYS] [--sources] [--graph]
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ DATE_RE = re.compile(r"(20\d{2}-\d{2}-\d{2})")
 H1_RE = re.compile(r"^#\s+.+", re.MULTILINE)
 
 REQUIRED_FIELDS = ("Summary", "Sources", "Last updated")
-EXEMPT_ORPHANS = {"index", "log", "README", "readme"}
+EXEMPT_PAGES = {"index", "log", "README", "readme"}
 NEEDS_VERIFICATION_RE = re.compile(r"\(?source:\s*needs verification\)?", re.IGNORECASE)
 # A raw/ path token inside a Sources entry — stops at backtick, comma, quote,
 # whitespace, or closing bracket/paren so multi-path lines split correctly.
@@ -170,7 +174,10 @@ def build_edges(pages: List[dict]) -> Dict[str, List[str]]:
 
 def inbound_counts(edges: Dict[str, List[str]]) -> Dict[str, int]:
     counts: Dict[str, int] = {}
-    for _, targets in edges.items():
+    for src, targets in edges.items():
+        # Hub pages link everything; a link from them doesn't de-orphan a page.
+        if src in EXEMPT_PAGES:
+            continue
         for t in targets:
             counts[t] = counts.get(t, 0) + 1
     return counts
@@ -210,7 +217,7 @@ def find_orphans(
     orphans = []
     for page in pages:
         slug = slug_from_path(page["path"])
-        if slug in EXEMPT_ORPHANS or slug in retired:
+        if slug in EXEMPT_PAGES or slug in retired:
             continue
         if inbound.get(slug, 0) == 0:
             orphans.append(slug)
@@ -246,6 +253,8 @@ def find_broken_links(
 def find_format_violations(pages: List[dict]) -> List[dict]:
     violations: List[dict] = []
     for page in pages:
+        if slug_from_path(page["path"]) in EXEMPT_PAGES:
+            continue
         text = page["text"]
         missing = []
         if not H1_RE.search(text):
@@ -265,7 +274,7 @@ def find_empty_pages(pages: List[dict]) -> List[dict]:
     empty: List[dict] = []
     for page in pages:
         slug = slug_from_path(page["path"])
-        if slug in EXEMPT_ORPHANS:
+        if slug in EXEMPT_PAGES:
             continue
         body = page_body(page["text"])
         lowered = body.lower()
@@ -282,6 +291,41 @@ def find_empty_pages(pages: List[dict]) -> List[dict]:
     return empty
 
 
+def is_traversal(path: str) -> bool:
+    """True when a path has a `..` segment (would escape raw/)."""
+    return ".." in Path(path.strip()).parts
+
+
+def traversal_source_paths(text: str) -> List[str]:
+    """Return the Sources `raw/...` tokens that contain a `..` segment."""
+    return [
+        t.strip()
+        for entry in parse_sources(text)
+        for t in PATH_TOKEN_RE.findall(entry)
+        if is_traversal(t)
+    ]
+
+
+def resolve_source_paths(text: str, raw_dir: Path) -> List[str]:
+    """Return the `raw/...` paths cited in a page's Sources block.
+
+    Explicit `raw/...` tokens are kept as-is, except ones with a `..` segment,
+    which are dropped (see `traversal_source_paths`). A bare filename (`api-guide.md`)
+    resolves to `raw/<name>` only when that file exists in raw_dir; other bare
+    words are dropped.
+    """
+    out: List[str] = []
+    for entry in parse_sources(text):
+        out.extend(
+            t.strip() for t in PATH_TOKEN_RE.findall(entry) if not is_traversal(t)
+        )
+        for piece in re.split(r"[\s,]+", entry):
+            name = piece.strip("`'\"()[]")
+            if name and "/" not in name and (raw_dir / name).is_file():
+                out.append(f"raw/{name}")
+    return out
+
+
 def find_missing_sources(pages: List[dict], raw_dir: Path) -> List[dict]:
     """Flag Sources entries pointing at raw/ paths that don't exist on disk.
 
@@ -292,21 +336,11 @@ def find_missing_sources(pages: List[dict], raw_dir: Path) -> List[dict]:
     wiki_root = raw_dir.parent
     out: List[dict] = []
     for page in pages:
-        missing: List[str] = []
-        for entry in parse_sources(page["text"]):
-            for candidate in PATH_TOKEN_RE.findall(entry):
-                candidate = candidate.strip()
-                # Only check entries that look like a raw/ path.
-                if not candidate.startswith("raw/"):
-                    continue
-                if ".." in Path(candidate).parts:
-                    # Never resolve a traversal attempt against the real
-                    # filesystem — treat it as an invalid Sources entry
-                    # rather than a read-oracle for paths outside raw/.
-                    missing.append(candidate)
-                    continue
-                if not (wiki_root / candidate).exists():
-                    missing.append(candidate)
+        # Traversal entries are reported, never resolved against the filesystem.
+        missing = traversal_source_paths(page["text"]) + [
+            c for c in resolve_source_paths(page["text"], raw_dir)
+            if not (wiki_root / c).exists()
+        ]
         if missing:
             out.append(
                 {"page": slug_from_path(page["path"]), "missing": sorted(set(missing))}
@@ -314,13 +348,14 @@ def find_missing_sources(pages: List[dict], raw_dir: Path) -> List[dict]:
     return out
 
 
-def cited_raw_slugs(pages: List[dict]) -> set:
+def cited_raw_slugs(pages: List[dict], raw_dir: Path) -> set:
     """Return the set of raw slugs that ANY wiki page depends on.
 
     A raw file is "cited" if `raw/<slug>.md` (or an image under
     `raw/images/<slug>/`) is referenced anywhere in a page's text — the Sources
     block, an inline image link, or prose. We scan the whole page text (not just
-    Sources) so inline references also protect a raw from pruning.
+    Sources) so inline references also protect a raw from pruning; bare
+    filenames in the Sources block count too (via `resolve_source_paths`).
 
     Tokens are matched exactly and normalized to the slug: `raw/foo.md` →
     `foo`, `raw/images/foo/0.png` → `foo`. Exact-token extraction avoids
@@ -328,9 +363,11 @@ def cited_raw_slugs(pages: List[dict]) -> set:
     """
     cited: set = set()
     for page in pages:
-        for token in PATH_TOKEN_RE.findall(page["text"]):
+        tokens = PATH_TOKEN_RE.findall(page["text"])
+        tokens += resolve_source_paths(page["text"], raw_dir)
+        for token in tokens:
             token = token.strip()
-            if not token.startswith("raw/"):
+            if not token.startswith("raw/") or is_traversal(token):
                 continue
             rest = token[len("raw/"):]
             if rest.startswith("images/"):
@@ -512,6 +549,8 @@ def find_stale(
 def find_unsourced(pages: List[dict]) -> List[dict]:
     unsourced: List[dict] = []
     for page in pages:
+        if slug_from_path(page["path"]) in EXEMPT_PAGES:
+            continue
         text = page["text"]
         sources = parse_sources(text)
         needs_marker_count = len(NEEDS_VERIFICATION_RE.findall(text))
@@ -564,7 +603,13 @@ def main() -> int:
         default=None,
         help="Override raw subdir name (defaults to 'raw' or .wikirc.json value)",
     )
+    parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="Include the wiki-link graph (edges, inbound_counts) in the report",
+    )
     args = parser.parse_args()
+    warnings: List[str] = []
 
     wiki_root = args.wiki_root.resolve()
 
@@ -578,8 +623,8 @@ def main() -> int:
                 cfg = json.load(f)
             wiki_subdir = args.wiki_dir or cfg.get("wiki_dir") or wiki_subdir
             raw_subdir = args.raw_dir or cfg.get("raw_dir") or raw_subdir
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            warnings.append(f"ignored unreadable {config_path.name}: {e}")
 
     wiki_dir = wiki_root / wiki_subdir
     raw_dir = wiki_root / raw_subdir
@@ -604,7 +649,7 @@ def main() -> int:
     empty_pages = find_empty_pages(pages)
     status_pages = find_status_pages(pages)
     missing_sources = find_missing_sources(pages, raw_dir)
-    cited = cited_raw_slugs(pages)
+    cited = cited_raw_slugs(pages, raw_dir)
     empty_raw = find_empty_raw(raw_dir, cited)
 
     report = {
@@ -613,8 +658,6 @@ def main() -> int:
         "raw_dir": str(raw_dir),
         "page_count": len(pages),
         "archived_count": len(archived),
-        "edges": edges,
-        "inbound_counts": inbound,
         "orphans": orphans,
         "broken_links": broken,
         "missing_pages": dict(sorted(missing.items())),
@@ -626,7 +669,12 @@ def main() -> int:
         "status_pages": status_pages,
         "missing_sources": missing_sources,
         "empty_raw": empty_raw,
+        "warnings": warnings,
     }
+
+    if args.graph:
+        report["edges"] = edges
+        report["inbound_counts"] = inbound
 
     if args.sources:
         report["raw_sources"] = scan_raw(raw_dir)
