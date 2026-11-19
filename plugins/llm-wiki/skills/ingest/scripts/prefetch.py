@@ -147,7 +147,7 @@ def _fetch_one(queue: Queue, item, wiki_root: Path, force: bool = False) -> dict
     raise ValueError(f"unknown source kind: {source_kind}")
 
 
-def _describe_changed_images(wiki_root: Path, slug: str) -> dict:
+def _diff_images(wiki_root: Path, slug: str) -> dict:
     """Run ingest.py's image diff loop for one slug (lists pending images)."""
     # Import lazily so this module stays cheap for `queue_admin.py list`.
     from ingest import do_image_diff_loop  # noqa: WPS433
@@ -227,7 +227,7 @@ def _prefetch_one(
     # Run image-diff loop (count new/changed images still to describe)
     if do_images:
         try:
-            image_summary = _describe_changed_images(wiki_root, slug)
+            image_summary = _diff_images(wiki_root, slug)
         except Exception as e:  # noqa: BLE001
             item.raw_status = "failed"
             item.last_error = f"image diff failed: {e}"[:500]

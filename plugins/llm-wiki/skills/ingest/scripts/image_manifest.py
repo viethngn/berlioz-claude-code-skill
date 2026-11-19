@@ -195,6 +195,10 @@ def _cmd_mark_described(args: argparse.Namespace) -> int:
     manifest = load_manifest(raw_dir, args.slug)
     d = slug_dir(raw_dir, args.slug)
     for name in args.images:
+        # Names only: a path would read files and record entries outside the slug dir.
+        if "/" in name or "\\" in name or ".." in name:
+            print(f"ERROR: not a plain image name: {name!r}", file=sys.stderr)
+            return 1
         image_path = d / name
         description = d / f"{Path(name).stem}.md"
         if not image_path.is_file():

@@ -630,22 +630,23 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
 
     source_json = fetch_summary.get("source_json")
 
+    images_enabled = (args.describe_images or cfg.describe_images) and not args.skip_images
+
     # Diff gate: if the source is unchanged and we're not forcing, skip all
-    # downstream work (image download, image diff, git commit).
+    # downstream work (image download, git commit). The read-only image diff
+    # still runs so images left pending by an earlier run are listed again.
     if fetch_status == "unchanged" and not args.force:
-        image_summary = {"enabled": False}
+        image_summary = do_image_diff_loop(wiki_root, slug) if images_enabled else {"enabled": False}
         write_fetch_history(wiki_root, slug, "unchanged", args.source)
         result = {
             "source_type": source_type,
             "fetch": fetch_summary,
             "images": image_summary,
             "committed": None,
-            "note": "content unchanged since last ingest — skipped image download, image diff, and commit. Pass --force to re-run everything.",
+            "note": "content unchanged since last ingest — skipped image download and commit. Pass --force to re-run everything.",
         }
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
-
-    images_enabled = (args.describe_images or cfg.describe_images) and not args.skip_images
 
     # For Confluence/Jira/web, download image_hints before running the diff loop.
     if images_enabled and source_type in {"confluence", "jira", "web"} and source_json:

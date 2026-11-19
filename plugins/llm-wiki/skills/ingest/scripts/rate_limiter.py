@@ -1,6 +1,6 @@
 """Rate-limited HTTP helper for llm-wiki fetchers.
 
-Every fetcher/extractor/describer HTTP call goes through this module. It gives:
+Every fetcher/extractor HTTP call goes through this module. It gives:
 
 - A token-bucket limiter (sustained rps, burst) shared across a run
 - Automatic retries on 429/503 that respect the Retry-After header

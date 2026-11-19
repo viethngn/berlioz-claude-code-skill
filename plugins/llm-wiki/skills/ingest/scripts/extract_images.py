@@ -265,9 +265,11 @@ def main() -> int:
                 )
                 continue
             dest.write_bytes(payload)
+            # Keep the old sha: the manifest sha is the one that was described,
+            # so the new bytes classify as `changed` until mark-described runs.
             manifest.set_entry(
                 by_url,
-                sha256=sha,
+                sha256=existing_sha or sha,
                 description_file=existing_entry.get("description_file"),
                 source_url=url,
             )
