@@ -66,13 +66,40 @@ def commit(root: Path, msg: str) -> None:
     subprocess.run(["git", "commit", "-q", "-m", msg], cwd=root, check=True)
 
 
-def run_lint(root: Path, *args: str) -> dict:
+def run_lint(root: Path, *args: str, stdin: str = None) -> dict:
     out = subprocess.run(
         [sys.executable, str(LINT), "--wiki-root", str(root), *args],
-        capture_output=True, text=True,
+        capture_output=True, text=True, input=stdin,
     )
     _assert(out.returncode == 0, f"lint.py exit {out.returncode}: {out.stderr.strip()}")
     return json.loads(out.stdout)
+
+
+def collision_fixture(tmp: Path) -> Path:
+    """Two rate-limit pages that collide on 1000 vs 5000, plus an unrelated page; committed."""
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
+    write_page(root, "rate-limits", "The API rate limit is 1000 requests per minute for all tenants (source: raw/a.md). "
+               "Tenants are isolated by key. Bursts are smoothed over ten seconds windows always.")
+    write_page(root, "api-rate-limit", "The API rate limit is 5000 requests per minute for all tenants (source: raw/a.md). "
+               "Tenants are isolated by key. Bursts are smoothed over ten seconds windows always.")
+    write_page(root, "unrelated", "Onboarding takes three steps and ends with a welcome email being sent.", sources=("raw/a.md",))
+    commit(root, "ingest: initial")
+    return root
+
+
+def drift_fixture(tmp: Path) -> Path:
+    """Page `drifts` cites raw/a.md, which changed in a later commit; `together` does not drift."""
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\nlimit is 1000 per minute for everyone here.\n")
+    write_raw(root, "b.md", "# b\n\nother source content that is long enough.\n")
+    write_page(root, "together", "Committed with its raw. " * 4, sources=("raw/b.md",))
+    write_page(root, "drifts", "Cites a. " * 8, sources=("raw/a.md",))
+    commit(root, "ingest: initial")
+    time.sleep(1.1)
+    write_raw(root, "a.md", "# a\n\nlimit is 5000 per minute for everyone here.\n")
+    commit(root, "ingest: a changed")
+    return root
 
 
 # ------------------------------- Tests --------------------------------------
@@ -118,15 +145,7 @@ def test_bare_source_custom_raw_dir(tmp):
 
 
 def test_source_drift(tmp):
-    root = make_wiki(tmp)
-    write_raw(root, "a.md", "# a\n\nlimit is 1000 per minute for everyone here.\n")
-    write_raw(root, "b.md", "# b\n\nother source content that is long enough.\n")
-    write_page(root, "together", "Committed with its raw. " * 4, sources=("raw/b.md",))
-    write_page(root, "drifts", "Cites a. " * 8, sources=("raw/a.md",))
-    commit(root, "ingest: initial")
-    time.sleep(1.1)
-    write_raw(root, "a.md", "# a\n\nlimit is 5000 per minute for everyone here.\n")
-    commit(root, "ingest: a changed")
+    root = drift_fixture(tmp)
     r = run_lint(root)
     _assert([d["page"] for d in r["source_drift"]] == ["drifts"], f"drift: {r['source_drift']}")
     _assert(r["source_drift"][0]["drifted"][0]["raw"] == "raw/a.md", "names the raw")
@@ -174,13 +193,7 @@ def test_drift_untracked_and_retired(tmp):
 
 
 def test_fact_collision_and_overlap(tmp):
-    root = make_wiki(tmp)
-    write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
-    write_page(root, "rate-limits", "The API rate limit is 1000 requests per minute for all tenants (source: raw/a.md). "
-               "Tenants are isolated by key. Bursts are smoothed over ten seconds windows always.")
-    write_page(root, "api-rate-limit", "The API rate limit is 5000 requests per minute for all tenants (source: raw/a.md). "
-               "Tenants are isolated by key. Bursts are smoothed over ten seconds windows always.")
-    write_page(root, "unrelated", "Onboarding takes three steps and ends with a welcome email being sent.", sources=("raw/a.md",))
+    root = collision_fixture(tmp)
     r = run_lint(root)
     fc = r["fact_collisions"]
     _assert(len(fc) == 1 and fc[0]["pages"] == ["api-rate-limit", "rate-limits"], f"collision: {fc}")
@@ -347,8 +360,59 @@ def test_link_resolution(tmp):
     _assert(not any("/" in b["to"] and not b["to"].startswith("archive/") for b in r["broken_links"]), "cross-wiki never broken")
 
 
+def test_review_memory(tmp):
+    root = collision_fixture(tmp)
+    pair = ["api-rate-limit", "rate-limits"]
+    sents = run_lint(root)["fact_collisions"][0]["sentences"]
+    out = run_lint(root, "--mark-reviewed", stdin=json.dumps({
+        "pairs": [{"pages": pair, "verdict": "fine"}],
+        "collisions": [{"pages": pair, "sentences": sents, "verdict": "rejected"}]}))
+    _assert(out == {"recorded": 2, "pruned": 0}, f"mark: {out}")
+    r = run_lint(root)
+    _assert(r["fact_collisions"] == [] and r["overlap_candidates"] == [], "reviewed items suppressed")
+    _assert(r["suppressed"] == {"pairs": 1, "collisions": 1, "drift": 0}, f"suppressed: {r['suppressed']}")
+    p = root / "wiki/rate-limits.md"; p.write_text(p.read_text().replace("1000", "1200"))
+    r = run_lint(root)
+    _assert(len(r["fact_collisions"]) == 1 and len(r["overlap_candidates"]) == 1, "page change invalidates entries")
+    (root / "wiki/api-rate-limit.md").unlink()
+    out = run_lint(root, "--mark-reviewed", stdin="{}")
+    _assert(out["pruned"] == 2, "entries for deleted pages pruned")
+
+
+def test_drift_ack(tmp):
+    root = drift_fixture(tmp)
+    run_lint(root, "--mark-reviewed", stdin=json.dumps({"drift": [{"page": "drifts", "raw": "raw/a.md"}]}))
+    _assert(run_lint(root)["source_drift"] == [], "acknowledged drift suppressed")
+    write_raw(root, "a.md", "# a\n\nlimit is 9000 per minute for everyone here.\n"); time.sleep(1.1); commit(root, "ingest: again")
+    _assert(len(run_lint(root)["source_drift"]) == 1, "new raw content re-opens drift")
+
+
+def test_since_last_lint(tmp):
+    root = collision_fixture(tmp)
+    _assert(len(run_lint(root, "--since-last-lint")["fact_collisions"]) == 1, "no lint commit → full")
+    (root / "wiki/log.md").write_text("# Log\n"); time.sleep(1.1); commit(root, "lint: baseline")
+    _assert(run_lint(root, "--since-last-lint")["fact_collisions"] == [], "nothing changed since lint")
+    _assert(len(run_lint(root)["fact_collisions"]) == 1, "--full default still reports")
+    p = root / "wiki/rate-limits.md"; p.write_text(p.read_text() + "\nedit\n")
+    _assert(len(run_lint(root, "--since-last-lint")["fact_collisions"]) == 1, "changed page re-enters scope")
+
+
+def test_collision_template_does_not_crowd_out(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
+    for i in range(12):
+        write_page(root, f"build{i:02d}", f"Build number is {i + 1}.")
+    write_page(root, "sla-one", "SLA is 99.9% uptime.")
+    write_page(root, "sla-two", "SLA: 99.95% uptime.")
+    r = run_lint(root)
+    fc = r["fact_collisions"]
+    _assert(any(c["pages"] == ["sla-one", "sla-two"] for c in fc), f"SLA collision reported: {len(fc)} entries")
+    _assert(len(fc) == 50 and all("kind" not in c for c in fc), f"cap filled, no internal keys: {len(fc)}")
+    _assert("fact_collisions: showing 50 of 67 found (exact: 66, fuzzy: 1)" in r["warnings"], f"warning: {r['warnings']}")
+
+
 def main() -> int:
-    tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
+    tests =[v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed = 0
     for t in tests:
         with tempfile.TemporaryDirectory() as td:
