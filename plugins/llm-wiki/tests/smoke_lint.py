@@ -481,8 +481,122 @@ def test_claude_md_warning(tmp):
     _assert(not any("--upgrade" in w for w in run_lint(root)["warnings"]), "no warning with block")
 
 
+def test_malformed_review_memory(tmp):
+    root = collision_fixture(tmp)
+    bad = {"pairs": [{"pages": ["a", "b"]}, "x"],
+           "collisions": [{"pages": [["a"], "b"], "hash": "h"}],
+           "drift": [{"page": "x"}]}
+    (root / "wiki/.lint-reviewed.json").write_text(json.dumps(bad))
+    r = run_lint(root)  # asserts exit 0
+    _assert(len(r["fact_collisions"]) == 1 and r["suppressed"] == {"pairs": 0, "collisions": 0, "drift": 0},
+            f"bad entries suppress nothing: {r['suppressed']}")
+    _assert(sum("ignored 4 malformed" in w for w in r["warnings"]) == 1, f"one warning: {r['warnings']}")
+    out = run_lint(root, "--mark-reviewed", stdin=json.dumps({"pairs": [{"pages": ["api-rate-limit", "rate-limits"], "verdict": "fine"}]}))
+    _assert(out == {"recorded": 1, "pruned": 0}, f"mark over bad file: {out}")
+    kept = json.loads((root / "wiki/.lint-reviewed.json").read_text())
+    _assert(kept["collisions"] == [] and kept["drift"] == [] and len(kept["pairs"]) == 1,
+            f"bad entries dropped on rewrite: {kept}")
+
+
+def test_mark_reviewed_rejects_noop_entries(tmp):
+    root = collision_fixture(tmp)
+    sents = run_lint(root)["fact_collisions"][0]["sentences"]
+    for payload in ({"pairs": [{"pages": ["rate-limits", "rate-limits"], "verdict": "fine"}]},
+                    {"pairs": [{"pages": "rate-limits", "verdict": "fine"}]},
+                    {"pairs": [{"pages": ["rate-limits", 3], "verdict": "fine"}]},
+                    {"collisions": [{"pages": ["api-rate-limit", "unrelated"], "sentences": sents, "verdict": "fine"}]},
+                    {"collisions": [{"pages": ["api-rate-limit", "rate-limits"], "sentences": [sents[0], "made up 7."],
+                                     "verdict": "fine"}]}):
+        out = subprocess.run([sys.executable, str(LINT), "--wiki-root", str(root), "--mark-reviewed"],
+                             input=json.dumps(payload), capture_output=True, text=True)
+        _assert(out.returncode == 1 and "ERROR" in out.stderr, f"rejected {payload}: {out.returncode} {out.stderr}")
+        _assert(not (root / "wiki/.lint-reviewed.json").exists(), f"nothing written for {payload}")
+
+
+def test_since_last_lint_non_ascii(tmp):
+    root = make_wiki(tmp)
+    write_page(root, "料金", "The API rate limit is 1000 requests per minute.", sources=("raw/x.md",))
+    write_page(root, "zz", "The API rate limit is 5000 requests per minute.", sources=("raw/y.md",))
+    commit(root, "ingest: initial")
+    (root / "wiki/log.md").write_text("# Log\n"); time.sleep(1.1); commit(root, "lint: baseline")
+    _assert(run_lint(root, "--since-last-lint")["fact_collisions"] == [], "nothing changed")
+    p = root / "wiki/料金.md"; p.write_text(p.read_text() + "\nedit\n")
+    fc = run_lint(root, "--since-last-lint")["fact_collisions"]
+    _assert(len(fc) == 1 and "料金" in fc[0]["pages"], f"non-ASCII changed page in scope: {fc}")
+
+
+def test_drift_non_ascii_raw(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "料金.md", "# a\n\noriginal content long enough to count here.\n")
+    write_page(root, "modified", "Cites it. " * 8, sources=("raw/料金.md",))
+    write_page(root, "untracked", "Cites new. " * 8, sources=("raw/新規.md",))
+    commit(root, "ingest: initial")
+    write_raw(root, "料金.md", "# a\n\nchanged content long enough to count here.\n")
+    write_raw(root, "新規.md", "# n\n\nuntracked content long enough to count here.\n")
+    d = {e["page"]: e["drifted"][0] for e in run_lint(root)["source_drift"]}
+    _assert(set(d) == {"modified", "untracked"} and all(x["uncommitted"] for x in d.values()),
+            f"non-ASCII dirty raws are drift: {d}")
+
+
+def test_since_last_lint_scan_budget(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
+    for i in range(46):  # C(46, 2) = 1035 exact hits > the 1000-hit scan budget
+        write_page(root, f"build{i:02d}", f"Build number is {i + 1}.")
+    commit(root, "ingest: initial")
+    (root / "wiki/log.md").write_text("# Log\n"); time.sleep(1.1); commit(root, "lint: baseline")
+    p = root / "wiki/build45.md"; p.write_text(p.read_text() + "\nedit\n")
+    full = run_lint(root)
+    _assert(any("at least" in w and "truncated" in w for w in full["warnings"]), f"full warns: {full['warnings']}")
+    r = run_lint(root, "--since-last-lint")
+    fc = r["fact_collisions"]
+    _assert(len(fc) == 45 and all("build45" in c["pages"] for c in fc), f"all 45 in-scope found: {len(fc)} {r['warnings']}")
+
+
+def test_collision_exact_cap_binds(tmp):
+    root = make_wiki(tmp)
+    for i in range(12):
+        write_page(root, f"build{i:02d}", f"Build number is {i + 1}.")
+    words = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet "
+             "kilo lima mike november oscar papa quebec romeo sierra tango").split()
+    for i, w in enumerate(words):  # 20 fuzzy hits, one per pair sharing its own raw
+        write_page(root, f"q{i:02d}a", f"The {w} queue limit is 10 jobs.", sources=(f"raw/q{i}.md",))
+        write_page(root, f"q{i:02d}b", f"The {w} queue limit: 20 jobs.", sources=(f"raw/q{i}.md",))
+    r = run_lint(root)
+    fc = r["fact_collisions"]
+    n_exact = sum(c["pages"][0].startswith("build") for c in fc)
+    _assert(len(fc) == 50 and n_exact == 35, f"35 exact slots: {n_exact} of {len(fc)}; {r['warnings']}")
+    _assert(any("exact: 66" in w for w in r["warnings"]), f"warning: {r['warnings']}")
+
+
+def test_collision_exact_fewest_pages_first(tmp):
+    root = make_wiki(tmp)
+    for i in range(3):  # "retry" sorts before "timeout", but its group spans more pages
+        write_page(root, f"retry{i}", f"Retry count is {i + 1}.", sources=(f"raw/r{i}.md",))
+    write_page(root, "timeout-a", "Timeout is 30 s.", sources=("raw/t1.md",))
+    write_page(root, "timeout-b", "Timeout is 60 s.", sources=("raw/t2.md",))
+    fc = run_lint(root)["fact_collisions"]
+    _assert(len(fc) == 4 and fc[0]["pages"] == ["timeout-a", "timeout-b"], f"fewest pages first: {fc}")
+
+
+def test_drift_ack_one_of_two(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\noriginal a content long enough to count.\n")
+    write_raw(root, "b.md", "# b\n\noriginal b content long enough to count.\n")
+    write_page(root, "both", "Cites two. " * 8, sources=("raw/a.md", "raw/b.md"))
+    commit(root, "ingest: initial"); time.sleep(1.1)
+    write_raw(root, "a.md", "# a\n\nchanged a content long enough to count.\n")
+    write_raw(root, "b.md", "# b\n\nchanged b content long enough to count.\n")
+    commit(root, "ingest: both changed")
+    run_lint(root, "--mark-reviewed", stdin=json.dumps({"drift": [{"page": "both", "raw": "raw/a.md"}]}))
+    r = run_lint(root)
+    _assert([[x["raw"] for x in d["drifted"]] for d in r["source_drift"]] == [["raw/b.md"]],
+            f"unacknowledged raw stays: {r['source_drift']}")
+    _assert(r["suppressed"]["drift"] == 1, f"suppressed: {r['suppressed']}")
+
+
 def main() -> int:
-    tests =[v for k, v in globals().items() if k.startswith("test_") and callable(v)]
+    tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed = 0
     for t in tests:
         with tempfile.TemporaryDirectory() as td:

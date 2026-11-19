@@ -54,7 +54,7 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from itertools import combinations
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 
 # Overlap / fact-collision tuning. Score = weighted sum of components in [0, 1];
@@ -555,6 +555,12 @@ def _git(wiki_root: Path, *args: str) -> Optional[str]:
     return out.stdout if out.returncode == 0 else None
 
 
+def _git_paths(wiki_root: Path, *args: str) -> set:
+    """Paths printed by a path-listing git command, read with -z so non-ASCII
+    names are not C-quoted; empty set if git fails."""
+    return set(filter(None, (_git(wiki_root, args[0], "-z", *args[1:]) or "").split("\0")))
+
+
 def last_commit(
     wiki_root: Path, rel_path: str, skip_lint: bool = False
 ) -> Optional[Tuple[str, int]]:
@@ -596,10 +602,7 @@ def find_source_drift(
         return []
     # ls-files prints paths relative to wiki_root (git status --porcelain would
     # print them relative to the repo top, which differs for a nested wiki).
-    dirty = set(
-        (_git(wiki_root, "ls-files", "-m", "-o", "--exclude-standard", "--", raw_dir.name) or "")
-        .splitlines()
-    )
+    dirty = _git_paths(wiki_root, "ls-files", "-m", "-o", "--exclude-standard", "--", raw_dir.name)
     out: List[dict] = []
     for page in pages:
         slug = slug_from_path(page["path"])
@@ -781,6 +784,7 @@ def find_fact_collisions(
     pages: Iterable[dict] = (),
     stop_after: int = COLLISION_SCAN_LIMIT,
     stats: Optional[dict] = None,
+    accept: Optional[Callable[[str, str, str, str], bool]] = None,
 ) -> List[dict]:
     """Prose sentences that agree once numbers are removed but whose numbers differ.
 
@@ -791,7 +795,8 @@ def find_fact_collisions(
     pages is least likely a real contradiction), then fuzzy hits; de-duplicated.
     Each entry carries `kind` ("exact" | "fuzzy"). Each pass stops after
     `stop_after` hits of its own; a `stats` dict, if given, gets
-    `truncated = True` when either pass stopped.
+    `truncated = True` when either pass stopped. `accept(pa, pb, sa, sb)`, if
+    given, drops a hit before it counts against the budget (scope, review memory).
     """
     found: List[dict] = []
     seen = set()
@@ -802,8 +807,9 @@ def find_fact_collisions(
         key = (pa, pb, sa, sb)
         if key not in seen:
             seen.add(key)
-            found.append({"pages": [pa, pb], "sentences": [sa, sb],
-                          "differing": _differing(ka, kb), "kind": kind})
+            if accept is None or accept(*key):
+                found.append({"pages": [pa, pb], "sentences": [sa, sb],
+                              "differing": _differing(ka, kb), "kind": kind})
 
     exact: Dict[str, Dict[Tuple[str, Tuple[str, ...]], str]] = {}
     for page in active_pages(list(pages)):
@@ -875,14 +881,32 @@ def _review_key(kind: str, entry: dict) -> tuple:
     return tuple(entry["pages"])
 
 
-def load_reviewed(wiki_dir: Path) -> dict:
+def _two_strings(pages: object) -> bool:
+    return (isinstance(pages, list) and len(pages) == 2
+            and all(isinstance(p, str) for p in pages) and pages[0] != pages[1])
+
+
+def _valid_entry(kind: str, e: object) -> bool:
+    if not isinstance(e, dict):
+        return False
+    if kind == "drift":
+        return all(isinstance(e.get(f), str) for f in ("page", "raw", "hash"))
+    return _two_strings(e.get("pages")) and all(isinstance(e.get(f), str) for f in ("hash", "verdict"))
+
+
+def load_reviewed(wiki_dir: Path, warnings: Optional[List[str]] = None) -> dict:
     """The review memory `wiki/.lint-reviewed.json`; empty lists when absent.
-    Raises ValueError on a malformed file."""
+    Malformed entries are dropped (one warning with the count). Raises
+    ValueError on a malformed file."""
     path = wiki_dir / REVIEWED_FILE
     data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     if not isinstance(data, dict) or not all(isinstance(data.get(k, []), list) for k in REVIEW_KINDS):
         raise ValueError(f"{REVIEWED_FILE} is not an object of lists")
-    return {k: data.get(k, []) for k in REVIEW_KINDS}
+    out = {k: [e for e in data.get(k, []) if _valid_entry(k, e)] for k in REVIEW_KINDS}
+    bad = sum(len(data.get(k, [])) - len(out[k]) for k in REVIEW_KINDS)
+    if bad and warnings is not None:
+        warnings.append(f"{REVIEWED_FILE}: ignored {bad} malformed entr{'y' if bad == 1 else 'ies'}")
+    return out
 
 
 def mark_reviewed(wiki_dir: Path, raw_dir: Path, payload: dict) -> dict:
@@ -906,22 +930,35 @@ def mark_reviewed(wiki_dir: Path, raw_dir: Path, payload: dict) -> dict:
             raise ValueError(f"verdict must be one of {VERDICTS}: {item['verdict']!r}")
         return item["verdict"]
 
+    def pages_of(item: dict) -> List[str]:
+        if not _two_strings(item["pages"]):
+            raise ValueError(f"pages must be two different page slugs: {item['pages']!r}")
+        return sorted(item["pages"])
+
+    def prose(slug: str) -> set:
+        return set(prose_sentences(page_body(text(slug))))
+
     if not isinstance(payload, dict):
         raise ValueError("payload must be a JSON object")
     new: Dict[str, List[dict]] = {k: [] for k in REVIEW_KINDS}
     try:
         for item in payload.get("pairs", []):
-            a, b = sorted(item["pages"])
+            a, b = pages_of(item)
             new["pairs"].append({"pages": [a, b], "hash": pair_hash(text(a), text(b)),
                                  "verdict": verdict(item)})
         for item in payload.get("collisions", []):
-            a, b = sorted(item["pages"])
-            text(a)
-            text(b)
+            a, b = pages_of(item)
+            if not _two_strings(item["sentences"]):
+                raise ValueError(f"sentences must be two different strings: {item['sentences']!r}")
             s1, s2 = item["sentences"]
+            pa, pb = prose(a), prose(b)
+            if not ((s1 in pa and s2 in pb) or (s1 in pb and s2 in pa)):
+                raise ValueError(f"sentences do not occur in pages {a} and {b}")
             new["collisions"].append({"pages": [a, b], "hash": collision_hash(s1, s2),
                                       "verdict": verdict(item)})
         for item in payload.get("drift", []):
+            if not isinstance(item["raw"], str):
+                raise ValueError(f"raw must be a path string: {item['raw']!r}")
             text(item["page"])
             new["drift"].append({"page": item["page"], "raw": item["raw"],
                                  "hash": _sha(raw_bytes(item["raw"]))})
@@ -1005,9 +1042,8 @@ def changed_since_last_lint(wiki_root: Path) -> Optional[set]:
     if base is None:
         return None
     # Diffing against the work tree covers base..HEAD plus staged/unstaged edits.
-    diff = _git(wiki_root, "diff", "--name-only", "--relative", base) or ""
-    untracked = _git(wiki_root, "ls-files", "-o", "--exclude-standard") or ""
-    return set(diff.splitlines()) | set(untracked.splitlines())
+    return (_git_paths(wiki_root, "diff", "--name-only", "--relative", base)
+            | _git_paths(wiki_root, "ls-files", "-o", "--exclude-standard"))
 
 
 def scan_raw(raw_dir: Path) -> List[dict]:
@@ -1134,58 +1170,65 @@ def main() -> int:
     cited = cited_raw_slugs(pages, raw_dir)
     empty_raw = find_empty_raw(raw_dir, cited)
     pairs = related_pairs(pages, raw_dir, warnings)
-    overlap = find_overlap(pairs, raw_dir, None)
-    scan: dict = {}
-    collisions = find_fact_collisions(pairs, pages, stats=scan)
 
-    # Scope and review memory apply before the caps, so dropped items free report slots.
+    # Scope and review memory apply before the caps, and inside the collision
+    # scan before its budget, so dropped items never take report slots.
     changed = changed_since_last_lint(wiki_root) if args.since_last_lint else None
     if args.since_last_lint and changed is None:
         warnings.append("--since-last-lint: no `lint:` commit found; checked the full wiki")
     texts = {slug_from_path(p["path"]): p["text"] for p in pages}
+
+    def touched(slug: str) -> bool:
+        return changed is None or f"{wiki_subdir}/{slug}.md" in changed
+
     if changed is not None:
-        def touched(slug: str) -> bool:
-            return f"{wiki_subdir}/{slug}.md" in changed
-        overlap = [c for c in overlap if any(map(touched, c["pages"]))]
-        collisions = [c for c in collisions if any(map(touched, c["pages"]))]
+        pairs = [(a, b) for a, b in pairs
+                 if touched(slug_from_path(a["path"])) or touched(slug_from_path(b["path"]))]
         source_drift = [d for d in source_drift if touched(d["page"])
                         or changed & set(resolve_source_paths(texts[d["page"]], raw_dir))]
 
     try:
-        reviewed = load_reviewed(wiki_dir)
+        reviewed = load_reviewed(wiki_dir, warnings)
     except (ValueError, OSError) as e:
         warnings.append(f"ignored unreadable {REVIEWED_FILE}: {e}")
         reviewed = {k: [] for k in REVIEW_KINDS}
+    seen_pairs = {(tuple(e["pages"]), e["hash"]) for e in reviewed["pairs"]}
+    seen_collisions = {(tuple(e["pages"]), e["hash"]) for e in reviewed["collisions"]}
+    acked = {(e["page"], e["raw"]): e["hash"] for e in reviewed["drift"]}
     suppressed = {k: 0 for k in REVIEW_KINDS}
-    if any(reviewed.values()):
-        seen_pairs = {(tuple(e["pages"]), e["hash"]) for e in reviewed["pairs"]}
-        seen_collisions = {(tuple(e["pages"]), e["hash"]) for e in reviewed["collisions"]}
-        acked = {(e["page"], e["raw"]): e["hash"] for e in reviewed["drift"]}
 
-        def pair_reviewed(c: dict) -> bool:
-            a, b = c["pages"]
-            return (tuple(c["pages"]), pair_hash(texts[a], texts[b])) in seen_pairs
-
-        def collision_reviewed(c: dict) -> bool:
-            return (tuple(c["pages"]), collision_hash(*c["sentences"])) in seen_collisions
-
-        def drift_acked(page: str, raw: str) -> bool:
-            path = wiki_root / raw
-            return (page, raw) in acked and path.is_file() and acked[(page, raw)] == _sha(path.read_bytes())
-
-        kept = [c for c in overlap if not pair_reviewed(c)]
-        suppressed["pairs"], overlap = len(overlap) - len(kept), kept
-        kept = [c for c in collisions if not collision_reviewed(c)]
-        suppressed["collisions"], collisions = len(collisions) - len(kept), kept
-        kept_drift = []
-        for d in source_drift:
-            raws = [r for r in d["drifted"] if not drift_acked(d["page"], r["raw"])]
-            suppressed["drift"] += len(d["drifted"]) - len(raws)
-            if raws:
-                kept_drift.append({**d, "drifted": raws})
-        source_drift = kept_drift
-
+    overlap = []
+    for c in find_overlap(pairs, raw_dir, None):
+        a, b = c["pages"]
+        if seen_pairs and ((a, b), pair_hash(texts[a], texts[b])) in seen_pairs:
+            suppressed["pairs"] += 1
+        else:
+            overlap.append(c)
     overlap = overlap[:args.max_candidates]
+
+    def accept_collision(pa: str, pb: str, sa: str, sb: str) -> bool:
+        if not (touched(pa) or touched(pb)):
+            return False
+        if seen_collisions and ((pa, pb), collision_hash(sa, sb)) in seen_collisions:
+            suppressed["collisions"] += 1
+            return False
+        return True
+
+    scan: dict = {}
+    collisions = find_fact_collisions(pairs, pages, stats=scan, accept=accept_collision)
+
+    def drift_acked(page: str, raw: str) -> bool:
+        path = wiki_root / raw
+        return (page, raw) in acked and path.is_file() and acked[(page, raw)] == _sha(path.read_bytes())
+
+    kept_drift = []
+    for d in source_drift:
+        raws = [r for r in d["drifted"] if not drift_acked(d["page"], r["raw"])]
+        suppressed["drift"] += len(d["drifted"]) - len(raws)
+        if raws:
+            kept_drift.append({**d, "drifted": raws})
+    source_drift = kept_drift
+
     exact = [c for c in collisions if c["kind"] == "exact"]
     fuzzy = [c for c in collisions if c["kind"] == "fuzzy"]
     for c in collisions:
@@ -1193,11 +1236,13 @@ def main() -> int:
     # Exact hits get at most MAX_EXACT_COLLISIONS slots while fuzzy hits exist;
     # slots either kind leaves unused go to the other.
     n_exact = min(len(exact), max(MAX_EXACT_COLLISIONS, MAX_COLLISIONS - len(fuzzy)))
-    if len(collisions) > MAX_COLLISIONS:
+    shown = exact[:n_exact] + fuzzy[:MAX_COLLISIONS - n_exact]
+    if scan["truncated"] or len(collisions) > MAX_COLLISIONS:
         total = f"at least {len(collisions)}" if scan["truncated"] else len(collisions)
-        warnings.append(f"fact_collisions: showing {MAX_COLLISIONS} of {total} found "
-                        f"(exact: {len(exact)}, fuzzy: {len(fuzzy)})")
-    collisions = exact[:n_exact] + fuzzy[:MAX_COLLISIONS - n_exact]
+        warnings.append(f"fact_collisions: showing {len(shown)} of {total} found "
+                        f"(exact: {len(exact)}, fuzzy: {len(fuzzy)})"
+                        + ("; collision scan truncated, more may exist" if scan["truncated"] else ""))
+    collisions = shown
 
     report = {
         "wiki_root": str(wiki_root),
