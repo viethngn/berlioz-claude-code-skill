@@ -35,15 +35,8 @@
     "max_retries": 5,
     "retry_base_delay_seconds": 2
   },
-  "nano_banana": {
-    "base_url": "https://your-nano-banana-endpoint.example.com/v1/",
-    "api_key": "REPLACE_ME",
-    "vision_model": "gemini-3-pro",
-    "verify_ssl": true,
-    "rate_limit_rps": 1,
-    "burst": 2,
-    "max_retries": 3,
-    "retry_base_delay_seconds": 2
+  "images": {
+    "describe": false
   },
   "slack": {
     "token": "xoxp-REPLACE_ME",

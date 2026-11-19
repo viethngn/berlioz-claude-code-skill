@@ -8,7 +8,7 @@ Every fetcher/extractor/describer HTTP call goes through this module. It gives:
 - Optional circuit breaker for callers that iterate many requests
 
 `get_limiter(cfg_section)` returns a cached `RateLimiter` per config section
-(atlassian, nano_banana) so repeated calls within one process share the same
+(atlassian, slack) so repeated calls within one process share the same
 token bucket.
 
 Stdlib + requests only. requests is already required by fetch_*.py so no new
@@ -96,7 +96,7 @@ class RateLimiter:
 
     def throttle(self) -> None:
         """Block until a token is available; use before making an HTTP call
-        via a client that we don't control (e.g. google-genai)."""
+        via a client that we don't control."""
         self._acquire()
 
     def _acquire(self) -> None:
@@ -286,7 +286,7 @@ def _resolve(section: Optional[dict], key: str) -> float:
 def get_limiter(section_name: str, section: Optional[dict]) -> RateLimiter:
     """Return a cached RateLimiter keyed by section name.
 
-    section_name is a label like "atlassian" or "nano_banana".
+    section_name is a label like "atlassian" or "slack".
     section is the dict from load_config(); may be None for tests.
     """
     with _CACHE_LOCK:

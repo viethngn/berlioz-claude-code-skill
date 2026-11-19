@@ -473,7 +473,7 @@ def _bootstrap(
     next_steps = [
         f"cd {target}",
         "Edit .wikirc.json — fill in the integrations you want (Confluence/Jira "
-        "URLs + PATs, nano-banana vision endpoint + key, Slack token). Each is "
+        "URLs + PATs, Slack token). Each is "
         "optional; leaving one empty just skips that source type.",
         f"If the plugin is not installed yet: /plugin marketplace add {marketplace_str} "
         "then /plugin install llm-wiki@berlioz-claude-code-skill",

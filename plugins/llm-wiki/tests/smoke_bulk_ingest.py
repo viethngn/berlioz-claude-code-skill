@@ -195,12 +195,6 @@ def _write_wikirc(wiki_root: Path, port: int) -> None:
                     "max_retries": 3,
                     "retry_base_delay_seconds": 0.2,
                 },
-                "nano_banana": {
-                    "base_url": "",
-                    "api_key": "",
-                    "vision_model": "gemini-3-pro",
-                    "verify_ssl": True,
-                },
             },
             indent=2,
         )
@@ -472,7 +466,6 @@ def test_renamed_raw_wiki_dirs(port: int) -> None:
                         "confluence_pat": "test-pat",
                         "jira_pat": "test-pat",
                     },
-                    "nano_banana": {"base_url": "", "api_key": ""},
                 },
                 indent=2,
             )

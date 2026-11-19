@@ -85,7 +85,6 @@ def _write_wikirc(wiki_root: Path, port: int) -> None:
                 },
                 "web": {"rate_limit_rps": 20, "burst": 5, "max_retries": 2},
                 "slack": {"token": "xoxp-test-token", "rate_limit_rps": 20, "burst": 5},
-                "nano_banana": {"base_url": "", "api_key": "", "vision_model": "gemini-3-pro"},
             },
             indent=2,
         )

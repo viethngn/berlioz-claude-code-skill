@@ -176,7 +176,7 @@ def run_script(
     try:
         return json.loads(stdout)
     except json.JSONDecodeError:
-        # Some scripts (e.g. describe_image.py) print a plain path
+        # Tolerate a script that prints plain text
         return {"stdout": stdout}
 
 
@@ -298,100 +298,31 @@ def git_push(wiki_root: Path, cfg) -> Optional[str]:
         return None
 
 
-def _looks_like_placeholder(value: str) -> bool:
-    if not value:
-        return True
-    lowered = value.lower()
-    for marker in ("replace_me", "example.com", "your-", "changeme", "todo"):
-        if marker in lowered:
-            return True
-    return False
+def do_image_diff_loop(wiki_root: Path, slug: str) -> dict:
+    """List the slug's images that still need a description.
 
+    An image is pending (`new` / `changed`) until `image_manifest.py
+    mark-described` records its current sha. Never writes the manifest.
+    """
+    from image_manifest import classify, load_manifest, scan_slug_dir  # stdlib
 
-def do_image_diff_loop(
-    wiki_root: Path,
-    slug: str,
-) -> dict:
-    """Run image manifest status, describe new/changed images, update manifest."""
-    from image_manifest import (  # local import — stdlib
-        classify,
-        hash_file,
-        load_manifest,
-        scan_slug_dir,
-    )
-
-    cfg = load_config(wiki_root)
-    raw_dir = cfg.raw_dir
+    raw_dir = load_config(wiki_root).raw_dir
     manifest = load_manifest(raw_dir, slug)
-    scanned = scan_slug_dir(raw_dir, slug)
-
-    if not scanned:
-        return {"new": 0, "changed": 0, "unchanged": 0, "described": 0, "images": {}}
-
     images_dir = raw_dir / "images" / slug
-    per_image = {}
-    counts = {"new": 0, "changed": 0, "unchanged": 0, "described": 0, "skipped": 0}
-
-    base_url = cfg.nano_banana_base_url()
-    api_key = cfg.nano_banana_key()
-    can_describe = bool(
-        base_url
-        and api_key
-        and not _looks_like_placeholder(base_url)
-        and not _looks_like_placeholder(api_key)
-    )
-
-    for image_name, sha in sorted(scanned.items()):
+    counts = {"new": 0, "changed": 0, "unchanged": 0}
+    pending = []
+    for image_name, sha in sorted(scan_slug_dir(raw_dir, slug).items()):
         status = classify(manifest, image_name, sha)
         counts[status] += 1
-        image_path = images_dir / image_name
-        description_file = images_dir / f"{Path(image_name).stem}.md"
-
-        if status == "unchanged":
-            per_image[image_name] = {"status": status, "sha256": sha}
-            continue
-
-        if not can_describe:
-            per_image[image_name] = {
-                "status": status,
-                "sha256": sha,
-                "described": False,
-                "reason": (
-                    "nano_banana.base_url or api_key is empty or looks like a placeholder "
-                    "(REPLACE_ME / example.com / your-…) — description skipped"
-                ),
-            }
-            manifest.set_entry(image_name, sha256=sha)
-            manifest.save()
-            counts["skipped"] += 1
-            continue
-
-        run_script(
-            "describe_image.py",
-            [
-                "--wiki-root",
-                str(wiki_root),
-                "--image",
-                str(image_path),
-                "--output",
-                str(description_file),
-            ],
-        )
-        manifest.set_entry(
-            image_name,
-            sha256=sha,
-            description_file=description_file.name,
-        )
-        manifest.mark_described(image_name)
-        manifest.save()
-        counts["described"] += 1
-        per_image[image_name] = {
-            "status": status,
-            "sha256": sha,
-            "description_file": description_file.name,
-        }
-
-    return {**counts, "images": per_image}
+        if status != "unchanged":
+            pending.append(
+                {
+                    "image": str((images_dir / image_name).resolve()),
+                    "description": str((images_dir / f"{Path(image_name).stem}.md").resolve()),
+                    "status": status,
+                }
+            )
+    return {"enabled": True, **counts, "pending_images": pending}
 
 
 def _stream_prefetch(
@@ -401,6 +332,7 @@ def _stream_prefetch(
     max_items: int,
     skip_images: bool,
     force: bool = False,
+    describe_images: bool = False,
 ) -> int:
     """Run prefetch.py as a subprocess and stream its output line-by-line.
 
@@ -420,6 +352,8 @@ def _stream_prefetch(
         cmd.extend(["--max-items", str(max_items)])
     if skip_images:
         cmd.append("--skip-images")
+    if describe_images:
+        cmd.append("--describe-images")
     if force:
         cmd.append("--force")
 
@@ -578,6 +512,7 @@ def _cmd_bulk(
         max_items=args.max_items,
         skip_images=args.skip_images,
         force=args.force,
+        describe_images=args.describe_images,
     )
 
     # After prefetch, report queue counts to guide Claude's synthesis loop
@@ -696,22 +631,24 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
     source_json = fetch_summary.get("source_json")
 
     # Diff gate: if the source is unchanged and we're not forcing, skip all
-    # downstream work (image download, describe, git commit).
+    # downstream work (image download, image diff, git commit).
     if fetch_status == "unchanged" and not args.force:
-        image_summary = {"new": 0, "changed": 0, "unchanged": 0, "described": 0, "skipped": 0, "images": {}}
+        image_summary = {"enabled": False}
         write_fetch_history(wiki_root, slug, "unchanged", args.source)
         result = {
             "source_type": source_type,
             "fetch": fetch_summary,
             "images": image_summary,
             "committed": None,
-            "note": "content unchanged since last ingest — skipped image download, description, and commit. Pass --force to re-run everything.",
+            "note": "content unchanged since last ingest — skipped image download, image diff, and commit. Pass --force to re-run everything.",
         }
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
 
+    images_enabled = (args.describe_images or cfg.describe_images) and not args.skip_images
+
     # For Confluence/Jira/web, download image_hints before running the diff loop.
-    if source_type in {"confluence", "jira", "web"} and source_json:
+    if images_enabled and source_type in {"confluence", "jira", "web"} and source_json:
         image_hints = fetch_summary.get("image_hints") or []
         if image_hints:
             run_script(
@@ -727,7 +664,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
             )
 
     # Run the image diff loop (for local images, images are already on disk)
-    image_summary = do_image_diff_loop(wiki_root, slug)
+    image_summary = do_image_diff_loop(wiki_root, slug) if images_enabled else {"enabled": False}
 
     write_fetch_history(wiki_root, slug, fetch_status, args.source)
 
@@ -854,7 +791,15 @@ def main() -> int:
     parser.add_argument(
         "--skip-images",
         action="store_true",
-        help="Bulk prefetch: skip nano-banana-pro description (still downloads image bytes)",
+        help="Disable image download and the image diff for this run (wins over --describe-images)",
+    )
+    parser.add_argument(
+        "--describe-images",
+        action="store_true",
+        help=(
+            "Download images and list the new/changed ones as pending_images for "
+            "the session to describe (default: images.describe in .wikirc.json)"
+        ),
     )
     parser.add_argument(
         "--batch",
@@ -869,7 +814,7 @@ def main() -> int:
         "--force",
         action="store_true",
         help=(
-            "Bypass content-diff gates: re-download images, re-describe them, "
+            "Bypass content-diff gates: re-download images (when enabled) "
             "and commit even if the source content is unchanged. Honored by "
             "single, bulk and refresh runs"
         ),
