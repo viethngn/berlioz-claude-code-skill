@@ -411,6 +411,46 @@ def test_collision_template_does_not_crowd_out(tmp):
     _assert("fact_collisions: showing 50 of 67 found (exact: 66, fuzzy: 1)" in r["warnings"], f"warning: {r['warnings']}")
 
 
+def test_fix(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "api-guide-v2.md", "# g\n\nreal content that is long enough to count.\n")
+    write_page(root, "stub", "Placeholder — add content when a source covers this concept.")
+    write_page(root, "keeper", "See [[stub]] and [[ghost|the ghost page]] and [[real]]. " * 2, sources=("raw/api-guide.md",))
+    write_page(root, "real", "Links back to [[keeper]]. " * 4, sources=("raw/api-guide-v2.md",))
+    before = (root / "wiki/keeper.md").read_text()
+    _assert(run_lint(root)["empty_pages"] and (root / "wiki/stub.md").exists(), "no --fix → no writes")
+    _assert((root / "wiki/keeper.md").read_text() == before, "no --fix → page untouched")
+    r = run_lint(root, "--fix")
+    _assert(r["fixed"]["deleted_pages"] == ["stub"] and not (root / "wiki/stub.md").exists(), "stub deleted")
+    text = (root / "wiki/keeper.md").read_text()
+    _assert("[[stub]]" not in text and "the ghost page" in text and "[[ghost" not in text, "unlinked, alias text kept")  # Review Focus 4
+    _assert("[[real]]" in text, "valid link kept")
+    _assert("raw/api-guide-v2.md" in text, "source path repaired")
+    _assert(r["broken_links"] == [] and r["empty_pages"] == [] and r["missing_sources"] == [], "report is post-fix")
+
+
+def test_fix_journal_crosswiki_log_traversal(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "api-guide-v2.md", "# g\n\nreal content that is long enough to count.\n")
+    day = root / "wiki/2026-01-02.md"
+    day.write_text("# 2026-01-02\n\n## 09:00 — Note\n\nSee [[other/slug]], [[2026-01-02#Heading]] and [[ghost3]].\n")
+    write_page(root, "normal", "See [[other/slug]] and [[ghost#part]] here. " * 2, sources=("raw/../api-guide.md",))
+    (root / "wiki/log.md").write_text("# Log\n\n## 2026-01-01\n- created [[gone]]\n")
+    (root / "wiki/.lint-reviewed.json").write_text('{"pairs": []}\n')
+    snap = {p: p.read_bytes() for p in (day, root / "wiki/log.md", root / "wiki/.lint-reviewed.json")}
+    r = run_lint(root, "--fix")
+    for p, b in snap.items():
+        _assert(p.read_bytes() == b, f"{p.name} byte-identical after --fix")
+    text = (root / "wiki/normal.md").read_text()
+    _assert("[[other/slug]]" in text, "cross-wiki link kept")
+    _assert("[[ghost" not in text and "ghost#part here" in text, f"anchored ghost unlinked: {text}")
+    _assert("raw/../api-guide.md" in text and r["fixed"]["repaired_sources"] == [], "traversal never repaired")
+    _assert(r["fixed"]["unlinked"] == [{"page": "normal", "target": "ghost"}], f"unlinked: {r['fixed']['unlinked']}")
+    out = subprocess.run([sys.executable, str(LINT), "--wiki-root", str(root), "--fix", "--mark-reviewed"],
+                         capture_output=True, text=True)
+    _assert(out.returncode == 2 and "not allowed" in out.stderr, f"--fix with --mark-reviewed: {out.stderr}")
+
+
 def main() -> int:
     tests =[v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed = 0

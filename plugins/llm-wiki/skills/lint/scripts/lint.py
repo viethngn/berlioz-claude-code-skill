@@ -29,8 +29,12 @@ REPORTS them; the /lint skill deletes them after user confirmation.
 
 Usage:
     python3 lint.py --wiki-root PATH [--sources] [--graph] [--max-candidates N]
-                    [--full | --since-last-lint]
+                    [--full | --since-last-lint] [--fix]
     python3 lint.py --wiki-root PATH --mark-reviewed < reviewed.json
+
+`--fix` (see `apply_fixes`) deletes empty pages, unlinks unresolvable links and
+repairs unambiguous missing Sources paths, then reports on the fixed wiki
+under the extra key `fixed`.
 
 `wiki/.lint-reviewed.json` remembers reviewed overlap pairs, collisions and
 acknowledged drift by content hash; a matching item is left out of the report
@@ -69,7 +73,7 @@ MAX_COLLISIONS = 50
 MAX_EXACT_COLLISIONS = 35  # exact-pass share of MAX_COLLISIONS while fuzzy hits exist
 COLLISION_SCAN_LIMIT = 20 * MAX_COLLISIONS  # per pass (exact, fuzzy); past it the warning says "at least"
 
-WIKI_LINK_RE = re.compile(r"\[\[([^\]\|]+?)(?:\|[^\]]+)?\]\]")
+WIKI_LINK_RE = re.compile(r"\[\[([^\]\|]+?)(?:\|([^\]]+))?\]\]")  # group 2: alias text
 H1_RE = re.compile(r"^#\s+.+", re.MULTILINE)
 
 REQUIRED_FIELDS = ("Summary", "Sources", "Last updated")
@@ -934,6 +938,60 @@ def mark_reviewed(wiki_dir: Path, raw_dir: Path, payload: dict) -> dict:
     return {"recorded": sum(len(v) for v in new.values()), "pruned": pruned}
 
 
+def apply_fixes(pages: List[dict], wiki_dir: Path, raw_dir: Path) -> dict:
+    """Judgment-free cleanups: delete empty pages, unlink unresolvable
+    `[[links]]`, repoint a missing Sources path to its single plausible raw.
+
+    Journal pages and log.md are never written; cross-wiki links and
+    traversal Sources paths are never touched.
+    """
+    deleted = sorted(e["page"] for e in find_empty_pages(pages))
+    for slug in deleted:
+        (wiki_dir / f"{slug}.md").unlink()
+    pages = [p for p in pages if slug_from_path(p["path"]) not in deleted]
+
+    archived = archived_slugs(wiki_dir)
+    existing = {slug_from_path(p["path"]) for p in pages} | archived
+    existing |= {f"{ARCHIVE_SUBDIR}/{s}" for s in archived}
+    raws = sorted(p for p in raw_dir.glob("*.md") if p.is_file()) if raw_dir.exists() else []
+    wiki_root = raw_dir.parent
+    unlinked: List[dict] = []
+    repaired: List[dict] = []
+
+    for page in pages:
+        slug = slug_from_path(page["path"])
+        if slug == "log" or is_journal_slug(slug):
+            continue
+        dropped: List[str] = []
+
+        def unlink(m: "re.Match") -> str:
+            target = link_target(m.group(1))
+            if target is None or target in existing:
+                return m.group(0)
+            dropped.append(target)
+            return (m.group(2) or m.group(1)).strip()
+
+        text = WIKI_LINK_RE.sub(unlink, page["text"])
+        unlinked += [{"page": slug, "target": t} for t in dict.fromkeys(dropped)]
+
+        for missing in dict.fromkeys(resolve_source_paths(text, raw_dir)):
+            if (wiki_root / missing).exists():
+                continue
+            stem = Path(missing).stem
+            found = [r for r in raws if r.stem == stem or f"-{stem}-" in f"-{r.stem}-"]
+            if len(found) != 1:
+                continue
+            new = f"{raw_dir.name}/{found[0].name}"
+            m = re.search(r"\*\*Sources\*\*\s*:\s*(.+?)(?=\n\*\*|\n---|\n#|\Z)", text, re.S)
+            block = PATH_TOKEN_RE.sub(lambda t: new if t.group(0) == missing else t.group(0), m.group(1))
+            text = text[:m.start(1)] + block + text[m.end(1):]
+            repaired.append({"page": slug, "from": missing, "to": new})
+
+        if text != page["text"]:
+            page["path"].write_text(text, encoding="utf-8")
+    return {"deleted_pages": deleted, "unlinked": unlinked, "repaired_sources": repaired}
+
+
 def changed_since_last_lint(wiki_root: Path) -> Optional[set]:
     """Wiki-root-relative paths changed (committed or not) since the newest
     commit whose subject starts with `lint:`; None when there is no such commit."""
@@ -1002,9 +1060,13 @@ def main() -> int:
     scope.add_argument("--since-last-lint", action="store_true",
                        help="Limit overlap, collisions and drift to pages/raws changed "
                             "since the newest `lint:` commit")
-    parser.add_argument("--mark-reviewed", action="store_true",
+    writes = parser.add_mutually_exclusive_group()
+    writes.add_argument("--mark-reviewed", action="store_true",
                         help=f"Record reviewed items read from stdin into wiki/{REVIEWED_FILE}; "
                              "runs no checks")
+    writes.add_argument("--fix", action="store_true",
+                        help="Delete empty pages, unlink broken links and repair missing "
+                             "Sources paths, then report on the fixed wiki")
     args = parser.parse_args()
     warnings: List[str] = []
 
@@ -1039,8 +1101,11 @@ def main() -> int:
         print(json.dumps(result))
         return 0
 
-    page_paths = collect_pages(wiki_dir)
-    pages = [load_page(p) for p in page_paths]
+    pages = [load_page(p) for p in collect_pages(wiki_dir)]
+    fixed = None
+    if args.fix:
+        fixed = apply_fixes(pages, wiki_dir, raw_dir)
+        pages = [load_page(p) for p in collect_pages(wiki_dir)]
 
     archived = archived_slugs(wiki_dir)
     edges = build_edges(pages)
@@ -1145,6 +1210,9 @@ def main() -> int:
         "suppressed": suppressed,
         "warnings": warnings,
     }
+
+    if fixed is not None:
+        report["fixed"] = fixed
 
     if args.graph:
         report["edges"] = edges
