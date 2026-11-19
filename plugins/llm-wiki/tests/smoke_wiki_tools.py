@@ -47,6 +47,35 @@ def no_bare_lf(text: str) -> bool:
     return "\n" not in text.replace("\r\n", "")
 
 
+def _titled_page(root: Path, slug: str, h1: str, summary: str = "s", body: str = "Body text.") -> None:
+    (root / "wiki" / f"{slug}.md").write_text(
+        f"# {h1}\n\n**Summary**: {summary}\n\n**Sources**:\n- `raw/a.md`\n\n"
+        f"**Last updated**: 2026-01-01\n\n---\n\n{body}\n",
+        encoding="utf-8",
+    )
+
+
+def test_related_mention_title_and_cjk(tmp):
+    sys.path.insert(0, str(TOOL.parent))
+    from wiki_tools import related
+
+    root = make_wiki(tmp)
+    _titled_page(root, "rate-limits", "Rate Limits")
+    _titled_page(root, "api-rate-limit", "API Rate Limit")
+    _titled_page(root, "onboarding", "Onboarding", body="rate limits rate limits")
+    _titled_page(root, "pricing", "料金プラン")
+    write_page(root, "2026-01-02", "rate limits")  # journal: never related
+    hits = related(root / "wiki", "API rate limit guide", "This guide explains rate limits for each tenant.")
+    by = {h["page"]: h for h in hits}
+    _assert(set(by) == {"rate-limits", "api-rate-limit"}, f"related: {hits}")
+    _assert(by["rate-limits"]["why"] in {"mentioned", "both"}, f"mention: {hits}")
+    _assert(by["api-rate-limit"]["why"] == "title", f"title similarity: {hits}")
+    _assert(set(hits[0]) == {"page", "summary", "score", "why"}, f"shape: {hits[0]}")
+    hits = related(root / "wiki", "新しいお知らせ", "本日より新しい料金プランを提供します。")
+    _assert([h["page"] for h in hits] == ["pricing"] and hits[0]["why"] == "mentioned", f"CJK: {hits}")
+    _assert(related(root / "wiki", "Quarterly", "nothing relevant here") == [], "no hits -> empty")
+
+
 def test_locate_and_citing(tmp):
     root = collision_fixture(tmp)
     write_page(root, "2026-01-02", "## 09:00 — rate limit note\n\nrate limit rate limit\n")

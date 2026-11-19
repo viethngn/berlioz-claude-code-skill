@@ -96,6 +96,53 @@ def citing(wiki_dir: Path, raw_slug: str, raw_dir: Optional[Path] = None) -> Lis
     )
 
 
+MENTION_MIN_CHARS = 4  # shorter page names match too much by accident
+MENTION_CAP = 5  # occurrences counted per page
+TITLE_MIN_CONTAINMENT = 0.6  # share of the source title's trigrams found in the page
+TITLE_WEIGHT = 3  # score of a perfect title match
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.lower().replace("-", " ").replace("_", " ").split())
+
+
+def _trigrams(text: str) -> set:
+    text = _norm(text)
+    return {text[i:i + 3] for i in range(len(text) - 2)} or ({text} if text else set())
+
+
+def related(wiki_dir: Path, title: str, text: str, limit: int = 10) -> List[dict]:
+    """Pages a source is about: named in its text, or titled like it.
+
+    `mentioned`: the page's H1 or slug-as-words occurs in `text` (also with a
+    trailing `s` dropped). `title`: character-trigram containment of `title`
+    in the page's H1 + slug + Summary is at least TITLE_MIN_CONTAINMENT.
+    """
+    text = _norm(text)
+    want = _trigrams(title)
+    hits = []
+    for page in _content_pages(wiki_dir):
+        slug = slug_from_path(page["path"])
+        h1 = H1_RE.search(page["text"])
+        h1 = h1.group(1) if h1 else ""
+        summary = _summary(page["text"])
+        names = {n for n in (_norm(h1), _norm(slug)) if len(n) >= MENTION_MIN_CHARS}
+        names |= {n[:-1] for n in names if len(n) >= 5 and n.endswith("s")}
+        mentions = min(max((text.count(n) for n in names), default=0), MENTION_CAP)
+        sim = len(want & _trigrams(f"{h1} {slug} {summary}")) / len(want) if want else 0.0
+        titled = sim >= TITLE_MIN_CONTAINMENT
+        if not (mentions or titled):
+            continue
+        hits.append({
+            "page": slug,
+            "summary": summary,
+            "score": round(mentions + (TITLE_WEIGHT * sim if titled else 0), 2),
+            "why": "both" if mentions and titled else ("mentioned" if mentions else "title"),
+        })
+    hits.sort(key=lambda h: (-h["score"], h["page"]))
+    return hits[:limit]
+
+
 # ------------------------- line-preserving file edits -------------------------
 
 

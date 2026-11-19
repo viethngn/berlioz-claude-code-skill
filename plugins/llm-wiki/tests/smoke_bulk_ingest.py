@@ -639,9 +639,53 @@ def test_rerun_is_resume_and_replace_is_refresh() -> None:
     print("[OK] plain re-run = resume (says so); --replace = refresh (new + edited found, unchanged kept)")
 
 
+def test_known_source_turning_empty_is_kept() -> None:
+    """Only a never-committed source that renders empty is dropped (R5)."""
+    pages = {"30001": {"title": "Known Page", "body": "real content that is clearly long enough"}}
+    srv, port = _start_server(pages)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            wiki = Path(td) / "wiki"
+            wiki.mkdir()
+            _write_wikirc(wiki, port)
+            for cmd in (["init", "-q"], ["config", "user.email", "t@example.invalid"],
+                        ["config", "user.name", "t"], ["config", "commit.gpgsign", "false"]):
+                subprocess.run(["git", "-C", str(wiki), *cmd], check=True, capture_output=True)
+            flags = ["--space", "FOO", "--skip-images"]
+            r = _ingest(wiki, *flags)
+            _assert(r.returncode == 0, f"baseline failed: {r.stderr}\n{r.stdout}")
+            job = _only_job(wiki)
+            _mark_wiki_done(wiki, job, "30001")
+            subprocess.run(["git", "-C", str(wiki), "add", "raw"], check=True)
+            subprocess.run(["git", "-C", str(wiki), "commit", "-q", "-m", "v1"], check=True)
+            slug = _queue(wiki, job)["items"][0]["slug"]
+            md = wiki / "raw" / f"{slug}.md"
+            src = wiki / "raw" / f"{slug}.source.json"
+
+            # The page empties upstream: a changed source, files kept, re-synthesized.
+            pages["30001"].update(html="<p> </p>", version=2)
+            r = _ingest(wiki, *flags, "--replace")
+            _assert(r.returncode == 0, f"--replace failed: {r.stderr}\n{r.stdout}")
+            _assert(md.exists() and src.exists(), "known source's raw files kept")
+            _assert(_states(wiki, job)["30001"] == ("done", "pending"), f"{_states(wiki, job)}")
+
+            # Even when the files are missing on disk (fetch says "new"), git history wins.
+            md.unlink()
+            src.unlink()
+            pages["30001"]["version"] = 3
+            r = _ingest(wiki, *flags, "--replace")
+            _assert(r.returncode == 0, f"second --replace failed: {r.stderr}\n{r.stdout}")
+            _assert(md.exists() and src.exists(), "committed source's raw files kept")
+            _assert(_states(wiki, job)["30001"] == ("done", "pending"), f"{_states(wiki, job)}")
+    finally:
+        srv.shutdown()
+    print("[OK] a known source that becomes empty keeps its raw files and is re-synthesized")
+
+
 def main() -> int:
     test_detect_bulk_from_url()
     test_rerun_is_resume_and_replace_is_refresh()
+    test_known_source_turning_empty_is_kept()
 
     pages = {
         "10001": {"title": "Onboarding", "body": "how to onboard"},

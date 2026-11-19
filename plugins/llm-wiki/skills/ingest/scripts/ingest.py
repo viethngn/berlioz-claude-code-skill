@@ -57,10 +57,17 @@ from web_url import SITEMAP_URL_RE
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR.parents[1] / "lint" / "scripts"))
-from wiki_tools import citing, locate  # noqa: E402  (stdlib-only, shares lint.py)
+from wiki_tools import citing, related  # noqa: E402  (stdlib-only, shares lint.py)
 
 RAW_DIFF_MAX_CHARS = 8000
-HEADING_RE = re.compile(r"^#{1,2} +(.+?)\s*#*\s*$", re.MULTILINE)
+FENCED_CODE_RE = re.compile(r"^(`{3,}|~{3,}).*?(?:^\1[^\n]*$|\Z)", re.MULTILINE | re.DOTALL)
+# Headings the fetchers generate themselves (Jira sections, PDF pages, PPTX
+# slide numbers, default XLSX sheet names): they say nothing about the topic.
+FETCHER_BOILERPLATE_RE = re.compile(
+    r"^## (?:Description|Comments|Page \d+|Sheet ?\d*)[ \t]*$|^## Slide \d+:?", re.MULTILINE
+)
+JIRA_KEY_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+\s*(?:—|–|:|-)\s*")
+H1_LINE_RE = re.compile(r"^# +(.+)$", re.MULTILINE)
 JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
 CONFLUENCE_SPACE_URL_RE = re.compile(r"/spaces/([A-Za-z0-9._~-]+)(?:/|$)")
 
@@ -345,13 +352,26 @@ def _git_lines(wiki_root: Path, *args: str) -> List[str]:
 def raw_commits(wiki_root: Path, raw_md: Path) -> List[str]:
     """Commits that touched raw/<slug>.md, newest first."""
     rel = os.path.relpath(raw_md, wiki_root)
-    return _git_lines(wiki_root, "log", "--format=%H", "--", rel)
+    return _git_lines(wiki_root, "log", "--follow", "--format=%H", "--", rel)
+
+
+def _source_title(raw_md: Path, text: str) -> str:
+    """source.json `title`, else the raw H1, without a leading Jira key."""
+    try:
+        title = json.loads(raw_md.with_suffix(".source.json").read_text(encoding="utf-8")).get("title")
+    except (OSError, ValueError, AttributeError):
+        title = None
+    if not title:
+        m = H1_LINE_RE.search(text)
+        title = m.group(1) if m else ""
+    return JIRA_KEY_PREFIX_RE.sub("", str(title).strip())
 
 
 def build_context(wiki_root: Path, slug: str, status: Optional[str] = None) -> dict:
     """What the session needs to synthesize raw/<slug>.md into existing pages.
 
-    `related_pages`: pages matching the raw file's H1 / `##` headings.
+    `related_pages`: `wiki_tools.related` on the source title and the raw
+    text minus fenced code and fetcher-generated headings.
     For a `changed` source also `citing_pages` (pages citing it) and
     `raw_diff` (what changed, capped at RAW_DIFF_MAX_CHARS). `status` comes
     from the fetcher (single ingest); None (bulk) derives it from git history.
@@ -374,10 +394,10 @@ def build_context(wiki_root: Path, slug: str, status: Optional[str] = None) -> d
             status = "changed" if commits else "new"
         if status == "changed":
             diff = "\n".join(_git_lines(wiki_root, "diff", "HEAD", "--", rel))
-    terms = HEADING_RE.findall(text)
+    body = FETCHER_BOILERPLATE_RE.sub("", FENCED_CODE_RE.sub("", text))
     return {
         "status": status,
-        "related_pages": locate(cfg.wiki_dir, terms) if terms else [],
+        "related_pages": related(cfg.wiki_dir, _source_title(raw_md, text), body),
         "citing_pages": citing(cfg.wiki_dir, slug, cfg.raw_dir) if status in {"changed", "unchanged"} else [],
         "raw_diff": diff[:RAW_DIFF_MAX_CHARS],
         "raw_diff_truncated": len(diff) > RAW_DIFF_MAX_CHARS,
@@ -390,6 +410,13 @@ def _cmd_context(args: argparse.Namespace) -> int:
         load_config(wiki_root)
     except ConfigError as e:
         print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    if "/" in args.slug or "\\" in args.slug or ".." in args.slug:
+        print(f"ERROR: invalid slug {args.slug!r}: no path separators or '..'", file=sys.stderr)
+        return 1
+    raw_md = load_config(wiki_root).raw_dir / f"{args.slug}.md"
+    if not raw_md.exists():
+        print(f"ERROR: no raw file for slug {args.slug!r}: {raw_md} does not exist", file=sys.stderr)
         return 1
     status = None
     if args.job_id:
@@ -931,6 +958,8 @@ def main() -> int:
     # ignored and the user would think a refresh had run.
     if args.refresh_all and (args.commit_only or args.push_only or args.context):
         parser.error("--refresh-all cannot be combined with --commit-only, --push-only or --context")
+    if args.context and (args.commit_only or args.push_only):
+        parser.error("--context cannot be combined with --commit-only or --push-only")
 
     # An empty --source means a caller's variable was empty, not "refresh
     # everything". Falling through to refresh-all here would turn a typo into a

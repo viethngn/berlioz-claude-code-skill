@@ -225,6 +225,7 @@ def _prefetch_one(
     if _is_empty_new_source(wiki_root, fetch_status, raw_md):
         # Nothing to synthesize: drop the just-written raw files. raw_status
         # stays "done" so the item never trips the circuit breaker.
+        # With no source.json left, each refresh re-fetches it (one API call, no model work).
         Path(raw_md).unlink()
         Path(raw_md).with_suffix(".source.json").unlink(missing_ok=True)
         item.raw_status = "done"

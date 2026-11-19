@@ -95,11 +95,11 @@ def git(root: Path, *args: str) -> str:
     ).stdout
 
 
-def write_page(root: Path, slug: str, body: str, sources=("raw/a.md",), summary="s") -> Path:
+def write_page(root: Path, slug: str, body: str, sources=("raw/a.md",), summary="s", title=None) -> Path:
     path = root / "wiki" / f"{slug}.md"
     src = "\n".join(f"- `{s}`" for s in sources)
     path.write_text(
-        f"# {slug}\n\n**Summary**: {summary}\n\n**Sources**:\n{src}\n\n"
+        f"# {title or slug}\n\n**Summary**: {summary}\n\n**Sources**:\n{src}\n\n"
         f"**Last updated**: 2026-01-01\n\n---\n\n{body}\n",
         encoding="utf-8",
     )
@@ -282,6 +282,54 @@ def test_bulk_context_new_and_unchanged(tmp: Path) -> None:
     print("[OK] bulk context: new / changed from git history, truncation, unchanged items")
 
 
+def _related(root: Path, slug: str) -> list:
+    return [h["page"] for h in ingest.build_context(root, slug, "new")["related_pages"]]
+
+
+def test_related_pages_signal(tmp: Path) -> None:
+    root = make_wiki(tmp)
+    write_page(root, "login-timeouts", "Sessions end after inactivity.", title="Login Timeouts",
+               summary="Login sessions time out after inactivity.")
+    write_page(root, "code-review", "Every PR needs a description and all comments addressed.",
+               title="Code Review", summary="How code review works.")
+    write_page(root, "release-process", "Release notes list each description and comments.",
+               title="Release Process", summary="How releases ship.")
+    write_page(root, "page-1", "Front matter.", title="Page 1")
+    write_page(root, "deploy-script", "Runs the deploy.", title="Deploy Script")
+    raw = root / "raw"
+    # Jira-shaped raw: key-prefixed H1, generated section headings.
+    (raw / "PROJ-12.md").write_text(
+        "# PROJ-12 — Fix login timeout\n\n**Type:** Bug\n**Status:** Open\n\n## Description\n\n"
+        "Users are logged out after 5 minutes; the login timeout is too short.\n\n"
+        "## Comments\n\n### Ann — 2026-01-01\n\nAgreed.\n"
+    )
+    (raw / "PROJ-12.source.json").write_text(json.dumps({"type": "jira", "title": "PROJ-12 — Fix login timeout"}))
+    hits = _related(root, "PROJ-12")
+    _assert(hits[:1] == ["login-timeouts"], f"jira: {hits}")
+    _assert("code-review" not in hits and "release-process" not in hits, f"jira boilerplate matched: {hits}")
+    # PDF-shaped raw: 60 generated page headings, no real mentions.
+    (raw / "report.md").write_text(
+        "# Quarterly Report\n\n" + "".join(f"## Page {i}\n\nLorem ipsum dolor sit amet.\n\n" for i in range(1, 61))
+    )
+    _assert(_related(root, "report") == [], f"pdf: {_related(root, 'report')}")
+    # A `# comment` inside a fenced block is code, not a mention.
+    (raw / "setup.md").write_text("# Setup\n\nInstall things.\n\n```bash\n# deploy script here\n./run\n```\n")
+    _assert(_related(root, "setup") == [], f"fenced: {_related(root, 'setup')}")
+    print("[OK] related_pages: Jira / PDF boilerplate and fenced code ignored")
+
+
+def test_context_cli_errors(tmp: Path) -> None:
+    root = make_wiki(tmp)
+    for slug, msg in (("missing", "no raw file"), ("../x", "invalid slug"), ("a/b", "invalid slug")):
+        proc = run_script("ingest.py", ["--wiki-root", str(root), "--context", "--slug", slug])
+        _assert(proc.returncode == 1 and msg in proc.stderr and not proc.stdout, f"{slug}: {proc.stderr}")
+    for flag in ("--push-only", "--commit-only"):
+        proc = run_script("ingest.py", ["--wiki-root", str(root), "--context", "--slug", "x", flag])
+        _assert(proc.returncode == 2 and "--context cannot be combined" in proc.stderr, f"{flag}: {proc.stderr}")
+    _assert(not (root / ".wiki-state/bulk-jobs").exists(), "no queue created")
+    print("[OK] --context rejects unknown / path-like slugs and commit/push modes")
+
+
 def test_source_date_never_triggers_changed(tmp: Path) -> None:
     root = make_wiki(tmp)
     src = tmp / "guide.md"
@@ -318,6 +366,8 @@ def main() -> int:
     for test in (
         test_context_new_and_changed,
         test_bulk_context_new_and_unchanged,
+        test_related_pages_signal,
+        test_context_cli_errors,
         test_source_date_never_triggers_changed,
         test_default_off_and_legacy_config,
         test_pending_then_marked,
