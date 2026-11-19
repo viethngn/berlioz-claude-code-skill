@@ -285,6 +285,22 @@ def test_collision_reordered_numbers_and_self_link(tmp):
     _assert(len(fc) == 1 and fc[0]["differing"] == [["9", "17"], ["17", "9"]], f"positional differing: {fc}")
 
 
+def test_unbannered_archive_link_skips_index(tmp):
+    root = make_wiki(tmp)
+    write_page(root, "archive/old", "Old content without a banner.")
+    write_page(root, "user", "See [[archive/old]].")
+    (root / "wiki" / "index.md").write_text("# Index\n\n- [[archive/old]]\n- [[user]]\n", encoding="utf-8")
+    links = run_lint(root)["archive_links_without_banner"]
+    _assert([l["from"] for l in links] == ["user"], f"index must not be flagged: {links}")
+
+
+def test_traversal_source_reported_missing(tmp):
+    root = make_wiki(tmp)
+    write_page(root, "p", "Body text.", sources=("raw/../../etc/passwd",))
+    ms = run_lint(root)["missing_sources"]  # run_lint asserts exit 0
+    _assert(ms == [{"page": "p", "missing": ["raw/../../etc/passwd"]}], f"missing_sources: {ms}")
+
+
 def main() -> int:
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed = 0

@@ -489,6 +489,8 @@ def find_unbannered_archive_links(
 
     out: List[dict] = []
     for slug, targets in edges.items():
+        if slug in EXEMPT_PAGES:
+            continue
         for t in targets:
             archived_slug = archived_slug_of(t)
             if archived_slug and not has_banner(archived_slug):
