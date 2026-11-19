@@ -35,6 +35,7 @@ def make_wiki(tmp: Path) -> Path:
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=root, check=True)
     return root
 
 
@@ -66,8 +67,9 @@ def commit(root: Path, msg: str) -> None:
 def run_lint(root: Path, *args: str) -> dict:
     out = subprocess.run(
         [sys.executable, str(LINT), "--wiki-root", str(root), *args],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True,
     )
+    _assert(out.returncode == 0, f"lint.py exit {out.returncode}: {out.stderr.strip()}")
     return json.loads(out.stdout)
 
 
@@ -88,7 +90,7 @@ def test_orphan_ignores_index_and_log(tmp):
     _assert(not any(v["page"] in ("index", "log") for v in r["unsourced_claims"]), "index/log exempt from unsourced")
     _assert("edges" not in r and "inbound_counts" not in r, "graph hidden by default")
     _assert("edges" in run_lint(root, "--graph"), "graph with --graph")
-    _assert(r["warnings"] == [] or isinstance(r["warnings"], list), "warnings key present")
+    _assert("warnings" in r, "warnings key present")
 
 
 def test_bare_source_filename_resolves(tmp):
@@ -97,6 +99,20 @@ def test_bare_source_filename_resolves(tmp):
     write_page(root, "p", "Body text. " * 6, sources=("api-guide.md",))
     r = run_lint(root)
     _assert(r["missing_sources"] == [], "bare filename is not a missing source")
+    write_raw(root, "stub.md", "# stub\n")
+    write_page(root, "q", "Body text. " * 6, sources=("stub.md",))
+    r = run_lint(root)
+    _assert(not any(e["slug"] == "stub" for e in r["empty_raw"]), f"bare-cited stub is cited: {r['empty_raw']}")
+
+
+def test_bare_source_custom_raw_dir(tmp):
+    root = make_wiki(tmp)
+    (root / "sources").mkdir()
+    (root / "sources/api-guide.md").write_text("# g\n")
+    write_page(root, "p", "Body text. " * 6, sources=("api-guide.md",))
+    r = run_lint(root, "--raw-dir", "sources")
+    _assert(r["missing_sources"] == [], f"missing_sources: {r['missing_sources']}")
+    _assert(r["empty_raw"] == [], f"bare-cited stub in custom raw dir is cited: {r['empty_raw']}")
 
 
 def main() -> int:

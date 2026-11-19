@@ -307,12 +307,13 @@ def traversal_source_paths(text: str) -> List[str]:
 
 
 def resolve_source_paths(text: str, raw_dir: Path) -> List[str]:
-    """Return the `raw/...` paths cited in a page's Sources block.
+    """Return the wiki-root-relative raw paths cited in a page's Sources block.
 
     Explicit `raw/...` tokens are kept as-is, except ones with a `..` segment,
-    which are dropped (see `traversal_source_paths`). A bare filename (`api-guide.md`)
-    resolves to `raw/<name>` only when that file exists in raw_dir; other bare
-    words are dropped.
+    which are dropped (see `traversal_source_paths`). A bare filename
+    (`api-guide.md`) resolves to `<raw_dir name>/<name>` (normally
+    `raw/<name>`) only when that file exists in raw_dir; other bare words are
+    dropped.
     """
     out: List[str] = []
     for entry in parse_sources(text):
@@ -322,7 +323,7 @@ def resolve_source_paths(text: str, raw_dir: Path) -> List[str]:
         for piece in re.split(r"[\s,]+", entry):
             name = piece.strip("`'\"()[]")
             if name and "/" not in name and (raw_dir / name).is_file():
-                out.append(f"raw/{name}")
+                out.append(f"{raw_dir.name}/{name}")
     return out
 
 
@@ -367,9 +368,10 @@ def cited_raw_slugs(pages: List[dict], raw_dir: Path) -> set:
         tokens += resolve_source_paths(page["text"], raw_dir)
         for token in tokens:
             token = token.strip()
-            if not token.startswith("raw/") or is_traversal(token):
+            head, _, rest = token.partition("/")
+            # Bare-name resolution yields the configured raw dir name.
+            if head not in ("raw", raw_dir.name) or is_traversal(token):
                 continue
-            rest = token[len("raw/"):]
             if rest.startswith("images/"):
                 # raw/images/<slug>/<file> → slug is the first path segment
                 parts = rest[len("images/"):].split("/", 1)
