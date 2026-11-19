@@ -476,7 +476,7 @@ def find_unbannered_archive_links(
     return out
 
 
-_COMMIT_CACHE: Dict[Tuple[str, bool], Optional[Tuple[str, int]]] = {}
+_COMMIT_CACHE: Dict[Tuple[str, str, bool], Optional[Tuple[str, int]]] = {}
 
 
 def _git(wiki_root: Path, *args: str) -> Optional[str]:
@@ -498,7 +498,7 @@ def last_commit(
     With skip_lint, commits whose subject starts with `lint:` are ignored, so a
     lint link-fix never counts as the page catching up with its sources.
     """
-    key = (rel_path, skip_lint)
+    key = (str(wiki_root), rel_path, skip_lint)
     if key not in _COMMIT_CACHE:
         found = None
         log = _git(wiki_root, "log", "--format=%H%x09%ct%x09%s", "--", rel_path) or ""
@@ -518,11 +518,13 @@ def find_source_drift(
     wiki_subdir: str,
     raw_dir: Path,
     warnings: List[str],
+    retired: Optional[set] = None,
 ) -> List[dict]:
     """Pages whose cited raws changed in git after the page's last non-lint commit.
 
     A cited raw with uncommitted changes (modified or untracked) is always drift.
-    An untracked page is never drifted. No repo / no commits -> [] + warning.
+    An untracked page is never drifted; EXEMPT_PAGES and retired pages are
+    skipped. No repo / no commits -> [] + warning.
     """
     if _git(wiki_root, "rev-parse", "--verify", "-q", "HEAD") is None:
         warnings.append("source_drift skipped: wiki root is not a git repo with commits")
@@ -536,6 +538,8 @@ def find_source_drift(
     out: List[dict] = []
     for page in pages:
         slug = slug_from_path(page["path"])
+        if slug in EXEMPT_PAGES or slug in (retired or set()):
+            continue
         page_c = last_commit(wiki_root, f"{wiki_subdir}/{page['path'].name}", skip_lint=True)
         if page_c is None:
             continue
@@ -652,7 +656,7 @@ def main() -> int:
     broken, missing = find_broken_links(pages, edges, archived)
     unbannered_archive_links = find_unbannered_archive_links(edges, wiki_dir, archived)
     format_violations = find_format_violations(pages)
-    source_drift = find_source_drift(pages, wiki_root, wiki_subdir, raw_dir, warnings)
+    source_drift = find_source_drift(pages, wiki_root, wiki_subdir, raw_dir, warnings, retired)
     unsourced = find_unsourced(pages)
     empty_pages = find_empty_pages(pages)
     status_pages = find_status_pages(pages)

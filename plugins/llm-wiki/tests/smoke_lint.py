@@ -153,6 +153,26 @@ def test_drift_uncommitted_and_no_git(tmp):
     _assert(r["source_drift"] == [] and any("git" in w for w in r["warnings"]), "no git → empty + warning")
 
 
+def test_drift_untracked_and_retired(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\noriginal content long enough to count here.\n")
+    p = write_page(root, "old", "Cites a. " * 8)
+    p.write_text(p.read_text().replace("**Last updated**", "**Status**: Archived\n\n**Last updated**"))
+    write_page(root, "p", "Cites new. " * 8, sources=("raw/new.md",))
+    commit(root, "ingest: initial")
+    time.sleep(1.1)
+    write_raw(root, "a.md", "# a\n\nchanged content long enough to count here.\n")
+    commit(root, "ingest: a changed")
+    write_raw(root, "new.md", "# new\n\nuntracked raw content long enough here.\n")
+    # an untracked page whose cited raw is dirty is never drifted
+    write_page(root, "fresh", "Cites a too. " * 8)
+    write_raw(root, "a.md", "# a\n\ndirty again content long enough here.\n")
+    d = {e["page"]: e for e in run_lint(root)["source_drift"]}
+    _assert("old" not in d, f"archived page is skipped: {d}")
+    _assert("fresh" not in d, "untracked page never drifted")
+    _assert("p" in d and d["p"]["drifted"][0]["uncommitted"] is True, f"untracked cited raw is drift: {d}")
+
+
 def main() -> int:
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed = 0
