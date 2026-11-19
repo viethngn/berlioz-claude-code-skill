@@ -325,6 +325,18 @@ nano-banana, images off by default, new lint behaviour).
   sections; `locate` and `citing` return the expected pages.
 - `tests/smoke_bulk_ingest.py` updated for the removed `nano_banana` config.
 
+## Amendment 1 (rebase onto origin/main)
+
+The design was written against a base 8 commits behind `origin/main`, which
+adds web ingest, refresh-all and the `log` skill. The resulting decisions
+(journal pages exempt from lint judgment, cross-wiki link handling, no model
+name in cascade ingest, `source_date` excluded from change detection, empty
+bulk items, push cadence kept per item, release bookkeeping) are recorded in
+`docs/superpowers/plans/2026-11-20-llm-wiki-lean-rework-amendment-1.md` and
+are part of this design. The "push once at the end" line under Bulk is
+withdrawn. Sentence splitting: `. ! ?` end a sentence only before whitespace
+or end of text; `。 ！ ？` and newline always do.
+
 ## Left to the builder
 
 - Similarity weights, thresholds and sentence-splitting details, within the
