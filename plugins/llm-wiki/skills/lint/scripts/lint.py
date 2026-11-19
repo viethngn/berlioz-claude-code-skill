@@ -186,18 +186,100 @@ def parse_status(text: str) -> Tuple[Optional[str], Optional[str]]:
     return lowered.split()[0] if lowered else None, None
 
 
-# Lines allowed before the header `---`: the H1, blanks, `**Field**:` lines,
-# their list-item continuations, and a blockquote banner.
-HEADER_LINE_RE = re.compile(r"^(?:#\s.*|\*\*[^*]+\*\*\s*:.*|\s*[-*+]\s.*|\s*>.*|\s*)$")
+FIELD_LINE_RE = re.compile(r"^\*\*[^*]+\*\*\s*:")
+HEADER_FIELD_RE = re.compile(r"^\*\*(?:Summary|Sources|Last updated|Status)\*\*\s*:", re.IGNORECASE)
+SUMMARY_LINE_RE = re.compile(r"^\*\*Summary\*\*\s*:(.*)$", re.MULTILINE)
+FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+# shortcut: inline code spans are matched per line; a span crossing a line break is not seen.
+CODE_SPAN_RE = re.compile(r"(`+).+?\1")
+
+
+def _is_header_block(head: str) -> bool:
+    """True when every line is header material: the H1, blanks, `**Field**:`
+    lines, their hard-wrapped continuations and list items, a blockquote banner."""
+    prev = None  # kind of the previous non-blank line, or "blank"
+    for line in head.splitlines():
+        s = line.strip()
+        if not s:
+            kind = "blank"
+        elif FIELD_LINE_RE.match(s):
+            kind = "field"
+        elif re.match(r"[-*+]\s", s):
+            if prev not in ("field", "item"):
+                return False
+            kind = "item"
+        elif s.startswith(">"):
+            kind = "quote"
+        elif re.match(r"#\s", s):
+            kind = "h1"
+        elif prev in ("field", "wrap"):
+            kind = "wrap"
+        else:
+            return False
+        prev = kind
+    return True
 
 
 def page_body(text: str) -> str:
     """Return the page body: after the first `---` when everything before it is
     header material, else everything after the H1 (a `---` in prose is a rule)."""
     head, sep, rest = text.partition("\n---")
-    if sep and all(HEADER_LINE_RE.match(line) for line in head.splitlines()):
+    if sep and _is_header_block(head):
         return rest
     return body_after_h1(text)
+
+
+def _fence_step(line: str, fence: Optional[str]) -> Tuple[bool, Optional[str]]:
+    """(line is fenced code or a fence delimiter, fence open after the line)."""
+    f = FENCE_RE.match(line)
+    if fence is None:
+        return (True, f.group(1)) if f else (False, None)
+    if f and f.group(1)[0] == fence[0] and len(f.group(1)) >= len(fence) \
+            and not line[f.end():].strip():
+        return True, None
+    return True, fence
+
+
+def _non_ws(s: str) -> int:
+    return len(re.sub(r"\s+", "", s))
+
+
+def stub_marker(text: str) -> Optional[str]:
+    """The `STUB_MARKERS` phrase that makes a page a stub, or None.
+
+    A stub has a marker in its Summary or in body prose (not fenced code,
+    inline code or blockquotes) AND, once marker sentences, header fields,
+    headings and the `## Related pages` section are removed, a body below
+    `EMPTY_BODY_CHARS` non-whitespace characters.
+    """
+    def marker_in(s: str) -> Optional[str]:
+        lowered = s.lower()
+        return next((m for m in STUB_MARKERS if m in lowered), None)
+
+    summary = SUMMARY_LINE_RE.search(text)
+    found = marker_in(CODE_SPAN_RE.sub(" ", summary.group(1))) if summary else None
+    kept = 0
+    fence: Optional[str] = None
+    related = False
+    for line in page_body(text).splitlines():
+        in_code, fence = _fence_step(line, fence)
+        s = line.strip()
+        if in_code or s.startswith(">"):
+            kept += 0 if related else _non_ws(line)
+            continue
+        if s.startswith("#"):
+            related = s.lstrip("#").strip().lower() == "related pages"
+            continue
+        if related or HEADER_FIELD_RE.match(s):
+            continue
+        kept += sum(_non_ws(c.group(0)) for c in CODE_SPAN_RE.finditer(line))
+        for sentence in SENTENCE_SPLIT_RE.split(CODE_SPAN_RE.sub(" ", line)):
+            m = marker_in(sentence)
+            if m:
+                found = found or m
+            else:
+                kept += _non_ws(sentence)
+    return found if found and kept < EMPTY_BODY_CHARS else None
 
 
 def body_after_h1(text: str) -> str:
@@ -338,11 +420,8 @@ def find_empty_pages(pages: List[dict]) -> List[dict]:
         slug = slug_from_path(page["path"])
         if skip_judgment(slug):
             continue
-        body = page_body(page["text"])
-        lowered = body.lower()
-        marker = next((m for m in STUB_MARKERS if m in lowered), None)
-        non_ws = re.sub(r"\s+", "", body)
-        if marker:
+        non_ws = re.sub(r"\s+", "", page_body(page["text"]))
+        if stub_marker(page["text"]):
             empty.append(
                 {"page": slug, "reason": "stub placeholder", "char_count": len(non_ws)}
             )
@@ -992,9 +1071,6 @@ def mark_reviewed(wiki_dir: Path, raw_dir: Path, payload: dict) -> dict:
     return {"recorded": sum(len(v) for v in new.values()), "pruned": pruned}
 
 
-FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
-# shortcut: inline code spans are matched per line; a span crossing a line break is not seen.
-CODE_SPAN_RE = re.compile(r"(`+).+?\1")
 LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s")
 
 
@@ -1020,18 +1096,15 @@ def _unlink_deleted(text: str, gone: set, index: bool) -> Tuple[str, List[str], 
     out: List[str] = []
     fence: Optional[str] = None
     for i, line in enumerate(lines):
-        f = FENCE_RE.match(line)
-        if fence is None and f:
-            fence = f.group(1)
-        elif fence is not None:
-            if f and f.group(1)[0] == fence[0] and len(f.group(1)) >= len(fence) \
-                    and not line[f.end():].strip():
-                fence = None
-        else:
-            links = WIKI_LINK_RE.findall(line)
-            if (index and LIST_ITEM_RE.match(line) and "![[" not in line
-                    and len(links) == 1 and link_target(links[0][0]) in gone):
-                target = link_target(links[0][0])
+        in_code, fence = _fence_step(line, fence)
+        if not in_code:
+            # Index removal counts only real links: not in inline code, not embeds.
+            plain = CODE_SPAN_RE.sub(lambda s: " " * len(s.group(0)), line)
+            links = [m.group(1) for m in WIKI_LINK_RE.finditer(plain)
+                     if not (m.start() and plain[m.start() - 1] == "!")]
+            if (index and LIST_ITEM_RE.match(line)
+                    and len(links) == 1 and link_target(links[0]) in gone):
+                target = link_target(links[0])
                 nxt = next((l for l in lines[i + 1:] if l.strip()), "")
                 if nxt and _indent(nxt) > _indent(line):
                     print(f"note: index.md line for deleted page {target} kept "
@@ -1073,7 +1146,7 @@ def apply_fixes(
     deleted = sorted(
         s for s, t in texts.items()
         if not skip_judgment(s) and s not in retired
-        and any(m in page_body(t).lower() for m in STUB_MARKERS))
+        and stub_marker(t))
     for slug in deleted:
         (wiki_dir / f"{slug}.md").unlink()
 

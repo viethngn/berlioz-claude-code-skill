@@ -477,6 +477,43 @@ def test_fix(tmp):
     after = wiki_bytes(root)
     r2 = run_lint(root, "--fix", "--allow-dirty")
     _assert(wiki_bytes(root) == after and r2["fixed"] == NO_FIXES, f"second --fix changes nothing: {r2['fixed']}")
+    commit(root, "lint: fix")
+    out = lint_proc(root, "--fix")
+    _assert(out.returncode == 0 and json.loads(out.stdout)["fixed"] == NO_FIXES and wiki_bytes(root) == after,
+            f"--fix after committing the fix changes nothing: {out.stderr}")
+
+
+def test_fix_stub_needs_short_body(tmp):
+    root = make_wiki(tmp)
+    long_pages = {
+        "style-guide": "\n\n> Placeholder — add content when a source covers this concept.\n",
+        "code-tbd": "\n\nWrite `TBD — mentioned in [[x]]` as the stub summary.\n",
+        "code-ph": "\n\nUse ``placeholder - add content`` in new stubs.\n",
+        "owners": "\n\nOwner: TBD - mentioned in standup.\n",
+    }
+    for slug, extra in long_pages.items():
+        write_page(root, slug, NEAR_DUP_A + extra)
+    (root / "wiki/foo.md").write_text(   # the stub template from ingest/references/page-format.md
+        "# Foo\n\n**Summary**: TBD — mentioned in [[bar]] but not yet expanded.\n\n**Sources**: (none yet)\n\n"
+        "**Last updated**: 2026-01-01\n\n---\n\nPlaceholder — add content when a source covers this concept.\n")
+    commit(root, "ingest: initial")
+    before = wiki_bytes(root)
+    r = run_lint(root, "--fix")
+    _assert(r["fixed"]["deleted_pages"] == ["foo"], f"only the real stub deleted: {r['fixed']}")
+    for slug in long_pages:
+        key = f"wiki/{slug}.md"
+        _assert((root / key).read_bytes() == before[key], f"{slug} byte-identical")
+    _assert(not any(e["page"] in long_pages for e in r["empty_pages"]), f"not stubs: {r['empty_pages']}")
+
+
+def test_page_body_header_detection(tmp):
+    sys.path.insert(0, str(LINT.parent))
+    import lint
+    wrapped = ("# T\n\n**Summary**: a long summary that is\nhard-wrapped onto a second line\n\n"
+               "**Sources**:\n- `raw/a.md`\n\n**Last updated**: 2026-01-01\n\n---\n\nShort body.\n")
+    _assert(lint.page_body(wrapped).strip() == "Short body.", "wrapped field is header material")
+    plain_list = "# T\n\n- a\n- b\n\n---\n\nrest\n"
+    _assert(lint.page_body(plain_list).strip().startswith("- a"), "a list after the H1 is body, not header")
 
 
 def test_fix_keeps_short_and_retired_pages(tmp):
@@ -534,13 +571,14 @@ def test_fix_index_nested_line_kept(tmp):
     write_page(root, "keeper", "Keeper content that is long enough here. " * 2)
     (root / "wiki/index.md").write_text(
         "# Index\n\n- [[stub]] — gone\n- [[stub2]] — has children\n  - [[keeper]] — nested\n"
-        "- [[keeper]] and [[stub]] — two links\n")
+        "- [[keeper]] and [[stub]] — two links\n- `[[stub]]` is the syntax\n")
     commit(root, "ingest: initial")
     out = lint_proc(root, "--fix")
     _assert(out.returncode == 0, out.stderr)
     r = json.loads(out.stdout)
     _assert((root / "wiki/index.md").read_text() ==
-            "# Index\n\n- [[stub2]] — has children\n  - [[keeper]] — nested\n- [[keeper]] and stub — two links\n",
+            "# Index\n\n- [[stub2]] — has children\n  - [[keeper]] — nested\n- [[keeper]] and stub — two links\n"
+            "- `[[stub]]` is the syntax\n",
             f"index: {(root / 'wiki/index.md').read_text()!r}")
     _assert("stub2" in out.stderr and "nested" in out.stderr, f"stderr note: {out.stderr}")
     _assert(r["fixed"]["removed_index_lines"] == ["stub"], f"fixed: {r['fixed']}")
