@@ -180,7 +180,7 @@ def index_sync(wiki_dir: Path) -> dict:
     lines, eol = _read_lines(index_path, default="# Wiki Index\n")
     original = "".join(lines)
     existing = {slug_from_path(p).lower() for p in collect_pages(wiki_dir)}
-    archived = archived_slugs(wiki_dir)
+    archived = {s.lower(): s for s in archived_slugs(wiki_dir)}
     content = {slug_from_path(p["path"]): p["text"] for p in _content_pages(wiki_dir)}
 
     kept: List[str] = []
@@ -204,15 +204,16 @@ def index_sync(wiki_dir: Path) -> dict:
         if target.lower() in existing or target.startswith(ARCHIVE_SUBDIR + "/") or is_journal_slug(target):
             kept.append(line)
             continue
-        nxt = lines[i + 1] if i + 1 < len(lines) else ""
-        if not _blank(nxt) and _indent(nxt) > _indent(line):
+        # A child may follow after blank lines (loose list) and is still nested.
+        nxt = next((n for n in lines[i + 1:] if not _blank(n)), "")
+        if nxt and _indent(nxt) > _indent(line):
             print(f"index-sync: left [[{target}]] at index.md line {i + 1} untouched: "
                   "it has nested lines, review it by hand", file=sys.stderr)
             kept.append(line)
             continue
         just_removed = True
-        if target in archived:
-            moved.append(target)
+        if target.lower() in archived:
+            moved.append(archived[target.lower()])
             to_archive.append(WIKI_LINK_RE.sub(
                 lambda m: m.group(0).replace("[[", f"[[{ARCHIVE_SUBDIR}/", 1)
                 if link_target(m.group(1)) == target else m.group(0),

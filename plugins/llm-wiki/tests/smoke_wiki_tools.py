@@ -194,6 +194,33 @@ def test_index_sync_nested_entry(tmp):
     _assert("[[gone]]" in proc.stderr and "line 4" in proc.stderr, f"stderr note: {proc.stderr!r}")
 
 
+def test_index_sync_loose_nested_entry(tmp):
+    root = make_wiki(tmp)
+    write_page(root, "alpha", "alpha body text. " * 6)
+    write_page(root, "archive/old", "old body text. " * 6)
+    index = root / "wiki/index.md"
+    original = ("# Wiki Index\n\n- [[alpha]]\n- [[gone]] parent\n\n  - child note\n\n"
+                "- [[old]] archived parent\n\n\n  - old child\n")
+    index.write_text(original)
+    proc = run_proc(root, "index-sync")
+    _assert(json.loads(proc.stdout) == {"added": [], "removed": [], "archived": []}, f"loose nested: {proc.stdout}")
+    _assert(index.read_text() == original, "file unchanged")
+    _assert("[[gone]]" in proc.stderr and "line 4" in proc.stderr, f"gone note: {proc.stderr!r}")
+    _assert("[[old]]" in proc.stderr and "line 8" in proc.stderr, f"old note: {proc.stderr!r}")
+
+
+def test_index_sync_archive_case_insensitive(tmp):
+    root = make_wiki(tmp)
+    write_page(root, "alpha", "alpha body text. " * 6)
+    write_page(root, "archive/old", "old body text. " * 6)
+    index = root / "wiki/index.md"
+    index.write_text("# Wiki Index\n\n- [[alpha]]\n- [[Old]] — capitalised\n")
+    out = run_tool(root, "index-sync")
+    _assert(out == {"added": [], "removed": [], "archived": ["old"]}, f"archive case: {out}")
+    _assert("- [[archive/Old]] — capitalised" in index.read_text().split("## Archive")[1], index.read_text())
+    _assert(run_tool(root, "index-sync") == {"added": [], "removed": [], "archived": []}, "idempotent")
+
+
 def test_index_sync_case_and_blank_lines(tmp):
     root = make_wiki(tmp)
     for s in ("alpha", "a", "b"):
