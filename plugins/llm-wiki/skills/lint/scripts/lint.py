@@ -10,6 +10,10 @@ Scans wiki/*.md and emits a JSON report of:
 
 `index`, `log` and README pages (EXEMPT_PAGES) are skipped by every per-page
 check, and their links do not count as inbound links for orphan detection.
+Journal pages (`YYYY-MM-DD`, `YYYY-MM-index`, written by the `log` skill) skip
+the same judgment checks, but their links count as inbound and are checked for
+broken targets. Link targets drop `#anchor`; cross-wiki `[[label/slug]]` links
+are never resolved (see `link_target`).
 
 Pages carrying `**Status**: Archived` or `**Status**: Superseded by [[...]]`
 are excluded from the orphan check (intentionally retired).
@@ -62,6 +66,8 @@ H1_RE = re.compile(r"^#\s+.+", re.MULTILINE)
 
 REQUIRED_FIELDS = ("Summary", "Sources", "Last updated")
 EXEMPT_PAGES = {"index", "log", "README", "readme"}
+# Append-only journal written by the `log` skill: day-pages and monthly rollups.
+JOURNAL_SLUG_RE = re.compile(r"^\d{4}-\d{2}-(?:\d{2}|index)$")
 NEEDS_VERIFICATION_RE = re.compile(r"\(?source:\s*needs verification\)?", re.IGNORECASE)
 # A raw/ path token inside a Sources entry — stops at backtick, comma, quote,
 # whitespace, or closing bracket/paren so multi-path lines split correctly.
@@ -92,6 +98,28 @@ def load_page(path: Path) -> dict:
 
 def wiki_links_in(text: str) -> List[str]:
     return [m.group(1).strip() for m in WIKI_LINK_RE.finditer(text)]
+
+
+def is_journal_slug(slug: str) -> bool:
+    return bool(JOURNAL_SLUG_RE.match(slug))
+
+
+def skip_judgment(slug: str) -> bool:
+    """Exempt and journal pages get no per-page judgment checks."""
+    return slug in EXEMPT_PAGES or is_journal_slug(slug)
+
+
+def link_target(raw: str) -> Optional[str]:
+    """Resolvable page slug of a wiki-link target: `#anchor` stripped; None for
+    a cross-wiki link (`label/slug`, not `archive/...`) or a pure `[[#anchor]]`."""
+    target = raw.split("#", 1)[0].strip()
+    if "/" in target and target.split("/", 1)[0] != ARCHIVE_SUBDIR:
+        return None
+    return target or None
+
+
+def resolved_links(text: str) -> set:
+    return {t for t in map(link_target, wiki_links_in(text)) if t}
 
 
 def has_field(text: str, name: str) -> bool:
@@ -172,7 +200,7 @@ def build_edges(pages: List[dict]) -> Dict[str, List[str]]:
     edges: Dict[str, List[str]] = {}
     for page in pages:
         slug = slug_from_path(page["path"])
-        targets = sorted(set(wiki_links_in(page["text"])))
+        targets = sorted(resolved_links(page["text"]))
         edges[slug] = targets
     return edges
 
@@ -222,7 +250,7 @@ def find_orphans(
     orphans = []
     for page in pages:
         slug = slug_from_path(page["path"])
-        if slug in EXEMPT_PAGES or slug in retired:
+        if skip_judgment(slug) or slug in retired:
             continue
         if inbound.get(slug, 0) == 0:
             orphans.append(slug)
@@ -258,7 +286,7 @@ def find_broken_links(
 def find_format_violations(pages: List[dict]) -> List[dict]:
     violations: List[dict] = []
     for page in pages:
-        if slug_from_path(page["path"]) in EXEMPT_PAGES:
+        if skip_judgment(slug_from_path(page["path"])):
             continue
         text = page["text"]
         missing = []
@@ -279,7 +307,7 @@ def find_empty_pages(pages: List[dict]) -> List[dict]:
     empty: List[dict] = []
     for page in pages:
         slug = slug_from_path(page["path"])
-        if slug in EXEMPT_PAGES:
+        if skip_judgment(slug):
             continue
         body = page_body(page["text"])
         lowered = body.lower()
@@ -559,7 +587,7 @@ def find_source_drift(
     out: List[dict] = []
     for page in pages:
         slug = slug_from_path(page["path"])
-        if slug in EXEMPT_PAGES or slug in (retired or set()):
+        if skip_judgment(slug) or slug in (retired or set()):
             continue
         page_c = last_commit(wiki_root, f"{wiki_subdir}/{page['path'].name}", skip_lint=True)
         if page_c is None:
@@ -583,7 +611,7 @@ def find_source_drift(
 def find_unsourced(pages: List[dict]) -> List[dict]:
     unsourced: List[dict] = []
     for page in pages:
-        if slug_from_path(page["path"]) in EXEMPT_PAGES:
+        if skip_judgment(slug_from_path(page["path"])):
             continue
         text = page["text"]
         sources = parse_sources(text)
@@ -632,7 +660,7 @@ def _info(page: dict, raw_dir: Path) -> dict:
         page["_info"] = {
             "slug": slug_from_path(page["path"]),
             "sources": set(resolve_source_paths(page["text"], raw_dir)),
-            "links": set(wiki_links_in(page_body(page["text"]))),
+            "links": resolved_links(page_body(page["text"])),
             "shingles": {prose[i:i + SHINGLE] for i in range(max(len(prose) - SHINGLE + 1, 1))},
         }
     return page["_info"]
@@ -653,9 +681,10 @@ def _numeric(page: dict) -> List[Tuple[str, str, List[str]]]:
 
 
 def active_pages(pages: List[dict]) -> List[dict]:
-    """Content pages compared by overlap/collision checks: not exempt, not retired."""
-    skip = EXEMPT_PAGES | retired_slugs(pages)
-    return [p for p in pages if slug_from_path(p["path"]) not in skip]
+    """Content pages compared by overlap/collision checks: not exempt, journal or retired."""
+    retired = retired_slugs(pages)
+    return [p for p in pages
+            if not skip_judgment(slug_from_path(p["path"])) and slug_from_path(p["path"]) not in retired]
 
 
 def related_pairs(

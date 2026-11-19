@@ -313,6 +313,40 @@ def test_traversal_source_reported_missing(tmp):
     _assert(ms == [{"page": "p", "missing": ["raw/../../etc/passwd"]}], f"missing_sources: {ms}")
 
 
+def test_journal_pages_exempt(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
+    day = "## 09:00 — Decided limit\n\nThe API rate limit is 1000 requests per minute for all tenants.\n\n**Sources**: `raw/a.md`\n"
+    write_page(root, "2026-01-02", day)
+    write_page(root, "2026-01-03", day.replace("1000", "5000"))
+    write_page(root, "2026-01-index", "- [[2026-01-02]]\n- [[2026-01-03]]\n")
+    write_page(root, "only-from-diary", "Linked only from a day page. " * 4)
+    p = root / "wiki/2026-01-02.md"; p.write_text(p.read_text() + "\nSee [[only-from-diary]].\n")
+    r = run_lint(root)
+    journal = {"2026-01-02", "2026-01-03", "2026-01-index"}
+    _assert(not journal & set(r["orphans"]), f"journal not orphans: {r['orphans']}")
+    _assert("only-from-diary" not in r["orphans"], "day-page link counts as inbound")
+    _assert(r["fact_collisions"] == [] and r["overlap_candidates"] == [], "journal pages never compared")
+    for key in ("empty_pages", "format_violations", "unsourced_claims"):
+        _assert(not any(e["page"] in journal for e in r[key]), f"journal exempt from {key}")
+    _assert(not any(d["page"] in journal for d in r["source_drift"]), "journal exempt from drift")
+
+
+def test_link_resolution(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
+    write_page(root, "target", "Has a section. " * 5)
+    write_page(root, "linker", "See [[target#Section]], [[other-wiki/some-page]], [[ghost#part]] and [[#local]]. " * 2)
+    write_page(root, "2026-02-01", "## 10:00 — Note\n\nSee [[ghost2]] and [[label/slug]].\n")
+    r = run_lint(root)
+    broken = {(b["from"], b["to"]) for b in r["broken_links"]}
+    _assert("target" not in r["orphans"], "anchor link counts as inbound to target")
+    _assert(all(b["from"] != "linker" or "ghost" in b["to"] for b in r["broken_links"]), f"only ghost is broken from linker: {broken}")
+    _assert(any(b["from"] == "linker" and b["to"].startswith("ghost") for b in r["broken_links"]), "missing page with anchor is broken")
+    _assert(any(b["from"] == "2026-02-01" and b["to"] == "ghost2" for b in r["broken_links"]), "journal links still checked")
+    _assert(not any("/" in b["to"] and not b["to"].startswith("archive/") for b in r["broken_links"]), "cross-wiki never broken")
+
+
 def main() -> int:
     tests = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed = 0
