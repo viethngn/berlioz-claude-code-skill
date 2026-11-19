@@ -29,12 +29,13 @@ REPORTS them; the /lint skill deletes them after user confirmation.
 
 Usage:
     python3 lint.py --wiki-root PATH [--sources] [--graph] [--max-candidates N]
-                    [--full | --since-last-lint] [--fix]
+                    [--full | --since-last-lint] [--fix [--allow-dirty]]
     python3 lint.py --wiki-root PATH --mark-reviewed < reviewed.json
 
-`--fix` (see `apply_fixes`) deletes empty pages, unlinks unresolvable links and
-repairs unambiguous missing Sources paths, then reports on the fixed wiki
-under the extra key `fixed`.
+`--fix` (see `apply_fixes`) deletes stub-placeholder pages, unlinks links to
+them (dropping their index lines) and repairs a missing Sources path by exact
+stem, then reports on the fixed wiki under the extra key `fixed`. It refuses
+(exit 2) outside a git work tree or with uncommitted wiki changes.
 
 `wiki/.lint-reviewed.json` remembers reviewed overlap pairs, collisions and
 acknowledged drift by content hash; a matching item is left out of the report
@@ -143,8 +144,11 @@ def has_field(text: str, name: str) -> bool:
     return bool(re.search(pattern, text, re.MULTILINE))
 
 
+SOURCES_BLOCK_RE = re.compile(r"\*\*Sources\*\*\s*:\s*(.+?)(?=\n\*\*|\n---|\n#|\Z)", re.S)
+
+
 def parse_sources(text: str) -> List[str]:
-    m = re.search(r"\*\*Sources\*\*\s*:\s*(.+?)(?=\n\*\*|\n---|\n#|\Z)", text, re.S)
+    m = SOURCES_BLOCK_RE.search(text)
     if not m:
         return []
     block = m.group(1)
@@ -181,10 +185,18 @@ def parse_status(text: str) -> Tuple[Optional[str], Optional[str]]:
     return lowered.split()[0] if lowered else None, None
 
 
+# Lines allowed before the header `---`: the H1, blanks, `**Field**:` lines,
+# their list-item continuations, and a blockquote banner.
+HEADER_LINE_RE = re.compile(r"^(?:#\s.*|\*\*[^*]+\*\*\s*:.*|\s*[-*+]\s.*|\s*>.*|\s*)$")
+
+
 def page_body(text: str) -> str:
-    """Return the page body after the first `---` separator (or whole text)."""
-    parts = text.split("\n---", 1)
-    return parts[1] if len(parts) == 2 else text
+    """Return the page body: after the first `---` when everything before it is
+    header material, else everything after the H1 (a `---` in prose is a rule)."""
+    head, sep, rest = text.partition("\n---")
+    if sep and all(HEADER_LINE_RE.match(line) for line in head.splitlines()):
+        return rest
+    return body_after_h1(text)
 
 
 def body_after_h1(text: str) -> str:
@@ -979,58 +991,141 @@ def mark_reviewed(wiki_dir: Path, raw_dir: Path, payload: dict) -> dict:
     return {"recorded": sum(len(v) for v in new.values()), "pruned": pruned}
 
 
-def apply_fixes(pages: List[dict], wiki_dir: Path, raw_dir: Path) -> dict:
-    """Judgment-free cleanups: delete empty pages, unlink unresolvable
-    `[[links]]`, repoint a missing Sources path to its single plausible raw.
+FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+# shortcut: inline code spans are matched per line; a span crossing a line break is not seen.
+CODE_SPAN_RE = re.compile(r"(`+).+?\1")
+LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s")
 
-    Journal pages and log.md are never written; cross-wiki links and
-    traversal Sources paths are never touched.
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _unlink_deleted(text: str, gone: set, index: bool) -> Tuple[str, List[str], List[str]]:
+    """Unlink `[[links]]` to deleted pages outside code and embeds; in the index,
+    drop a list line whose only link is to a deleted page. Returns (text,
+    unlinked targets, removed index slugs). Line endings are kept as they are."""
+    dropped: List[str] = []
+    removed: List[str] = []
+
+    def sub(m: "re.Match") -> str:
+        target = link_target(m.group(1))
+        if target not in gone or (m.start() and m.string[m.start() - 1] == "!"):
+            return m.group(0)
+        dropped.append(target)
+        return (m.group(2) or m.group(1)).strip()
+
+    lines = text.splitlines(keepends=True)
+    out: List[str] = []
+    fence: Optional[str] = None
+    for i, line in enumerate(lines):
+        f = FENCE_RE.match(line)
+        if fence is None and f:
+            fence = f.group(1)
+        elif fence is not None:
+            if f and f.group(1)[0] == fence[0] and len(f.group(1)) >= len(fence) \
+                    and not line[f.end():].strip():
+                fence = None
+        else:
+            links = WIKI_LINK_RE.findall(line)
+            if (index and LIST_ITEM_RE.match(line) and "![[" not in line
+                    and len(links) == 1 and link_target(links[0][0]) in gone):
+                target = link_target(links[0][0])
+                nxt = next((l for l in lines[i + 1:] if l.strip()), "")
+                if nxt and _indent(nxt) > _indent(line):
+                    print(f"note: index.md line for deleted page {target} kept "
+                          "(nested content follows)", file=sys.stderr)
+                    out.append(line)
+                else:
+                    removed.append(target)
+                continue
+            pos, parts = 0, []
+            for span in CODE_SPAN_RE.finditer(line):
+                parts += [WIKI_LINK_RE.sub(sub, line[pos:span.start()]), span.group(0)]
+                pos = span.end()
+            line = "".join(parts) + WIKI_LINK_RE.sub(sub, line[pos:])
+        out.append(line)
+    return "".join(out), dropped, removed
+
+
+def apply_fixes(
+    pages: List[dict], wiki_dir: Path, raw_dir: Path, warnings: Optional[List[str]] = None
+) -> dict:
+    """Judgment-free cleanups: delete stub-placeholder pages, unlink links to
+    the pages deleted in this run (and drop their index lines), repoint a
+    missing Sources path to the one `raw/*.md` with exactly its stem.
+
+    Never writes log.md, journal pages or a page that is not valid UTF-8;
+    keeps every byte it does not change (line endings included). Other broken
+    links are left for the report.
     """
-    deleted = sorted(e["page"] for e in find_empty_pages(pages))
+    texts: Dict[str, str] = {}
+    for page in pages:
+        try:
+            with open(page["path"], encoding="utf-8", newline="") as f:
+                texts[slug_from_path(page["path"])] = f.read()
+        except UnicodeDecodeError:
+            if warnings is not None:
+                warnings.append(f"--fix skipped {page['path'].name}: not valid UTF-8")
+
+    retired = retired_slugs(pages)
+    deleted = sorted(
+        s for s, t in texts.items()
+        if not skip_judgment(s) and s not in retired
+        and any(m in page_body(t).lower() for m in STUB_MARKERS))
     for slug in deleted:
         (wiki_dir / f"{slug}.md").unlink()
-    pages = [p for p in pages if slug_from_path(p["path"]) not in deleted]
 
-    archived = archived_slugs(wiki_dir)
-    existing = {slug_from_path(p["path"]) for p in pages} | archived
-    existing |= {f"{ARCHIVE_SUBDIR}/{s}" for s in archived}
-    raws = sorted(p for p in raw_dir.glob("*.md") if p.is_file()) if raw_dir.exists() else []
+    raws = ({p.stem: p for p in raw_dir.glob("*.md") if p.is_file()}
+            if raw_dir.name == "raw" and raw_dir.is_dir() else {})
     wiki_root = raw_dir.parent
     unlinked: List[dict] = []
     repaired: List[dict] = []
+    removed: List[str] = []
 
-    for page in pages:
-        slug = slug_from_path(page["path"])
-        if slug == "log" or is_journal_slug(slug):
+    for slug, old in texts.items():
+        if slug in deleted or slug == "log" or is_journal_slug(slug):
             continue
-        dropped: List[str] = []
-
-        def unlink(m: "re.Match") -> str:
-            target = link_target(m.group(1))
-            if target is None or target in existing:
-                return m.group(0)
-            dropped.append(target)
-            return (m.group(2) or m.group(1)).strip()
-
-        text = WIKI_LINK_RE.sub(unlink, page["text"])
+        text, dropped, rm = _unlink_deleted(old, set(deleted), slug == "index")
         unlinked += [{"page": slug, "target": t} for t in dict.fromkeys(dropped)]
+        removed += rm
 
+        done = set()
         for missing in dict.fromkeys(resolve_source_paths(text, raw_dir)):
-            if (wiki_root / missing).exists():
+            raw = raws.get(Path(missing).stem)
+            if raw is None or (wiki_root / missing).exists():
                 continue
-            stem = Path(missing).stem
-            found = [r for r in raws if r.stem == stem or f"-{stem}-" in f"-{r.stem}-"]
-            if len(found) != 1:
-                continue
-            new = f"{raw_dir.name}/{found[0].name}"
-            m = re.search(r"\*\*Sources\*\*\s*:\s*(.+?)(?=\n\*\*|\n---|\n#|\Z)", text, re.S)
+            new = f"raw/{raw.name}"
+            m = SOURCES_BLOCK_RE.search(text)
             block = PATH_TOKEN_RE.sub(lambda t: new if t.group(0) == missing else t.group(0), m.group(1))
             text = text[:m.start(1)] + block + text[m.end(1):]
-            repaired.append({"page": slug, "from": missing, "to": new})
+            if new not in done:
+                done.add(new)
+                repaired.append({"page": slug, "from": missing, "to": new})
 
-        if text != page["text"]:
-            page["path"].write_text(text, encoding="utf-8")
-    return {"deleted_pages": deleted, "unlinked": unlinked, "repaired_sources": repaired}
+        if text != old:
+            with open(wiki_dir / f"{slug}.md", "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+    return {"deleted_pages": deleted, "unlinked": unlinked,
+            "repaired_sources": repaired, "removed_index_lines": removed}
+
+
+def fix_refusal(wiki_root: Path, wiki_subdir: str, allow_dirty: bool) -> Optional[str]:
+    """Why `--fix` must not run here, or None: it needs a git work tree and,
+    unless allow_dirty, no uncommitted changes under the wiki dir."""
+    if (_git(wiki_root, "rev-parse", "--is-inside-work-tree") or "").strip() != "true":
+        return f"--fix needs a git work tree; {wiki_root} is not inside one"
+    if allow_dirty:
+        return None
+    dirty = (_git_paths(wiki_root, "ls-files", "-m", "--", wiki_subdir)
+             | _git_paths(wiki_root, "diff", "--cached", "--name-only", "--relative", "--", wiki_subdir)
+             | {p for p in _git_paths(wiki_root, "ls-files", "-o", "--exclude-standard", "--", wiki_subdir)
+                if p.endswith(".md")})
+    if dirty:
+        shown = ", ".join(sorted(dirty)[:5]) + (", ..." if len(dirty) > 5 else "")
+        return (f"--fix refused: uncommitted changes under {wiki_subdir}/ ({shown}); "
+                "commit them or pass --allow-dirty")
+    return None
 
 
 def changed_since_last_lint(wiki_root: Path) -> Optional[set]:
@@ -1105,8 +1200,10 @@ def main() -> int:
                         help=f"Record reviewed items read from stdin into wiki/{REVIEWED_FILE}; "
                              "runs no checks")
     writes.add_argument("--fix", action="store_true",
-                        help="Delete empty pages, unlink broken links and repair missing "
-                             "Sources paths, then report on the fixed wiki")
+                        help="Delete stub-placeholder pages, unlink links to them, repair "
+                             "missing Sources paths by exact stem, then report on the fixed wiki")
+    parser.add_argument("--allow-dirty", action="store_true",
+                        help="With --fix: run despite uncommitted changes under the wiki dir")
     args = parser.parse_args()
     warnings: List[str] = []
 
@@ -1151,7 +1248,11 @@ def main() -> int:
     pages = [load_page(p) for p in collect_pages(wiki_dir)]
     fixed = None
     if args.fix:
-        fixed = apply_fixes(pages, wiki_dir, raw_dir)
+        refusal = fix_refusal(wiki_root, wiki_subdir, args.allow_dirty)
+        if refusal:
+            print(f"ERROR: {refusal}", file=sys.stderr)
+            return 2
+        fixed = apply_fixes(pages, wiki_dir, raw_dir, warnings)
         pages = [load_page(p) for p in collect_pages(wiki_dir)]
 
     archived = archived_slugs(wiki_dir)

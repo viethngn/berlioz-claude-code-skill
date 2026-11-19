@@ -377,6 +377,7 @@ def test_archive_link_case_insensitive(tmp):
     root = make_wiki(tmp)
     write_page(root, "archive/old", "Old content kept for history.")
     write_page(root, "user", "See [[Archive/old]] and [[ARCHIVE/old#Part]]. " * 2)
+    commit(root, "ingest: initial")
     r = run_lint(root, "--fix")
     _assert(not any(b["from"] == "user" for b in r["broken_links"]), f"Archive/ resolves: {r['broken_links']}")
     _assert("[[Archive/old]]" in (root / "wiki/user.md").read_text(), "--fix keeps Archive/ link")
@@ -434,43 +435,194 @@ def test_collision_template_does_not_crowd_out(tmp):
     _assert("fact_collisions: showing 50 of 67 found (exact: 66, fuzzy: 1)" in r["warnings"], f"warning: {r['warnings']}")
 
 
+STUB = "Placeholder — add content when a source covers this concept."
+NO_FIXES = {"deleted_pages": [], "unlinked": [], "repaired_sources": [], "removed_index_lines": []}
+
+
+def lint_proc(root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(LINT), "--wiki-root", str(root), *args],
+                          capture_output=True, text=True)
+
+
+def wiki_bytes(root: Path) -> dict:
+    return {p.relative_to(root).as_posix(): p.read_bytes()
+            for p in sorted((root / "wiki").rglob("*")) if p.is_file()}
+
+
 def test_fix(tmp):
     root = make_wiki(tmp)
-    write_raw(root, "api-guide-v2.md", "# g\n\nreal content that is long enough to count.\n")
-    write_page(root, "stub", "Placeholder — add content when a source covers this concept.")
-    write_page(root, "keeper", "See [[stub]] and [[ghost|the ghost page]] and [[real]]. " * 2, sources=("raw/api-guide.md",))
-    write_page(root, "real", "Links back to [[keeper]]. " * 4, sources=("raw/api-guide-v2.md",))
-    before = (root / "wiki/keeper.md").read_text()
-    _assert(run_lint(root)["empty_pages"] and (root / "wiki/stub.md").exists(), "no --fix → no writes")
-    _assert((root / "wiki/keeper.md").read_text() == before, "no --fix → page untouched")
+    write_raw(root, "api-guide.md", "# g\n\nreal content that is long enough to count.\n")
+    write_page(root, "stub", STUB)
+    write_page(root, "keeper", "See [[stub]] and [[ghost|the ghost page]] and [[real]]. " * 2, sources=("raw/api-guide.pdf",))
+    write_page(root, "real", "Links back to [[keeper]]. " * 4, sources=("raw/api-guide.md",))
+    (root / "wiki/index.md").write_text("# Index\n\n- [[stub]] — placeholder\n- [[keeper]] — keeper\n- [[real]] — real\n")
+    commit(root, "ingest: initial")
+    before = wiki_bytes(root)
+    _assert(run_lint(root)["empty_pages"] and wiki_bytes(root) == before, "no --fix → no writes")
     r = run_lint(root, "--fix")
-    _assert(r["fixed"]["deleted_pages"] == ["stub"] and not (root / "wiki/stub.md").exists(), "stub deleted")
+    _assert(r["fixed"] == {
+        "deleted_pages": ["stub"],
+        "unlinked": [{"page": "keeper", "target": "stub"}],
+        "repaired_sources": [{"page": "keeper", "from": "raw/api-guide.pdf", "to": "raw/api-guide.md"}],
+        "removed_index_lines": ["stub"]}, f"fixed: {r['fixed']}")
+    _assert(not (root / "wiki/stub.md").exists(), "stub deleted")
     text = (root / "wiki/keeper.md").read_text()
-    _assert("[[stub]]" not in text and "the ghost page" in text and "[[ghost" not in text, "unlinked, alias text kept")  # Review Focus 4
-    _assert("[[real]]" in text, "valid link kept")
-    _assert("raw/api-guide-v2.md" in text, "source path repaired")
-    _assert(r["broken_links"] == [] and r["empty_pages"] == [] and r["missing_sources"] == [], "report is post-fix")
+    _assert("[[stub]]" not in text and "See stub and" in text, "link to deleted stub unlinked")
+    _assert("[[ghost|the ghost page]]" in text and "[[real]]" in text, "other links kept")  # Review Focus 4
+    _assert("raw/api-guide.md" in text and "api-guide.pdf" not in text, "exact-stem source repaired")
+    _assert((root / "wiki/index.md").read_text() == "# Index\n\n- [[keeper]] — keeper\n- [[real]] — real\n",
+            "index line removed, not turned into text")
+    _assert(r["broken_links"] == [{"from": "keeper", "to": "ghost"}], f"other broken links report-only: {r['broken_links']}")
+    _assert(r["empty_pages"] == [] and r["missing_sources"] == [], "report is post-fix")
+    after = wiki_bytes(root)
+    r2 = run_lint(root, "--fix", "--allow-dirty")
+    _assert(wiki_bytes(root) == after and r2["fixed"] == NO_FIXES, f"second --fix changes nothing: {r2['fixed']}")
+
+
+def test_fix_keeps_short_and_retired_pages(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
+    (root / "wiki/hr.md").write_text("# Release process\n\nReleases are cut every second Tuesday by on-call.\n\n---\n\nSee also.\n")
+    write_page(root, "def", "TTL: time to live, in seconds.")
+    write_page(root, "redirect", "See [[target-page]].")
+    write_page(root, "table", "| a | b |\n|---|---|\n| 1 | 2 |")
+    p = write_page(root, "old-stub", STUB)
+    p.write_text(p.read_text().replace("**Last updated**", "**Status**: Superseded by [[target-page]]\n\n**Last updated**"))
+    write_page(root, "target-page", "See [[def]], [[redirect]], [[table]], [[old-stub]] and [[hr]]. " * 2)
+    (root / "wiki/index.md").write_text("# Index\n\n- [[def]] — TTL definition\n- [[old-stub]] — old\n")
+    commit(root, "ingest: initial")
+    before = wiki_bytes(root)
+    r = run_lint(root, "--fix")
+    _assert(r["fixed"] == NO_FIXES and wiki_bytes(root) == before, f"nothing deleted or rewritten: {r['fixed']}")
+    _assert(not any(e["page"] == "hr" for e in r["empty_pages"]), "a --- rule in prose is not the header separator")
+
+
+def test_fix_never_touches_code_or_embeds(tmp):
+    root = make_wiki(tmp)
+    write_page(root, "stub", STUB)
+    code = ("Shell check:\n\n```sh\nif [[ -f \"$cfg\" ]]; then\n  echo [[stub]]\nfi\n```\n\n"
+            "~~~~\n[[stub]]\n```\nstill fenced [[stub]]\n~~~~\n\n"
+            "Inline `[[stub]]` and ``a `[[stub]]` b`` and an embed ![[stub]] and ![[diagram.png]] "
+            "and `[[ghost-inline]]` and x=[[template]].\n")
+    write_page(root, "code", code)
+    write_page(root, "prose", "Mentions [[stub]] in plain prose. " * 2)
+    commit(root, "ingest: initial")
+    before = (root / "wiki/code.md").read_bytes()
+    r = run_lint(root, "--fix")
+    _assert(r["fixed"]["deleted_pages"] == ["stub"], f"stub deleted: {r['fixed']}")
+    _assert((root / "wiki/code.md").read_bytes() == before, "code, inline code and embeds byte-identical")
+    _assert(r["fixed"]["unlinked"] == [{"page": "prose", "target": "stub"}], f"unlinked: {r['fixed']['unlinked']}")
+
+
+def test_fix_keeps_case_and_nested_archive_links(tmp):
+    root = make_wiki(tmp)
+    write_page(root, "real-page", "Real content that is long enough here. " * 2)
+    write_page(root, "archive/2025/old", "Old content kept for history.")
+    write_page(root, "stub", STUB)
+    write_page(root, "linker", "See [[Real-Page]] and [[archive/2025/old]]. " * 2)
+    commit(root, "ingest: initial")
+    before = (root / "wiki/linker.md").read_bytes()
+    r = run_lint(root, "--fix")
+    _assert(r["fixed"]["deleted_pages"] == ["stub"] and r["fixed"]["unlinked"] == [], f"fixed: {r['fixed']}")
+    _assert((root / "wiki/linker.md").read_bytes() == before, "existing-page links byte-identical")
+
+
+def test_fix_index_nested_line_kept(tmp):
+    root = make_wiki(tmp)
+    write_page(root, "stub", STUB)
+    write_page(root, "stub2", STUB)
+    write_page(root, "keeper", "Keeper content that is long enough here. " * 2)
+    (root / "wiki/index.md").write_text(
+        "# Index\n\n- [[stub]] — gone\n- [[stub2]] — has children\n  - [[keeper]] — nested\n"
+        "- [[keeper]] and [[stub]] — two links\n")
+    commit(root, "ingest: initial")
+    out = lint_proc(root, "--fix")
+    _assert(out.returncode == 0, out.stderr)
+    r = json.loads(out.stdout)
+    _assert((root / "wiki/index.md").read_text() ==
+            "# Index\n\n- [[stub2]] — has children\n  - [[keeper]] — nested\n- [[keeper]] and stub — two links\n",
+            f"index: {(root / 'wiki/index.md').read_text()!r}")
+    _assert("stub2" in out.stderr and "nested" in out.stderr, f"stderr note: {out.stderr}")
+    _assert(r["fixed"]["removed_index_lines"] == ["stub"], f"fixed: {r['fixed']}")
+    _assert(r["fixed"]["unlinked"] == [{"page": "index", "target": "stub"}], f"fixed: {r['fixed']}")
+
+
+def test_fix_sources_exact_stem_only(tmp):
+    root = make_wiki(tmp)
+    for name in ("old-api-guide-v1.md", "security-guide.md", "manual.md"):
+        write_raw(root, name, "# r\n\nraw content that is long enough to count here.\n")
+    write_page(root, "loose", "Cites near-miss paths only. " * 3, sources=("raw/api-guide.md", "raw/guide.md"))
+    write_page(root, "exact", "Cites two other formats. " * 3, sources=("raw/manual.pdf", "raw/manual.txt"))
+    commit(root, "ingest: initial")
+    before = (root / "wiki/loose.md").read_bytes()
+    r = run_lint(root, "--fix")
+    _assert((root / "wiki/loose.md").read_bytes() == before, "no segment-run repair")
+    _assert(r["fixed"]["repaired_sources"] == [{"page": "exact", "from": "raw/manual.pdf", "to": "raw/manual.md"}],
+            f"one entry per repaired file: {r['fixed']['repaired_sources']}")
+    _assert("manual.pdf" not in (root / "wiki/exact.md").read_text(), "both paths repointed")
+
+
+def test_fix_preserves_bytes(tmp):
+    root = make_wiki(tmp)
+    write_page(root, "stub", STUB)
+    crlf = (b"# crlf\r\n\r\n**Summary**: s\r\n\r\n**Sources**:\r\n- `raw/a.md`\r\n\r\n**Last updated**: 2026-01-01\r\n"
+            b"\r\n---\r\n\r\nSee [[stub]] for the plan and more words here.\r\n")
+    latin = b"# latin\n\n---\n\nCaf\xe9 notes link [[stub]] and more words to be long enough.\n"
+    (root / "wiki/crlf.md").write_bytes(crlf)
+    (root / "wiki/latin.md").write_bytes(latin)
+    subprocess.run(["git", "config", "core.autocrlf", "false"], cwd=root, check=True)
+    commit(root, "ingest: initial")
+    r = run_lint(root, "--fix")
+    _assert((root / "wiki/crlf.md").read_bytes() == crlf.replace(b"[[stub]]", b"stub"), "CRLF kept")
+    _assert((root / "wiki/latin.md").read_bytes() == latin, "non-UTF-8 page never written")
+    _assert(any("latin.md" in w for w in r["warnings"]), f"warning names it: {r['warnings']}")
+
+
+def test_fix_refuses_non_git_and_dirty(tmp):
+    root = make_wiki(tmp)
+    write_page(root, "stub", STUB)
+    p = write_page(root, "p", "See [[stub]] for the plan. " * 2)
+    commit(root, "ingest: initial")
+    p.write_text(p.read_text() + "\nlocal edit\n")
+    snap = wiki_bytes(root)
+    out = lint_proc(root, "--fix")
+    _assert(out.returncode == 2 and "p.md" in out.stderr and "--allow-dirty" in out.stderr, f"dirty tracked: {out.stderr}")
+    _assert(wiki_bytes(root) == snap, "nothing written on refusal")
+    commit(root, "ingest: edit")
+    write_page(root, "new", "An untracked page with enough words. " * 2)
+    snap = wiki_bytes(root)
+    out = lint_proc(root, "--fix")
+    _assert(out.returncode == 2 and "new.md" in out.stderr and wiki_bytes(root) == snap, f"untracked .md: {out.stderr}")
+    r = run_lint(root, "--fix", "--allow-dirty")
+    _assert(r["fixed"]["deleted_pages"] == ["stub"], "--allow-dirty proceeds")
+    shutil.rmtree(root / ".git")
+    write_page(root, "stub", STUB)
+    snap = wiki_bytes(root)
+    out = lint_proc(root, "--fix", "--allow-dirty")
+    _assert(out.returncode == 2 and "git" in out.stderr and wiki_bytes(root) == snap, f"non-git: {out.stderr}")
 
 
 def test_fix_journal_crosswiki_log_traversal(tmp):
     root = make_wiki(tmp)
-    write_raw(root, "api-guide-v2.md", "# g\n\nreal content that is long enough to count.\n")
+    write_raw(root, "api-guide.md", "# g\n\nreal content that is long enough to count.\n")
+    write_page(root, "stub", STUB)
     day = root / "wiki/2026-01-02.md"
-    day.write_text("# 2026-01-02\n\n## 09:00 — Note\n\nSee [[other/slug]], [[2026-01-02#Heading]] and [[ghost3]].\n")
-    write_page(root, "normal", "See [[other/slug]] and [[ghost#part]] here. " * 2, sources=("raw/../api-guide.md",))
-    (root / "wiki/log.md").write_text("# Log\n\n## 2026-01-01\n- created [[gone]]\n")
+    day.write_text("# 2026-01-02\n\n## 09:00 — Note\n\nSee [[other/slug]], [[2026-01-02#Heading]], [[stub]] and [[ghost3]].\n")
+    write_page(root, "normal", "See [[other/slug]], [[stub#part]] and [[ghost#part]] here. " * 2,
+               sources=("raw/../api-guide.md",))
+    (root / "wiki/log.md").write_text("# Log\n\n## 2026-01-01\n- created [[stub]]\n")
     (root / "wiki/.lint-reviewed.json").write_text('{"pairs": []}\n')
+    commit(root, "ingest: initial")
     snap = {p: p.read_bytes() for p in (day, root / "wiki/log.md", root / "wiki/.lint-reviewed.json")}
     r = run_lint(root, "--fix")
     for p, b in snap.items():
         _assert(p.read_bytes() == b, f"{p.name} byte-identical after --fix")
     text = (root / "wiki/normal.md").read_text()
-    _assert("[[other/slug]]" in text, "cross-wiki link kept")
-    _assert("[[ghost" not in text and "ghost#part here" in text, f"anchored ghost unlinked: {text}")
+    _assert("[[other/slug]]" in text and "[[ghost#part]]" in text, "cross-wiki and never-existing links kept")
+    _assert("[[stub" not in text and "stub#part and" in text, f"anchored link to deleted page unlinked: {text}")
     _assert("raw/../api-guide.md" in text and r["fixed"]["repaired_sources"] == [], "traversal never repaired")
-    _assert(r["fixed"]["unlinked"] == [{"page": "normal", "target": "ghost"}], f"unlinked: {r['fixed']['unlinked']}")
-    out = subprocess.run([sys.executable, str(LINT), "--wiki-root", str(root), "--fix", "--mark-reviewed"],
-                         capture_output=True, text=True)
+    _assert(r["fixed"]["unlinked"] == [{"page": "normal", "target": "stub"}], f"unlinked: {r['fixed']['unlinked']}")
+    out = lint_proc(root, "--fix", "--mark-reviewed")
     _assert(out.returncode == 2 and "not allowed" in out.stderr, f"--fix with --mark-reviewed: {out.stderr}")
 
 
