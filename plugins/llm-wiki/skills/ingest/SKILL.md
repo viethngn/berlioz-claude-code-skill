@@ -178,7 +178,10 @@ source's knowledge already lives:
 The object is `{status, related_pages, citing_pages, raw_diff,
 raw_diff_truncated}`:
 
-- `status` — `new`, `changed` or `unchanged`.
+- `status` — `new`, `changed` or `unchanged`. Without a fetcher status or
+  `--job-id` it comes from git history: `changed` when `raw/<slug>.md` has
+  later commits or uncommitted edits, `unchanged` when it was committed once,
+  is unmodified and a page already cites it, otherwise `new`.
 - `related_pages` — existing pages the source is probably about, best first,
   each `{page, summary, score, why}`. `why` says how it was found:
   `mentioned` (the page's name appears in the source), `title` (the source's
@@ -186,8 +189,8 @@ raw_diff_truncated}`:
   string matching, not a verdict: open the top entries and judge. A page
   that is only mentioned in passing is a place to add a link or a sentence,
   not necessarily the source's home.
-- `citing_pages` — pages that already cite this raw file (filled for
-  `changed` and `unchanged`).
+- `citing_pages` — pages that already cite this raw file (always read from
+  the wiki, whatever the status).
 - `raw_diff` — for `changed`, the git diff of `raw/<slug>.md` against its
   previous version. When `raw_diff_truncated` is true the diff was cut short;
   read `raw/<slug>.md` itself for the rest.
@@ -263,7 +266,7 @@ exist (check the slug), and it cannot be combined with `--commit-only` or
 `raw/` holds the immutable sources: never modify a raw file during synthesis.
 The only files written under `raw/` by hand are image descriptions, below.
 
-### Describing images (only when `images.enabled` is true)
+### Describing images (only when `images.describe` is true)
 
 Images are off by default, and the ingest summary then carries
 `"images": {"enabled": false}`: skip this step. When the user turned them on
@@ -326,7 +329,7 @@ ${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
 
 The orchestrator prints a JSON summary: `fetch` (the fetcher's result,
 including `slug` and `status`), `images` (see
-[Describing images](#describing-images-only-when-imagesenabled-is-true)) and,
+[Describing images](#describing-images-only-when-imagesdescribe-is-true)) and,
 unless the source was unchanged, `context` (see
 [Wiki-update rules](#wiki-update-rules)). Add `--describe-images` to turn
 images on for this run when the user asks for them.
@@ -388,7 +391,7 @@ in) sees no change at all from this phase.
 
 After the orchestrator finishes, read the newly written `raw/<slug>.md`.
 If images are enabled, describe the pending ones now (see
-[Describing images](#describing-images-only-when-imagesenabled-is-true)) and
+[Describing images](#describing-images-only-when-imagesdescribe-is-true)) and
 read their descriptions. Print a short summary for the user's awareness, then
 **proceed directly to Phase 3** — do not wait for confirmation:
 
@@ -712,7 +715,7 @@ For each item with `raw_status in {done, unchanged}` and
 
 2. Read `raw/<slug>.md`. If images are enabled, describe the item's pending
    images (`image_manifest.py … status`, see
-   [Describing images](#describing-images-only-when-imagesenabled-is-true)).
+   [Describing images](#describing-images-only-when-imagesdescribe-is-true)).
 3. Apply the [Wiki-update rules](#wiki-update-rules). They matter most here:
    bulk ingest is where a space's structure emerges, and many items should
    feed the same topic pages rather than each producing a page of its own.

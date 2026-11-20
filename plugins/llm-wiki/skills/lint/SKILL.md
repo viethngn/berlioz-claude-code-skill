@@ -73,16 +73,21 @@ own reviewable diff, and the `lint:` commits at the end hold only lint's
 work, never the user's unfinished edits.
 
 ```bash
-${WIKI_PY} "${LINT}" --wiki-root "${WIKI_ROOT}" --fix --since-last-lint
+${WIKI_PY} "${LINT}" --wiki-root "${WIKI_ROOT}" --fix --full
 ```
 
-`--since-last-lint` limits the expensive comparisons (overlap, collisions,
-drift) to pages and raw files changed since the newest commit whose message
-starts with `lint:`, so a routine lint stays fast and does not re-raise what
-an earlier lint already settled. Structural checks always cover the whole
-wiki. On the first lint there is no such commit; the script then checks
-everything and says so in `warnings`. Use `--full` instead of
-`--since-last-lint` when the user asks for a full audit.
+`--full` (also the script's default when neither scope flag is given) runs
+the overlap, collision and drift checks over the whole wiki. Items an earlier
+lint settled do not come back: review memory (Step 5) suppresses them until
+the page or raw file changes.
+
+For a very large wiki, `--since-last-lint` is an opt-in speed-up: it limits
+those three checks to pages and raw files changed since the newest commit
+whose message starts with `lint:` (structural checks still cover the whole
+wiki; with no such commit it checks everything and says so in `warnings`).
+Items an earlier lint reported but nobody settled will **not** reappear
+under it, so use it only when the user asks for it, and run `--full`
+periodically.
 
 **When `--fix` refuses** (exit code 2, nothing written, the reason on
 stderr):
@@ -146,10 +151,12 @@ pages`, `source_drift skipped: …`, an unreadable `.lint-reviewed.json` — and
 when the wiki's `CLAUDE.md` has no managed block (then suggest the
 `bootstrap.py --upgrade` command it names). A truncated list means more
 exists than you were shown: say so in the report, and never call the wiki
-clean while such a warning is present. Collisions are capped at 50 (exact
-matches shared by the fewest pages first) and overlap pairs at
-`--max-candidates` (default 20); a later lint shows the rest once these are
-settled.
+clean while such a warning is present. Collisions are capped at 50: exact
+matches first (those shared by the fewest pages first, at most 35 while
+fuzzy hits exist), then fuzzy matches. Overlap pairs are capped at
+`--max-candidates` (default 20). Once you record verdicts for the items
+shown (Step 5), review memory suppresses them, so the next `--full` lint
+shows the next batch.
 
 ### Step 2 — Judge the shortlist
 
@@ -215,7 +222,8 @@ ALREADY FIXED (--fix):
   - Deleted 2 placeholder pages: stub-a, stub-b (unlinked 3 links, 1 index line)
   - Repaired Sources path in [[setup]]: raw/old-name.md -> raw/new-name.md
 
-NOTE: fact_collisions showed 50 of 73 found — the rest come up on the next lint.
+NOTE: fact_collisions showed 50 of 73 found — the rest come up on the next full lint
+      once these are settled.
 
 NEEDS YOUR APPROVAL:
   1. CONTRADICTION — [[api-limits]] "1000 req/min" vs [[changelog]] "5000 req/min".
@@ -303,7 +311,7 @@ EOF
 ### Step 6 — Re-run the linter to check the result
 
 ```bash
-${WIKI_PY} "${LINT}" --wiki-root "${WIKI_ROOT}" --since-last-lint
+${WIKI_PY} "${LINT}" --wiki-root "${WIKI_ROOT}" --full
 ```
 
 No `--fix` this time. `broken_links`, `empty_pages`, `format_violations`
@@ -330,7 +338,7 @@ named on stderr). `log` writes one `## YYYY-MM-DD (lint)` entry at the top of
 `wiki/log.md` (repeatable `--bullet`). Do not edit either file by hand.
 
 Then commit by category, each message starting with `lint:` — that prefix
-is how the next `--since-last-lint` finds where this lint ended. Stage only
+is how a later `--since-last-lint` run finds where this lint ended. Stage only
 the paths each commit touches (`git add -A <paths>` stages deletions and
 moves too) and skip empty categories:
 

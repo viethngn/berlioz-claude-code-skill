@@ -372,10 +372,11 @@ def build_context(wiki_root: Path, slug: str, status: Optional[str] = None) -> d
 
     `related_pages`: `wiki_tools.related` on the source title and the raw
     text minus fenced code and fetcher-generated headings.
-    For a `changed` source also `citing_pages` (pages citing it) and
-    `raw_diff` (what changed, capped at RAW_DIFF_MAX_CHARS). `status` comes
-    from the fetcher (single ingest); None (bulk) derives it from git history.
-    An `unchanged` status keeps `citing_pages` but has no diff.
+    `citing_pages`: pages citing it, always read from the wiki. For a
+    `changed` source also `raw_diff` (what changed, capped at
+    RAW_DIFF_MAX_CHARS). `status` comes from the fetcher (single ingest);
+    None (bulk, or --context without --job-id) derives it from git history:
+    a raw committed once, unmodified and already cited is `unchanged`.
     """
     cfg = load_config(wiki_root)
     raw_md = cfg.raw_dir / f"{slug}.md"
@@ -383,9 +384,12 @@ def build_context(wiki_root: Path, slug: str, status: Optional[str] = None) -> d
     text = raw_md.read_text(encoding="utf-8") if raw_md.exists() else ""
     commits = raw_commits(wiki_root, raw_md)
     diff = ""
+    cites = citing(cfg.wiki_dir, slug, cfg.raw_dir)
     if status is None:
         dirty = bool(_git_lines(wiki_root, "status", "--porcelain", "--", rel))
         status = "changed" if len(commits) >= 2 or (commits and dirty) else "new"
+        if status == "new" and commits and cites:
+            status = "unchanged"  # committed once, clean, already synthesized into a page
         if status == "changed":
             # Previous version vs current content.
             diff = "\n".join(_git_lines(wiki_root, "diff", commits[0] if dirty else commits[1], "--", rel))
@@ -398,7 +402,7 @@ def build_context(wiki_root: Path, slug: str, status: Optional[str] = None) -> d
     return {
         "status": status,
         "related_pages": related(cfg.wiki_dir, _source_title(raw_md, text), body),
-        "citing_pages": citing(cfg.wiki_dir, slug, cfg.raw_dir) if status in {"changed", "unchanged"} else [],
+        "citing_pages": cites,
         "raw_diff": diff[:RAW_DIFF_MAX_CHARS],
         "raw_diff_truncated": len(diff) > RAW_DIFF_MAX_CHARS,
     }

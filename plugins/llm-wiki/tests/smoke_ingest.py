@@ -241,7 +241,7 @@ def test_context_new_and_changed(tmp: Path) -> None:
     out = run_ingest(root, "--source", str(src), "--no-commit")
     ctx = out["context"]
     _assert(ctx["status"] == "new" and ctx["related_pages"][0]["page"] == "rate-limits", f"ctx: {ctx}")
-    _assert(ctx["citing_pages"] == [] and ctx["raw_diff"] == "", "no diff for new source")
+    _assert(ctx["citing_pages"] == ["rate-limits"] and ctx["raw_diff"] == "", f"citing always filled, no diff: {ctx}")
     meta = json.loads((root / "raw/api-guide.source.json").read_text())
     _assert(re.fullmatch(r"\d{4}-\d{2}-\d{2}", meta["source_date"]), "source_date present")
     git(root, "add", "-A"); git(root, "commit", "-m", "ingest: api-guide")
@@ -280,6 +280,18 @@ def test_bulk_context_new_and_unchanged(tmp: Path) -> None:
     ctx = ingest.build_context(root, "notes", "unchanged")
     _assert(ctx["status"] == "unchanged" and ctx["raw_diff"] == "" and ctx["citing_pages"] == ["deploys"], f"{ctx}")
     print("[OK] bulk context: new / changed from git history, truncation, unchanged items")
+
+
+def test_context_committed_and_cited_is_unchanged(tmp: Path) -> None:
+    root = make_wiki(tmp)
+    src = tmp / "notes.md"
+    src.write_text("# Notes\n\n## Deploy\n\nDeploy only on weekdays.\n")
+    run_ingest(root, "--source", str(src), "--no-commit")
+    write_page(root, "deploys", "Deploys happen on weekdays (source: raw/notes.md).", sources=("raw/notes.md",))
+    git(root, "add", "-A"); git(root, "commit", "-m", "ingest: notes")
+    ctx = run_ingest(root, "--context", "--slug", "notes")
+    _assert(ctx["status"] == "unchanged" and ctx["citing_pages"] == ["deploys"] and ctx["raw_diff"] == "", f"{ctx}")
+    print("[OK] context without --job-id: committed, clean, cited raw -> unchanged with citing_pages")
 
 
 def _related(root: Path, slug: str) -> list:
@@ -372,6 +384,7 @@ def main() -> int:
     for test in (
         test_context_new_and_changed,
         test_bulk_context_new_and_unchanged,
+        test_context_committed_and_cited_is_unchanged,
         test_related_pages_signal,
         test_context_cli_errors,
         test_source_date_never_triggers_changed,

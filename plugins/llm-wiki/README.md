@@ -557,8 +557,10 @@ top-level `queue.py` would shadow the stdlib `queue` module (which
 
 ### `/lint`
 
-Runs [lint.py](skills/lint/scripts/lint.py) `--fix --since-last-lint` (stdlib
-only, git-based). The script:
+Runs [lint.py](skills/lint/scripts/lint.py) `--fix --full` (stdlib only,
+git-based; `--since-last-lint` is an opt-in speed-up for very large wikis that
+checks only what changed since the last `lint:` commit, so unsettled items
+from an earlier lint do not reappear under it). The script:
 
 - **Fixes only what needs no judgment**: deletes placeholder stub pages,
   unlinks links to them, and repairs a `Sources` path whose file was renamed

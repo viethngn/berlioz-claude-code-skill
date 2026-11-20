@@ -276,6 +276,30 @@ def test_near_duplicate_both_slug_orders(tmp):
         _assert(any(c["pages"] == ["ingest-pipeline", "wiki-workflow"] for c in cands), f"near-dup found: {cands}")
 
 
+def test_paraphrased_overlap_shared_source(tmp):
+    # Same topic, one shared raw, different wording: scores ~0.40 (below the old 0.5 threshold).
+    root = make_wiki(tmp)
+    write_raw(root, "auth.md", "# auth\n\nSessions expire after 30 minutes. Login uses SSO with a one-time code.\n")
+    write_page(root, "auth", "Users sign in through the company SSO portal and then confirm with a one-time code. "
+               "A session expires after 30 minutes of inactivity and the user must sign in again "
+               "(source: raw/auth.md).", sources=("raw/auth.md",))
+    write_page(root, "authentication-flow", "Login goes through single sign-on, then the user enters a one-time "
+               "code. Sessions time out after 10 minutes of inactivity, after which a fresh login is required "
+               "(source: raw/auth.md).", sources=("raw/auth.md",))
+    commit(root, "ingest: auth")
+    cands = run_lint(root)["overlap_candidates"]
+    _assert(any(c["pages"] == ["auth", "authentication-flow"] for c in cands), f"paraphrase found: {cands}")
+
+
+def test_no_prose_pages_text_sim_zero(tmp):
+    root = make_wiki(tmp)
+    write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
+    write_page(root, "rates-table", "| plan | rate |\n|---|---|\n| a | 1 |\n")
+    write_page(root, "rates-tables", "```\nrate = 2\n```\n")
+    cands = run_lint(root)["overlap_candidates"]
+    _assert(cands and all(c["text_sim"] == 0 for c in cands), f"no prose -> text_sim 0: {cands}")
+
+
 def test_hub_key_exact_collision_and_warning(tmp):
     root = make_wiki(tmp)
     write_raw(root, "hub.md", "# hub\n\nsource body that is long enough to count.\n")

@@ -62,7 +62,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 # Overlap / fact-collision tuning. Score = weighted sum of components in [0, 1];
 # a shared source alone (W_SOURCES) must stay below OVERLAP_THRESHOLD.
 MAX_CANDIDATES = 20
-OVERLAP_THRESHOLD = 0.5
+OVERLAP_THRESHOLD = 0.35
 SENTENCE_SIM_THRESHOLD = 0.8
 W_SOURCES = 0.2
 W_LINKS = 0.1
@@ -772,7 +772,8 @@ def _info(page: dict, raw_dir: Path) -> dict:
             "slug": slug_from_path(page["path"]),
             "sources": set(resolve_source_paths(page["text"], raw_dir)),
             "links": resolved_links(page_body(page["text"])),
-            "shingles": {prose[i:i + SHINGLE] for i in range(max(len(prose) - SHINGLE + 1, 1))},
+            # No prose (table- or code-only page) -> no shingles, so text_sim is 0, not 1.
+            "shingles": {prose[i:i + SHINGLE] for i in range(max(len(prose) - SHINGLE + 1, 1))} if prose else set(),
         }
     return page["_info"]
 

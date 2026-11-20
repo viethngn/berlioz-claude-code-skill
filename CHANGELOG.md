@@ -46,9 +46,12 @@ without changes, but a few things behave differently.
   override). Short pages, other broken links, unrepaired sources and format
   violations are proposed in the approval report instead of fixed silently.
 - **New lint shortlists:** `fact_collisions` (same sentence, different
-  numbers), `overlap_candidates` (likely duplicates) and `source_drift`,
-  limited to what changed since the last `lint:` commit with
-  `--since-last-lint`. Truncated lists are reported in `warnings`.
+  numbers), `overlap_candidates` (likely duplicates) and `source_drift`.
+  `/lint` checks the whole wiki (`--full`, the default); settled items are
+  suppressed by review memory. `--since-last-lint` is an opt-in speed-up for
+  very large wikis that limits these checks to what changed since the last
+  `lint:` commit, so unsettled items from an earlier lint do not reappear
+  under it. Truncated lists are reported in `warnings`.
 - **New committed file `wiki/.lint-reviewed.json`.** Verdicts recorded with
   `lint.py --mark-reviewed` keep settled pairs, collisions and drift from
   coming back until the pages or sources change. Commit it with the wiki.

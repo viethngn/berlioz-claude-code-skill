@@ -79,7 +79,9 @@ as the first body line so readers are redirected to the latest page:
 
 - Every factual claim should reference its source file
 - Use the format `(source: raw/<file>)` after the claim
-- If two sources disagree, note the contradiction explicitly
+- If two sources disagree, the claim from the source with the later
+  `source_date` replaces the older one; when the dates are equal or missing,
+  keep both claims and note the disagreement explicitly
 - If a claim has no source, mark it as needing verification
 
 ## Question answering

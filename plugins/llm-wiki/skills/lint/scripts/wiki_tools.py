@@ -128,6 +128,8 @@ def _forms(name: str) -> set:
 def _count(form: str, text: str) -> int:
     """ASCII names match whole words only (`data` is not in "metadata"); others by substring."""
     if form.isascii():
+        if form not in text:  # cheap pre-check; the regex is ~50x slower on large sources
+            return 0
         return len(re.findall(rf"(?<![a-z0-9]){re.escape(form)}(?![a-z0-9])", text))
     return text.count(form)
 
