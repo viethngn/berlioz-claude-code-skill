@@ -47,16 +47,9 @@ DEFAULT_CONFIG = {
         "max_retries": 5,
         "retry_base_delay_seconds": 2,
     },
-    "nano_banana": {
-        "base_url": "",
-        "api_key": "",
-        "vision_model": "gemini-3-pro",
-        "verify_ssl": True,
-        "rate_limit_rps": 1,
-        "burst": 2,
-        "max_retries": 3,
-        "retry_base_delay_seconds": 2,
-    },
+    # Images are described by the session model, never by a script; off by
+    # default so an ingest never waits on image work nobody asked for.
+    "images": {"describe": False},
     "slack": {
         "token": "",
         "verify_ssl": True,
@@ -133,8 +126,8 @@ class Config:
         return dict(self.data.get("atlassian") or {})
 
     @property
-    def nano_banana(self) -> dict:
-        return dict(self.data.get("nano_banana") or {})
+    def describe_images(self) -> bool:
+        return bool((self.data.get("images") or {}).get("describe", False))
 
     def confluence_base_url(self) -> str:
         return (self.atlassian.get("confluence_base_url") or "").rstrip("/")
@@ -150,18 +143,6 @@ class Config:
 
     def atlassian_verify_ssl(self) -> bool:
         return bool(self.atlassian.get("verify_ssl", True))
-
-    def nano_banana_base_url(self) -> str:
-        return self.nano_banana.get("base_url") or ""
-
-    def nano_banana_key(self) -> str:
-        return self.nano_banana.get("api_key") or ""
-
-    def nano_banana_model(self) -> str:
-        return self.nano_banana.get("vision_model") or "gemini-3-pro"
-
-    def nano_banana_verify_ssl(self) -> bool:
-        return bool(self.nano_banana.get("verify_ssl", True))
 
     @property
     def slack(self) -> dict:
@@ -217,8 +198,8 @@ class Config:
 
         atl = clone.setdefault("atlassian", {})
         redact(atl, ["confluence_pat", "jira_pat"])
-        nb = clone.setdefault("nano_banana", {})
-        redact(nb, ["api_key"])
+        # A legacy image-endpoint block is unused but may still hold a key.
+        clone.pop("nano_banana", None)
         sl = clone.setdefault("slack", {})
         redact(sl, ["token"])
         # web.extra_headers is where a Cookie / Authorization header would live —
@@ -294,8 +275,7 @@ def apply_ssl_env(section: str, verify: bool) -> None:
     """Toggle SSL verification env vars for one section's HTTP calls.
 
     Called by scripts before making a request to a section whose
-    verify_ssl is False. This mirrors the pattern in nano-banana-pro's
-    image.py — necessary on some corporate networks that intercept TLS.
+    verify_ssl is False — necessary on some corporate networks that intercept TLS.
     """
     if not verify:
         os.environ["PYTHONHTTPSVERIFY"] = "0"

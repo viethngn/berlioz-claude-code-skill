@@ -75,7 +75,8 @@ reuse `ingest.py` directly rather than duplicating its fetch/commit logic.
 ### 1a — Local file path
 
 Reuse `/ingest`'s existing local-file dispatch verbatim — nothing new to
-build for this case, and it gets image extraction for free:
+build for this case (images are handled as in `/ingest`: described only when
+enabled):
 
 ```bash
 ${WIKI_PY} "${INGEST_DIR}/ingest.py" \
@@ -175,17 +176,21 @@ wiki's documented category-split threshold (~40 outbound links, see
 monthly rollup page (`wiki/YYYY-MM-index.md`) and link to that instead of
 listing every day individually.
 
-## Phase 5 — Append one entry to the operational `wiki/log.md`
+## Phase 5 — Add one entry to the operational `wiki/log.md`
 
 This is the **existing, separate** append-only operational log that
-`/ingest` and `/lint` already write to — not the new day-pages. Append:
+`/ingest` and `/lint` also write to — not the day-pages. Add the entry with
+the same script they use, rather than by hand, so all three skills keep one
+format and a second `/log` run on the same day joins that day's entry:
 
-```markdown
-## YYYY-MM-DD (log)
-
-- Logged `raw/<slug>.md` — N events across day-pages [[YYYY-MM-DD]], [[YYYY-MM-DD]]
+```bash
+${WIKI_PY} "${SKILL_DIR}/../lint/scripts/wiki_tools.py" log \
+  --wiki-root "${WIKI_ROOT}" --op log \
+  --title "Logged raw/<slug>.md — N events" \
+  --bullet "Day-pages: [[YYYY-MM-DD]], [[YYYY-MM-DD]]"
 ```
 
+It writes a `## YYYY-MM-DD (log)` entry at the top of `wiki/log.md`.
 Do not conflate this with the day-pages themselves, even though both now
 live flat in the same `wiki/` directory.
 
@@ -220,8 +225,10 @@ by which linked wiki they were meant for, so the user can decide whether to
 ## Concrete rules
 
 - **Day-pages are flat `wiki/YYYY-MM-DD.md` files** — no `wiki/diary/`
-  subfolder. This matches every other page in the wiki and keeps `/lint`'s
-  ordinary page scan working on them with no changes to `lint.py`.
+  subfolder. `/lint` recognises day-pages and `YYYY-MM-index` rollups as
+  journal pages: it never judges or edits them (their broken links are only
+  reported), and `wiki_tools.py index-sync` never touches them or the
+  `## Diary` section — that section stays this skill's to maintain.
 - **Cross-wiki links (`[[label/slug]]`) are read-only.** `/log` never writes
   into a linked wiki, regardless of match confidence.
 - **Immutability**: never edit a previously-logged Event's substantive

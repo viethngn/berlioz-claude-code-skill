@@ -190,6 +190,30 @@ def _cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_mark_described(args: argparse.Namespace) -> int:
+    raw_dir = Path(args.raw_dir).resolve()
+    manifest = load_manifest(raw_dir, args.slug)
+    d = slug_dir(raw_dir, args.slug)
+    for name in args.images:
+        # Names only: a path would read files and record entries outside the slug dir.
+        if "/" in name or "\\" in name or ".." in name:
+            print(f"ERROR: not a plain image name: {name!r}", file=sys.stderr)
+            return 1
+        image_path = d / name
+        description = d / f"{Path(name).stem}.md"
+        if not image_path.is_file():
+            print(f"ERROR: image not found: {image_path}", file=sys.stderr)
+            return 1
+        if not description.is_file():
+            print(f"ERROR: description file not found: {description}", file=sys.stderr)
+            return 1
+        manifest.set_entry(name, sha256=hash_file(image_path), description_file=description.name)
+        manifest.mark_described(name)
+    manifest.save()
+    print(json.dumps({"marked": args.images}))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Manage SHA-256 image manifests")
     parser.add_argument("--raw-dir", required=True, help="Path to raw/ directory")
@@ -208,7 +232,15 @@ def main() -> int:
         help="Set described_at to now",
     )
 
+    md = sub.add_parser(
+        "mark-described",
+        help="Record that <stem>.md now describes each image's current bytes",
+    )
+    md.add_argument("images", nargs="+", metavar="IMAGE_NAME")
+
     args = parser.parse_args()
+    if args.cmd == "mark-described":
+        return _cmd_mark_described(args)
     if args.cmd == "status":
         return _cmd_status(args)
     if args.cmd == "record":

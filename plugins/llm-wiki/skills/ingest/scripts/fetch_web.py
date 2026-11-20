@@ -30,6 +30,7 @@ import argparse
 import json
 import re
 import sys
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin, urlparse
@@ -404,6 +405,14 @@ def _check_robots(url: str, cfg, limiter) -> None:
         pass
 
 
+def _last_modified_date(resp) -> Optional[str]:
+    """`YYYY-MM-DD` from the HTTP Last-Modified header, or None when absent/garbled."""
+    try:
+        return parsedate_to_datetime(resp.headers.get("Last-Modified", "")).date().isoformat()
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fetch a web page into raw/")
     parser.add_argument("--wiki-root", type=Path, required=True)
@@ -599,7 +608,9 @@ def main() -> int:
     else:
         full_markdown = f"# {title}\n\n{body}\n"
 
-    result = write_raw_if_changed(cfg.raw_dir, slug, full_markdown, metadata)
+    result = write_raw_if_changed(
+        cfg.raw_dir, slug, full_markdown, metadata, source_date=_last_modified_date(resp)
+    )
 
     _write_validators(
         cfg.wiki_root,

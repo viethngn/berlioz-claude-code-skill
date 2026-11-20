@@ -33,8 +33,9 @@ Generate detailed, high-quality documentation images using Google's Gemini 3 Pro
 Maintain a personal LLM knowledge wiki, backed by git.
 
 **Skills:**
-- `ingest` — Pull Confluence pages, Jira issues, or local files (MD/HTML/PDF/DOCX/images) into a wiki. Describes embedded images via a nano-banana-pro-compatible vision endpoint only when they change. Commits raw + wiki to git after every run.
-- `lint` — Audit the wiki for gaps, contradictions, orphan pages, broken `[[links]]`, format violations, and stale facts.
+- `ingest` — Pull Confluence pages, Jira issues, Slack, web pages or local files (MD/HTML/PDF/DOCX/images) into a wiki, updating the pages a source touches before creating new ones. Images are off by default; when enabled, Claude describes new or changed ones itself. Commits raw + wiki to git after every run.
+- `lint` — Script-first audit: fixes only judgment-free problems, then shortlists contradictions, duplicate pages, pages whose sources changed, orphans and broken `[[links]]` for one approval report.
+- `log` — Turn meeting notes and transcripts into a per-day work diary with cross-wiki links.
 - `create-wiki` — Bootstrap a fresh LLM wiki: folder layout, `CLAUDE.md`, page template, git repo, and marketplace pinning.
 
 See [plugins/llm-wiki/README.md](plugins/llm-wiki/README.md) for the one-time setup steps.

@@ -134,9 +134,10 @@ class MockConfluenceHandler(http.server.BaseHTTPRequestHandler):
                     "space": {"key": "FOO"},
                     "body": {
                         "storage": {
-                            "value": (
+                            "value": page.get("html")
+                            or (
                                 f"<p>{page['body']}</p>"
-                                "<p>Some more content for hashing.</p>"
+                                "<p>Some more content for hashing, long enough to count as a real body.</p>"
                             )
                         }
                     },
@@ -194,12 +195,6 @@ def _write_wikirc(wiki_root: Path, port: int) -> None:
                     "burst": 5,
                     "max_retries": 3,
                     "retry_base_delay_seconds": 0.2,
-                },
-                "nano_banana": {
-                    "base_url": "",
-                    "api_key": "",
-                    "vision_model": "gemini-3-pro",
-                    "verify_ssl": True,
                 },
             },
             indent=2,
@@ -311,12 +306,20 @@ def test_discover_and_prefetch(pages: dict, wiki_root: Path, port: int) -> str:
     )
     _assert(counts["failed"] == 0, f"unexpected failures after resume: {q}")
 
-    # Every page should have a raw/<slug>.md
+    # Every page should have a raw/<slug>.md — except a new page that renders
+    # empty, which is dropped instead of queued for synthesis.
     for item in q["items"]:
         slug = item["slug"]
         _assert(slug, f"item {item['ref']} has no slug")
         md_path = wiki_root / "raw" / f"{slug}.md"
-        _assert(md_path.exists(), f"raw file missing: {md_path}")
+        if pages[item["ref"]].get("html"):
+            _assert(item["raw_status"] == "done" and item["wiki_status"] == "skipped", f"empty item: {item}")
+            _assert(item["last_error"] == "empty body", f"empty item: {item}")
+            _assert(not md_path.exists(), f"empty item's raw file kept: {md_path}")
+            _assert(not md_path.with_suffix(".source.json").exists(), "empty item's source.json kept")
+        else:
+            _assert(item["wiki_status"] == "pending", f"non-empty item: {item}")
+            _assert(md_path.exists(), f"raw file missing: {md_path}")
 
     # Confirm the rate limiter retried at least once for each page (server
     # returned 429 on hit #1, 200 on hit #2)
@@ -472,7 +475,6 @@ def test_renamed_raw_wiki_dirs(port: int) -> None:
                         "confluence_pat": "test-pat",
                         "jira_pat": "test-pat",
                     },
-                    "nano_banana": {"base_url": "", "api_key": ""},
                 },
                 indent=2,
             )
@@ -600,6 +602,11 @@ def test_rerun_is_resume_and_replace_is_refresh() -> None:
             _assert(st["10001"] == ("unchanged", "done"), f"unchanged keeps wiki status: {st}")
             _assert(st["10003"] == ("unchanged", "done"), f"unchanged keeps wiki status: {st}")
             _assert(_only_job(wiki) == job, "--replace reuses the job id")
+            slug = {i["ref"]: i["slug"] for i in _queue(wiki, job)["items"]}["10001"]
+            r = _ingest(wiki, "--context", "--slug", slug, "--job-id", job)
+            _assert(r.returncode == 0, f"--context failed: {r.stderr}")
+            ctx = json.loads(r.stdout)
+            _assert(ctx["status"] == "unchanged" and ctx["raw_diff"] == "", f"unchanged item context: {ctx}")
             _mark_wiki_done(wiki, job, "10002")
 
             # 10004 is still unsynthesized. A refresh with nothing new must not forget it.
@@ -632,15 +639,61 @@ def test_rerun_is_resume_and_replace_is_refresh() -> None:
     print("[OK] plain re-run = resume (says so); --replace = refresh (new + edited found, unchanged kept)")
 
 
+def test_known_source_turning_empty_is_kept() -> None:
+    """Only a never-committed source that renders empty is dropped (R5)."""
+    pages = {"30001": {"title": "Known Page", "body": "real content that is clearly long enough"}}
+    srv, port = _start_server(pages)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            wiki = Path(td) / "wiki"
+            wiki.mkdir()
+            _write_wikirc(wiki, port)
+            for cmd in (["init", "-q"], ["config", "user.email", "t@example.invalid"],
+                        ["config", "user.name", "t"], ["config", "commit.gpgsign", "false"]):
+                subprocess.run(["git", "-C", str(wiki), *cmd], check=True, capture_output=True)
+            flags = ["--space", "FOO", "--skip-images"]
+            r = _ingest(wiki, *flags)
+            _assert(r.returncode == 0, f"baseline failed: {r.stderr}\n{r.stdout}")
+            job = _only_job(wiki)
+            _mark_wiki_done(wiki, job, "30001")
+            subprocess.run(["git", "-C", str(wiki), "add", "raw"], check=True)
+            subprocess.run(["git", "-C", str(wiki), "commit", "-q", "-m", "v1"], check=True)
+            slug = _queue(wiki, job)["items"][0]["slug"]
+            md = wiki / "raw" / f"{slug}.md"
+            src = wiki / "raw" / f"{slug}.source.json"
+
+            # The page empties upstream: a changed source, files kept, re-synthesized.
+            pages["30001"].update(html="<p> </p>", version=2)
+            r = _ingest(wiki, *flags, "--replace")
+            _assert(r.returncode == 0, f"--replace failed: {r.stderr}\n{r.stdout}")
+            _assert(md.exists() and src.exists(), "known source's raw files kept")
+            _assert(_states(wiki, job)["30001"] == ("done", "pending"), f"{_states(wiki, job)}")
+
+            # Even when the files are missing on disk (fetch says "new"), git history wins.
+            md.unlink()
+            src.unlink()
+            pages["30001"]["version"] = 3
+            r = _ingest(wiki, *flags, "--replace")
+            _assert(r.returncode == 0, f"second --replace failed: {r.stderr}\n{r.stdout}")
+            _assert(md.exists() and src.exists(), "committed source's raw files kept")
+            _assert(_states(wiki, job)["30001"] == ("done", "pending"), f"{_states(wiki, job)}")
+    finally:
+        srv.shutdown()
+    print("[OK] a known source that becomes empty keeps its raw files and is re-synthesized")
+
+
 def main() -> int:
     test_detect_bulk_from_url()
     test_rerun_is_resume_and_replace_is_refresh()
+    test_known_source_turning_empty_is_kept()
 
     pages = {
         "10001": {"title": "Onboarding", "body": "how to onboard"},
         "10002": {"title": "Runbook: Alerts", "body": "alerts steps"},
         "10003": {"title": "Team Handbook", "body": "team handbook"},
         "10004": {"title": "Release Process", "body": "release notes"},
+        # Non-empty HTML (so the fetcher does not error) that renders to nothing.
+        "10005": {"title": "Empty Shell", "html": '<ac:structured-macro ac:name="toc"></ac:structured-macro><p> </p>'},
     }
     srv, port = _start_server(pages)
     try:

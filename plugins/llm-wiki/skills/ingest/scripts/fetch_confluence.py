@@ -34,7 +34,7 @@ from markdownify import markdownify
 
 from config import ConfigError, apply_ssl_env, load_config
 from rate_limiter import RateLimitFailure, get_limiter
-from raw_store import read_previous_source_metadata, write_raw_if_changed
+from raw_store import iso_date, read_previous_source_metadata, write_raw_if_changed
 
 
 _slug_re = re.compile(r"[^\w\-]+", re.UNICODE)
@@ -324,7 +324,9 @@ def main() -> int:
     }
 
     full_markdown = f"# {title}\n\n{markdown.strip()}\n"
-    result = write_raw_if_changed(cfg.raw_dir, slug, full_markdown, metadata)
+    result = write_raw_if_changed(
+        cfg.raw_dir, slug, full_markdown, metadata, source_date=iso_date(version.get("when"))
+    )
 
     summary = {
         "slug": slug,

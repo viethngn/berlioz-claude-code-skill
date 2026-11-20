@@ -1,7 +1,9 @@
 # Wiki Page Format Reference
 
-Load during Phase 3 of ingest, or whenever you're writing/updating a wiki
-page. This is the canonical template the plugin enforces.
+Load during the wiki-update phase of ingest, or whenever you're
+writing/updating a wiki page. This is the canonical template the plugin
+enforces. *When* to create a page versus update one is decided by the ingest
+skill's "Wiki-update rules"; this file covers what a page looks like.
 
 ## Page template
 
@@ -40,7 +42,7 @@ Fields:
   to a source.
 - **Last updated**: ISO date. Update every time the page is edited.
 - **Body**: Free-form Markdown. Short paragraphs. Cite claims inline with
-  `(source: <raw-filename>)`.
+  `(source: raw/<file>)`.
 - **Related pages**: 2-8 wiki-links, sorted alphabetically.
 
 ## Status field (optional — legacy in-place archiving)
@@ -68,7 +70,7 @@ redirected to the current information:
 - Values: `Active` (or omit the line), `Archived` (retired, no direct
   replacement), or `Superseded by [[current-page]]`.
 - The `Status` line is **optional** — its absence is never a format violation.
-- `/lint` excludes `Archived` / `Superseded` pages from orphan and stale checks,
+- `/lint` excludes `Archived` / `Superseded` pages from orphan and drift checks,
   so intentionally-retired pages stop being nagged.
 - In `wiki/index.md`, tag such pages, e.g.
   `[[old-concept]] — *(superseded by [[new-concept]])*`.
@@ -81,7 +83,7 @@ redirected to the current information:
   confirmation, and it never edits or deletes a raw that still carries content
   or is cited.
 - **Archive a retired wiki page by moving it to `wiki/archive/`** (`/lint` uses
-  `git mv`). Archived pages leave active lint scope (no more orphan/stale
+  `git mv`). Archived pages leave active lint scope (no more orphan/drift
   nagging) but stay in git and remain valid `[[link]]` targets — a reference to
   an archived page is not a broken link. Tag them under an `## Archive` section
   of `index.md`.
@@ -105,42 +107,47 @@ redirected to the current information:
   filename without the `.md` extension.
 - Prefer wiki-links to markdown links for anything inside the wiki. Reserve
   markdown links (`[text](url)`) for external URLs.
-- Never leave a broken wiki-link. If you mention `[[foo]]` and no `foo.md`
-  exists yet, create a stub page:
-
-  ```markdown
-  # Foo
-
-  **Summary**: TBD — mentioned in [[bar]] but not yet expanded.
-
-  **Sources**: (none yet)
-
-  **Last updated**: YYYY-MM-DD
-
-  ---
-
-  Placeholder — add content when a source covers this concept.
-  ```
-
-  `/lint` flags these stubs but does not delete them.
+- Never leave a broken wiki-link, and never create an empty placeholder page
+  to make one resolve. Until a source gives a concept enough substance for a
+  page of its own, mention it in plain text without brackets; add the
+  `[[link]]` when the page exists. A placeholder page looks like knowledge
+  but holds none, and `/lint --fix` deletes placeholder stub pages.
+- `[[label/slug]]` (a `/` whose first part is not `archive`) is a cross-wiki
+  link into a linked wiki written by `/log`; it is never resolved locally and
+  `/lint` never reports it as broken. `[[page#Heading]]` links to `page`.
 
 ## Citation rules
 
 - Every factual claim references its source file inline:
   `The API rate limit is 1000 req/min (source: raw/api-guide.pdf).`
-- If two sources disagree, note the contradiction explicitly:
+- If two sources disagree, the claim from the source with the later
+  `source_date` (in its `raw/<slug>.source.json`) replaces the older one and
+  cites the newer source. When the dates are equal or one is missing, keep
+  both and say so explicitly:
 
-  > The rate limit is 1000 req/min (source: raw/api-guide.pdf), though the
-  > 2026-05 changelog notes it was raised to 5000 (source:
-  > raw/changelog-2026-05.md). The newer source likely reflects the current
-  > state.
+  > The rate limit is 1000 req/min (source: raw/api-guide.md), though the
+  > changelog says 5000 req/min (source: raw/changelog-2026-05.md); the
+  > sources do not say which is current.
 
 - If a claim has no source, mark it: `(source: needs verification)` — `/lint`
   reports these for follow-up.
 
 ## Updating `wiki/index.md`
 
-Every ingest that creates or renames a wiki page updates `wiki/index.md`:
+`wiki/index.md` is kept in step with the pages on disk by a script, not by
+hand:
+
+```bash
+python3 <plugin>/skills/lint/scripts/wiki_tools.py index-sync --wiki-root <wiki>
+```
+
+It adds each page missing from the index as `- [[slug]] — <Summary>` under
+`## Uncategorized`, removes lines for pages that no longer exist, and moves
+lines for pages now in `wiki/archive/` under `## Archive`. Existing sections,
+their order and hand-written descriptions are left alone, as are journal
+pages and the `## Diary` section (owned by `/log`). After it runs, a newly
+added line may be moved into an existing section when one obviously fits.
+The resulting index looks like:
 
 ```markdown
 # Wiki Index
@@ -161,7 +168,16 @@ create new categories as needed but keep the count small (5-8 categories max).
 
 ## Updating `wiki/log.md`
 
-Append-only. Newest entry at the top:
+Append-only, newest entry at the top, written by a script:
+
+```bash
+python3 <plugin>/skills/lint/scripts/wiki_tools.py log --wiki-root <wiki> \
+  --op ingest --title "Ingested raw/prd-onboarding.md" \
+  --bullet "New pages: [[onboarding-flow]]" --bullet "Updated: [[product-alpha]]"
+```
+
+`--op` is `ingest`, `lint` or `log`; a second run on the same day with the
+same op adds its bullets to that day's entry. The result:
 
 ```markdown
 # Wiki Log
@@ -178,20 +194,24 @@ Append-only. Newest entry at the top:
 
 Each entry has:
 
-- ISO date header (`## YYYY-MM-DD`) — add a suffix for non-ingest operations,
-  e.g. `## 2026-07-20 (lint)`
+- ISO date header (`## YYYY-MM-DD`); other operations get a suffix,
+  `## 2026-07-20 (lint)` or `## 2026-07-20 (log)`
 - Bullet list of what was ingested/changed (or, for lint, what was cleaned:
   pages deleted, archived/superseded, conflicts resolved, fixes applied)
 - Wiki-links to the affected pages
 
-`log.md` records **every ingest and lint operation**. Both `/ingest` and `/lint`
-append an entry. Never edit past entries — treat `log.md` as append-only history.
+`log.md` records **every ingest, lint and log operation**. Never edit past
+entries — treat `log.md` as append-only history.
 
 ## Anti-patterns to avoid
 
-- **One giant page**: Split into 5-10 focused pages linked by `[[wiki-links]]`.
-- **Duplicated content**: If two pages contain the same paragraph, factor it
-  into a third page and link both to it.
+- **One page per source**: A source is not a topic. Fold its knowledge into
+  the pages for the topics it covers; `raw/<slug>.md` already is the
+  per-source record.
+- **One giant page**: Split only when a page covers clearly separate topics,
+  each with enough substance for a page of its own.
+- **Duplicated content**: If two pages contain the same paragraph, keep it on
+  the page whose topic it belongs to and link there from the other.
 - **Unsourced claims**: Every fact should trace back to a `raw/` file. If it
   doesn't, mark `(source: needs verification)` and `/lint` will remind you.
 - **Marketing tone**: Write plainly. "The product supports X" not "The

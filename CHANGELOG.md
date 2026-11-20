@@ -1,5 +1,67 @@
 # Changelog
 
+## 2.0.0 - 2026-11-20
+
+### llm-wiki — lean ingest, script-first lint, no image endpoint
+
+Ingest now folds each source into the pages it already touches, and lint does
+its mechanical work in a script and asks you once about everything that
+changes meaning. The separate vision endpoint is gone. This is a major version
+because two config/CLI surfaces were removed; existing wikis keep working
+without changes, but a few things behave differently.
+
+- **Run `bootstrap.py --upgrade` on each existing wiki.** Your wiki's
+  `CLAUDE.md` still carries the old workflow text (a summary page per source,
+  hand-edited `index.md`/`log.md`). Ask Claude to "upgrade my wiki's
+  CLAUDE.md", or run `python3 <plugin>/skills/create-wiki/scripts/bootstrap.py
+  --upgrade --target <wiki-root>`. It replaces only the plugin-owned sections
+  (now inside `<!-- llm-wiki:begin -->` … `<!-- llm-wiki:end -->`), keeps your
+  own sections, prints a diff and does not commit. Edits you made *inside* the
+  old template sections are replaced — review the diff. `/lint` warns until
+  this is done; the skills' own rules take precedence either way.
+- **The `nano_banana` config block is no longer used.** No script calls a
+  model any more. A leftover block in `.wikirc.json` is ignored without error;
+  you can delete it. `google-genai` and `pillow` are no longer dependencies.
+- **Images are off by default.** Ingest now downloads no images unless
+  `images.describe` is `true` in `.wikirc.json` or you pass
+  `--describe-images`. When on, Claude itself describes each new or changed
+  image and records it with `image_manifest.py mark-described`.
+  `--skip-images` still works and wins over both.
+- **Ingest updates before it creates.** The ingest summary (and
+  `ingest.py --context --slug S [--job-id J]` for bulk and refresh) lists the
+  related pages, the pages citing a changed source and the raw diff. Claude
+  updates existing pages, rewrites changed claims in place, creates a page
+  only for a topic with no home, and makes no summary or stub pages.
+  Conflicts are settled by the new `source_date` in each `source.json` (newer
+  wins; equal or missing keeps both with a note). `index.md` and `log.md` are
+  maintained by the new `wiki_tools.py` (`index-sync`, `log`). A new bulk item
+  that renders empty is skipped instead of becoming an empty raw file.
+- **`--stale-days` and `stale_pages` are gone.** The mtime-based stale check
+  is replaced by `source_drift`, which compares git history: a page drifts
+  when a raw file it cites was committed after the page.
+- **`lint.py --fix` is narrow.** It only deletes placeholder stub pages,
+  unlinks links to the pages it just deleted (and their `index.md` lines), and
+  repairs a `Sources` path on an exact filename match. It refuses to run
+  outside a git work tree or on uncommitted wiki changes (`--allow-dirty` to
+  override). Short pages, other broken links, unrepaired sources and format
+  violations are proposed in the approval report instead of fixed silently.
+- **New lint shortlists:** `fact_collisions` (same sentence, different
+  numbers), `overlap_candidates` (likely duplicates) and `source_drift`.
+  `/lint` checks the whole wiki (`--full`, the default); settled items are
+  suppressed by review memory. `--since-last-lint` is an opt-in speed-up for
+  very large wikis that limits these checks to what changed since the last
+  `lint:` commit, so unsettled items from an earlier lint do not reappear
+  under it. Truncated lists are reported in `warnings`.
+- **New committed file `wiki/.lint-reviewed.json`.** Verdicts recorded with
+  `lint.py --mark-reviewed` keep settled pairs, collisions and drift from
+  coming back until the pages or sources change. Commit it with the wiki.
+- **Day-pages and cross-wiki links.** `/lint` never judges or edits `/log`'s
+  day-pages and monthly rollups, and never reports `[[label/slug]]` links as
+  broken. The `/log` skill writes its `log.md` entry through
+  `wiki_tools.py log --op log`.
+- **Cascade ingest uses the session model.** The linked-wiki cascade subagent
+  no longer pins a model.
+
 ## 1.9.0 - 2026-09-04
 
 ### llm-wiki — new `/log` skill: a per-day work diary with cross-wiki links

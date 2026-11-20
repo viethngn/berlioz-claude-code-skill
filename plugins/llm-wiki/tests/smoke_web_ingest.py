@@ -340,7 +340,6 @@ def _write_wikirc(wiki_root: Path, extra_headers: dict | None = None) -> None:
                 "wiki_dir": "wiki",
                 "auto_commit": False,
                 "atlassian": {"confluence_base_url": "", "jira_base_url": ""},
-                "nano_banana": {"base_url": "", "api_key": ""},
                 "web": {
                     "user_agent": "llm-wiki-smoke-test/1.0",
                     "rate_limit_rps": 50,

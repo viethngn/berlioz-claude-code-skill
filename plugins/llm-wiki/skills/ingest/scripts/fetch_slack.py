@@ -662,7 +662,8 @@ def main() -> int:
         )
         print(f"WARNING: {truncation_note}", file=sys.stderr)
 
-    result = write_raw_if_changed(cfg.raw_dir, slug, markdown, source_dict)
+    newest_date = datetime.fromtimestamp(actual_latest, tz=timezone.utc).strftime("%Y-%m-%d")
+    result = write_raw_if_changed(cfg.raw_dir, slug, markdown, source_dict, source_date=newest_date)
 
     if result["status"] == "unchanged" and not args.force:
         write_fetch_history(wiki_root, slug, "unchanged", channel_key)

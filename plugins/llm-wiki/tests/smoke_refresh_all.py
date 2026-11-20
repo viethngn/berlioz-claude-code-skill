@@ -85,7 +85,6 @@ def _write_wikirc(wiki_root: Path, port: int) -> None:
                 },
                 "web": {"rate_limit_rps": 20, "burst": 5, "max_retries": 2},
                 "slack": {"token": "xoxp-test-token", "rate_limit_rps": 20, "burst": 5},
-                "nano_banana": {"base_url": "", "api_key": "", "vision_model": "gemini-3-pro"},
             },
             indent=2,
         )
@@ -483,7 +482,8 @@ class _VersionedConfluenceHandler(http.server.BaseHTTPRequestHandler):
                     "title": page["title"],
                     "version": {"number": page.get("version", 1)},
                     "space": {"key": "FOO"},
-                    "body": {"storage": {"value": f"<p>{page['body']}</p>"}},
+                    # Padded past EMPTY_BODY_CHARS so new items are not dropped as empty.
+                    "body": {"storage": {"value": f"<p>{page['body']}</p><p>Filler text long enough to be a real body.</p>"}},
                 },
             )
             return

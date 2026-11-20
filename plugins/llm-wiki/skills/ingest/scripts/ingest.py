@@ -14,6 +14,9 @@ Bulk usage:
     python3 ingest.py --wiki-root PATH --crawl https://example.com --depth 2 --max-pages 100
     python3 ingest.py --wiki-root PATH --resume <job-id>
 
+Synthesis context for one raw source (bulk / refresh synthesis):
+    python3 ingest.py --wiki-root PATH --context --slug S [--job-id J]
+
 Refresh usage (no source at all):
     python3 ingest.py --wiki-root PATH                 # == --refresh-all
     python3 ingest.py --wiki-root PATH --refresh-all --yes
@@ -37,11 +40,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 # The orchestrator is stdlib-only so it doesn't need require([...]).
@@ -52,6 +56,18 @@ from web_url import SITEMAP_URL_RE
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR.parents[1] / "lint" / "scripts"))
+from wiki_tools import citing, related  # noqa: E402  (stdlib-only, shares lint.py)
+
+RAW_DIFF_MAX_CHARS = 8000
+FENCED_CODE_RE = re.compile(r"^(`{3,}|~{3,}).*?(?:^\1[^\n]*$|\Z)", re.MULTILINE | re.DOTALL)
+# Headings the fetchers generate themselves (Jira sections, PDF pages, PPTX
+# slide numbers, default XLSX sheet names): they say nothing about the topic.
+FETCHER_BOILERPLATE_RE = re.compile(
+    r"^## (?:Description|Comments|Page \d+|Sheet ?\d*)[ \t]*$|^## Slide \d+:?", re.MULTILINE
+)
+JIRA_KEY_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+\s*(?:—|–|:|-)\s*")
+H1_LINE_RE = re.compile(r"^# +(.+)$", re.MULTILINE)
 JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
 CONFLUENCE_SPACE_URL_RE = re.compile(r"/spaces/([A-Za-z0-9._~-]+)(?:/|$)")
 
@@ -176,7 +192,7 @@ def run_script(
     try:
         return json.loads(stdout)
     except json.JSONDecodeError:
-        # Some scripts (e.g. describe_image.py) print a plain path
+        # Tolerate a script that prints plain text
         return {"stdout": stdout}
 
 
@@ -298,100 +314,127 @@ def git_push(wiki_root: Path, cfg) -> Optional[str]:
         return None
 
 
-def _looks_like_placeholder(value: str) -> bool:
-    if not value:
-        return True
-    lowered = value.lower()
-    for marker in ("replace_me", "example.com", "your-", "changeme", "todo"):
-        if marker in lowered:
-            return True
-    return False
+def do_image_diff_loop(wiki_root: Path, slug: str) -> dict:
+    """List the slug's images that still need a description.
 
+    An image is pending (`new` / `changed`) until `image_manifest.py
+    mark-described` records its current sha. Never writes the manifest.
+    """
+    from image_manifest import classify, load_manifest, scan_slug_dir  # stdlib
 
-def do_image_diff_loop(
-    wiki_root: Path,
-    slug: str,
-) -> dict:
-    """Run image manifest status, describe new/changed images, update manifest."""
-    from image_manifest import (  # local import — stdlib
-        classify,
-        hash_file,
-        load_manifest,
-        scan_slug_dir,
-    )
-
-    cfg = load_config(wiki_root)
-    raw_dir = cfg.raw_dir
+    raw_dir = load_config(wiki_root).raw_dir
     manifest = load_manifest(raw_dir, slug)
-    scanned = scan_slug_dir(raw_dir, slug)
-
-    if not scanned:
-        return {"new": 0, "changed": 0, "unchanged": 0, "described": 0, "images": {}}
-
     images_dir = raw_dir / "images" / slug
-    per_image = {}
-    counts = {"new": 0, "changed": 0, "unchanged": 0, "described": 0, "skipped": 0}
-
-    base_url = cfg.nano_banana_base_url()
-    api_key = cfg.nano_banana_key()
-    can_describe = bool(
-        base_url
-        and api_key
-        and not _looks_like_placeholder(base_url)
-        and not _looks_like_placeholder(api_key)
-    )
-
-    for image_name, sha in sorted(scanned.items()):
+    counts = {"new": 0, "changed": 0, "unchanged": 0}
+    pending = []
+    for image_name, sha in sorted(scan_slug_dir(raw_dir, slug).items()):
         status = classify(manifest, image_name, sha)
         counts[status] += 1
-        image_path = images_dir / image_name
-        description_file = images_dir / f"{Path(image_name).stem}.md"
+        if status != "unchanged":
+            pending.append(
+                {
+                    "image": str((images_dir / image_name).resolve()),
+                    "description": str((images_dir / f"{Path(image_name).stem}.md").resolve()),
+                    "status": status,
+                }
+            )
+    return {"enabled": True, **counts, "pending_images": pending}
 
-        if status == "unchanged":
-            per_image[image_name] = {"status": status, "sha256": sha}
-            continue
 
-        if not can_describe:
-            per_image[image_name] = {
-                "status": status,
-                "sha256": sha,
-                "described": False,
-                "reason": (
-                    "nano_banana.base_url or api_key is empty or looks like a placeholder "
-                    "(REPLACE_ME / example.com / your-…) — description skipped"
-                ),
-            }
-            manifest.set_entry(image_name, sha256=sha)
-            manifest.save()
-            counts["skipped"] += 1
-            continue
+def _git_lines(wiki_root: Path, *args: str) -> List[str]:
+    """Output lines of a git command, or [] when it fails (e.g. not a repo)."""
+    proc = subprocess.run(
+        ["git", "-C", str(wiki_root), *args], capture_output=True, text=True
+    )
+    return proc.stdout.splitlines() if proc.returncode == 0 else []
 
-        run_script(
-            "describe_image.py",
-            [
-                "--wiki-root",
-                str(wiki_root),
-                "--image",
-                str(image_path),
-                "--output",
-                str(description_file),
-            ],
-        )
-        manifest.set_entry(
-            image_name,
-            sha256=sha,
-            description_file=description_file.name,
-        )
-        manifest.mark_described(image_name)
-        manifest.save()
-        counts["described"] += 1
-        per_image[image_name] = {
-            "status": status,
-            "sha256": sha,
-            "description_file": description_file.name,
-        }
 
-    return {**counts, "images": per_image}
+def raw_commits(wiki_root: Path, raw_md: Path) -> List[str]:
+    """Commits that touched raw/<slug>.md, newest first."""
+    rel = os.path.relpath(raw_md, wiki_root)
+    return _git_lines(wiki_root, "log", "--follow", "--format=%H", "--", rel)
+
+
+def _source_title(raw_md: Path, text: str) -> str:
+    """source.json `title`, else the raw H1, without a leading Jira key."""
+    try:
+        title = json.loads(raw_md.with_suffix(".source.json").read_text(encoding="utf-8")).get("title")
+    except (OSError, ValueError, AttributeError):
+        title = None
+    if not title:
+        m = H1_LINE_RE.search(text)
+        title = m.group(1) if m else ""
+    return JIRA_KEY_PREFIX_RE.sub("", str(title).strip())
+
+
+def build_context(wiki_root: Path, slug: str, status: Optional[str] = None) -> dict:
+    """What the session needs to synthesize raw/<slug>.md into existing pages.
+
+    `related_pages`: `wiki_tools.related` on the source title and the raw
+    text minus fenced code and fetcher-generated headings.
+    `citing_pages`: pages citing it, always read from the wiki. For a
+    `changed` source also `raw_diff` (what changed, capped at
+    RAW_DIFF_MAX_CHARS). `status` comes from the fetcher (single ingest);
+    None (bulk, or --context without --job-id) derives it from git history:
+    a raw committed once, unmodified and already cited is `unchanged`.
+    """
+    cfg = load_config(wiki_root)
+    raw_md = cfg.raw_dir / f"{slug}.md"
+    rel = os.path.relpath(raw_md, wiki_root)
+    text = raw_md.read_text(encoding="utf-8") if raw_md.exists() else ""
+    commits = raw_commits(wiki_root, raw_md)
+    diff = ""
+    cites = citing(cfg.wiki_dir, slug, cfg.raw_dir)
+    if status is None:
+        dirty = bool(_git_lines(wiki_root, "status", "--porcelain", "--", rel))
+        status = "changed" if len(commits) >= 2 or (commits and dirty) else "new"
+        if status == "new" and commits and cites:
+            status = "unchanged"  # committed once, clean, already synthesized into a page
+        if status == "changed":
+            # Previous version vs current content.
+            diff = "\n".join(_git_lines(wiki_root, "diff", commits[0] if dirty else commits[1], "--", rel))
+    else:
+        if status == "forced":
+            status = "changed" if commits else "new"
+        if status == "changed":
+            diff = "\n".join(_git_lines(wiki_root, "diff", "HEAD", "--", rel))
+    body = FETCHER_BOILERPLATE_RE.sub("", FENCED_CODE_RE.sub("", text))
+    return {
+        "status": status,
+        "related_pages": related(cfg.wiki_dir, _source_title(raw_md, text), body),
+        "citing_pages": cites,
+        "raw_diff": diff[:RAW_DIFF_MAX_CHARS],
+        "raw_diff_truncated": len(diff) > RAW_DIFF_MAX_CHARS,
+    }
+
+
+def _cmd_context(args: argparse.Namespace) -> int:
+    wiki_root = args.wiki_root.resolve()
+    try:
+        load_config(wiki_root)
+    except ConfigError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    if "/" in args.slug or "\\" in args.slug or ".." in args.slug:
+        print(f"ERROR: invalid slug {args.slug!r}: no path separators or '..'", file=sys.stderr)
+        return 1
+    raw_md = load_config(wiki_root).raw_dir / f"{args.slug}.md"
+    if not raw_md.exists():
+        print(f"ERROR: no raw file for slug {args.slug!r}: {raw_md} does not exist", file=sys.stderr)
+        return 1
+    status = None
+    if args.job_id:
+        from bulk_queue import load_queue  # stdlib
+
+        try:
+            queue = load_queue(wiki_root, args.job_id)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 1
+        if any(i.slug == args.slug and i.raw_status == "unchanged" for i in queue.items):
+            status = "unchanged"
+    print(json.dumps(build_context(wiki_root, args.slug, status), indent=2, ensure_ascii=False))
+    return 0
 
 
 def _stream_prefetch(
@@ -401,6 +444,7 @@ def _stream_prefetch(
     max_items: int,
     skip_images: bool,
     force: bool = False,
+    describe_images: bool = False,
 ) -> int:
     """Run prefetch.py as a subprocess and stream its output line-by-line.
 
@@ -420,6 +464,8 @@ def _stream_prefetch(
         cmd.extend(["--max-items", str(max_items)])
     if skip_images:
         cmd.append("--skip-images")
+    if describe_images:
+        cmd.append("--describe-images")
     if force:
         cmd.append("--force")
 
@@ -578,6 +624,7 @@ def _cmd_bulk(
         max_items=args.max_items,
         skip_images=args.skip_images,
         force=args.force,
+        describe_images=args.describe_images,
     )
 
     # After prefetch, report queue counts to guide Claude's synthesis loop
@@ -695,23 +742,26 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
 
     source_json = fetch_summary.get("source_json")
 
+    images_enabled = (args.describe_images or cfg.describe_images) and not args.skip_images
+
     # Diff gate: if the source is unchanged and we're not forcing, skip all
-    # downstream work (image download, describe, git commit).
+    # downstream work (image download, git commit). The read-only image diff
+    # still runs so images left pending by an earlier run are listed again.
     if fetch_status == "unchanged" and not args.force:
-        image_summary = {"new": 0, "changed": 0, "unchanged": 0, "described": 0, "skipped": 0, "images": {}}
+        image_summary = do_image_diff_loop(wiki_root, slug) if images_enabled else {"enabled": False}
         write_fetch_history(wiki_root, slug, "unchanged", args.source)
         result = {
             "source_type": source_type,
             "fetch": fetch_summary,
             "images": image_summary,
             "committed": None,
-            "note": "content unchanged since last ingest — skipped image download, description, and commit. Pass --force to re-run everything.",
+            "note": "content unchanged since last ingest — skipped image download and commit. Pass --force to re-run everything.",
         }
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
 
     # For Confluence/Jira/web, download image_hints before running the diff loop.
-    if source_type in {"confluence", "jira", "web"} and source_json:
+    if images_enabled and source_type in {"confluence", "jira", "web"} and source_json:
         image_hints = fetch_summary.get("image_hints") or []
         if image_hints:
             run_script(
@@ -727,7 +777,7 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
             )
 
     # Run the image diff loop (for local images, images are already on disk)
-    image_summary = do_image_diff_loop(wiki_root, slug)
+    image_summary = do_image_diff_loop(wiki_root, slug) if images_enabled else {"enabled": False}
 
     write_fetch_history(wiki_root, slug, fetch_status, args.source)
 
@@ -736,6 +786,8 @@ def _cmd_ingest(args: argparse.Namespace) -> int:
         "fetch": fetch_summary,
         "images": image_summary,
         "committed": None,
+        # Before the commit below, so the diff against HEAD is still visible.
+        "context": build_context(wiki_root, slug, fetch_status),
     }
 
     if do_commit:
@@ -854,7 +906,15 @@ def main() -> int:
     parser.add_argument(
         "--skip-images",
         action="store_true",
-        help="Bulk prefetch: skip nano-banana-pro description (still downloads image bytes)",
+        help="Disable image download and the image diff for this run (wins over --describe-images)",
+    )
+    parser.add_argument(
+        "--describe-images",
+        action="store_true",
+        help=(
+            "Download images and list the new/changed ones as pending_images for "
+            "the session to describe (default: images.describe in .wikirc.json)"
+        ),
     )
     parser.add_argument(
         "--batch",
@@ -869,7 +929,7 @@ def main() -> int:
         "--force",
         action="store_true",
         help=(
-            "Bypass content-diff gates: re-download images, re-describe them, "
+            "Bypass content-diff gates: re-download images (when enabled) "
             "and commit even if the source content is unchanged. Honored by "
             "single, bulk and refresh runs"
         ),
@@ -881,7 +941,16 @@ def main() -> int:
         action="store_true",
         help="Only push already-made commits to the remote (gated on auto_push)",
     )
-    parser.add_argument("--slug", help="Slug for --commit-only")
+    parser.add_argument(
+        "--context",
+        action="store_true",
+        help="Print the synthesis context (related / citing pages, raw diff) for --slug",
+    )
+    parser.add_argument(
+        "--job-id",
+        help="With --context: the bulk job, so an item fetched as unchanged reports no diff",
+    )
+    parser.add_argument("--slug", help="Slug for --commit-only / --context")
     parser.add_argument("--message", help="Override commit message")
     parser.add_argument("--new-images", type=int, default=0, help="For --commit-only")
     parser.add_argument("--changed-images", type=int, default=0, help="For --commit-only")
@@ -891,8 +960,10 @@ def main() -> int:
     # Reject before dispatching: --commit-only / --push-only return below, so
     # without this an explicit --refresh-all alongside either would be silently
     # ignored and the user would think a refresh had run.
-    if args.refresh_all and (args.commit_only or args.push_only):
-        parser.error("--refresh-all cannot be combined with --commit-only or --push-only")
+    if args.refresh_all and (args.commit_only or args.push_only or args.context):
+        parser.error("--refresh-all cannot be combined with --commit-only, --push-only or --context")
+    if args.context and (args.commit_only or args.push_only):
+        parser.error("--context cannot be combined with --commit-only or --push-only")
 
     # An empty --source means a caller's variable was empty, not "refresh
     # everything". Falling through to refresh-all here would turn a typo into a
@@ -905,6 +976,12 @@ def main() -> int:
 
     if args.push_only:
         return _cmd_push_only(args)
+
+    # Before the no-source fallback below, which would start a refresh-all.
+    if args.context:
+        if not args.slug:
+            parser.error("--slug is required with --context")
+        return _cmd_context(args)
 
     if args.commit_only:
         if not args.slug:

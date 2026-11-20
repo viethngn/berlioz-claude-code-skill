@@ -3,14 +3,23 @@
 
 Scans wiki/*.md and emits a JSON report of:
     orphans, broken_links, missing_pages, archive_links_without_banner,
-    format_violations, empty_pages, stale_pages, unsourced_claims,
-    status_pages, missing_sources, empty_raw, edges (wiki-link graph)
+    format_violations, empty_pages, source_drift, unsourced_claims,
+    status_pages, missing_sources, empty_raw, overlap_candidates,
+    fact_collisions, warnings; plus edges / inbound_counts (wiki-link graph)
+    with --graph
+
+`index`, `log` and README pages (EXEMPT_PAGES) are skipped by every per-page
+check, and their links do not count as inbound links for orphan detection.
+Journal pages (`YYYY-MM-DD`, `YYYY-MM-index`, written by the `log` skill) skip
+the same judgment checks, but their links count as inbound and are checked for
+broken targets. Link targets drop `#anchor`; cross-wiki `[[label/slug]]` links
+are never resolved (see `link_target`).
 
 Pages carrying `**Status**: Archived` or `**Status**: Superseded by [[...]]`
-are excluded from the orphan and stale checks (intentionally retired).
+are excluded from the orphan check (intentionally retired).
 
 Pages under `wiki/archive/` are the primary archival namespace: they are NOT
-collected as active pages (so they're never re-flagged as orphan/stale), but
+collected as active pages (so they're never re-flagged as orphans), but
 their slugs ARE resolvable link targets so references into the archive don't
 read as broken links.
 
@@ -19,26 +28,63 @@ AND which no wiki page cites — safe-to-prune candidates. The linter only
 REPORTS them; the /lint skill deletes them after user confirmation.
 
 Usage:
-    python3 lint.py --wiki-root PATH [--stale-days DAYS] [--sources]
+    python3 lint.py --wiki-root PATH [--sources] [--graph] [--max-candidates N]
+                    [--full | --since-last-lint] [--fix [--allow-dirty]]
+    python3 lint.py --wiki-root PATH --mark-reviewed < reviewed.json
+
+`--fix` (see `apply_fixes`) deletes stub-placeholder pages, unlinks links to
+them (dropping their index lines) and repairs a missing Sources path by exact
+stem, then reports on the fixed wiki under the extra key `fixed`. It refuses
+(exit 2) outside a git work tree or with uncommitted wiki changes.
+
+`wiki/.lint-reviewed.json` remembers reviewed overlap pairs, collisions and
+acknowledged drift by content hash; a matching item is left out of the report
+(counted under `suppressed`) until the page or raw content changes.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
+import subprocess
 import sys
+from collections import Counter
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
+from itertools import combinations
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 
-WIKI_LINK_RE = re.compile(r"\[\[([^\]\|]+?)(?:\|[^\]]+)?\]\]")
-DATE_RE = re.compile(r"(20\d{2}-\d{2}-\d{2})")
+# Overlap / fact-collision tuning. Score = weighted sum of components in [0, 1];
+# a shared source alone (W_SOURCES) must stay below OVERLAP_THRESHOLD.
+MAX_CANDIDATES = 20
+OVERLAP_THRESHOLD = 0.5
+# Second path: pages sharing a cited raw are candidates from this text_sim alone
+# (test fixtures: paraphrased duplicate 0.21; distinct sibling pages 0.11-0.16).
+SHARED_SOURCE_TEXT_SIM = 0.2
+SENTENCE_SIM_THRESHOLD = 0.8
+W_SOURCES = 0.2
+W_LINKS = 0.1
+W_SLUG = 0.2
+W_TEXT = 0.5
+SLUG_TOKEN_MIN = 4
+SHINGLE = 5  # character n-gram size for page-level text_sim
+MAX_BUCKET = 50  # index keys shared by more pages generate no pairs (warned)
+MAX_COLLISIONS = 50
+MAX_EXACT_COLLISIONS = 35  # exact-pass share of MAX_COLLISIONS while fuzzy hits exist
+COLLISION_SCAN_LIMIT = 20 * MAX_COLLISIONS  # per pass (exact, fuzzy); past it the warning says "at least"
+
+WIKI_LINK_RE = re.compile(r"\[\[([^\]\|]+?)(?:\|([^\]]+))?\]\]")  # group 2: alias text
 H1_RE = re.compile(r"^#\s+.+", re.MULTILINE)
 
 REQUIRED_FIELDS = ("Summary", "Sources", "Last updated")
-EXEMPT_ORPHANS = {"index", "log", "README", "readme"}
+EXEMPT_PAGES = {"index", "log", "README", "readme"}
+# Append-only journal written by the `log` skill: day-pages and monthly rollups.
+JOURNAL_SLUG_RE = re.compile(r"^\d{4}-\d{2}-(?:\d{2}|index)$")
 NEEDS_VERIFICATION_RE = re.compile(r"\(?source:\s*needs verification\)?", re.IGNORECASE)
 # A raw/ path token inside a Sources entry — stops at backtick, comma, quote,
 # whitespace, or closing bracket/paren so multi-path lines split correctly.
@@ -54,7 +100,7 @@ STUB_MARKERS = (
     "tbd — mentioned in",
     "tbd - mentioned in",
 )
-# Status values that retire a page from orphan/stale nagging.
+# Status values that retire a page from orphan nagging.
 RETIRED_STATUSES = ("archived", "superseded")
 # Subdirectory under wiki/ holding archived pages. Files here are NOT linted as
 # active pages, but their slugs are valid link targets (references into the
@@ -71,27 +117,42 @@ def wiki_links_in(text: str) -> List[str]:
     return [m.group(1).strip() for m in WIKI_LINK_RE.finditer(text)]
 
 
+def is_journal_slug(slug: str) -> bool:
+    return bool(JOURNAL_SLUG_RE.fullmatch(slug))
+
+
+def skip_judgment(slug: str) -> bool:
+    """Exempt and journal pages get no per-page judgment checks."""
+    return slug in EXEMPT_PAGES or is_journal_slug(slug)
+
+
+def link_target(raw: str) -> Optional[str]:
+    """Resolvable page slug of a wiki-link target: `#anchor` stripped; None for
+    a cross-wiki link (`label/slug`, not `archive/...`) or a pure `[[#anchor]]`.
+    The `archive` segment matches in any case and is returned lower-case."""
+    target = raw.split("#", 1)[0].strip()
+    if "/" in target:
+        head, rest = target.split("/", 1)
+        if head.lower() != ARCHIVE_SUBDIR:
+            return None
+        target = f"{ARCHIVE_SUBDIR}/{rest}"
+    return target or None
+
+
+def resolved_links(text: str) -> set:
+    return {t for t in map(link_target, wiki_links_in(text)) if t}
+
+
 def has_field(text: str, name: str) -> bool:
     pattern = rf"^\*\*{re.escape(name)}\*\*\s*:"
     return bool(re.search(pattern, text, re.MULTILINE))
 
 
-def parse_last_updated(text: str) -> Optional[datetime]:
-    m = re.search(r"\*\*Last updated\*\*\s*:\s*(\S+)", text)
-    if not m:
-        return None
-    raw = m.group(1).strip().rstrip(",")
-    md = DATE_RE.search(raw)
-    if not md:
-        return None
-    try:
-        return datetime.strptime(md.group(1), "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
+SOURCES_BLOCK_RE = re.compile(r"\*\*Sources\*\*\s*:\s*(.+?)(?=\n\*\*|\n---|\n#|\Z)", re.S)
 
 
 def parse_sources(text: str) -> List[str]:
-    m = re.search(r"\*\*Sources\*\*\s*:\s*(.+?)(?=\n\*\*|\n---|\n#|\Z)", text, re.S)
+    m = SOURCES_BLOCK_RE.search(text)
     if not m:
         return []
     block = m.group(1)
@@ -128,10 +189,100 @@ def parse_status(text: str) -> Tuple[Optional[str], Optional[str]]:
     return lowered.split()[0] if lowered else None, None
 
 
+FIELD_LINE_RE = re.compile(r"^\*\*[^*]+\*\*\s*:")
+HEADER_FIELD_RE = re.compile(r"^\*\*(?:Summary|Sources|Last updated|Status)\*\*\s*:", re.IGNORECASE)
+SUMMARY_LINE_RE = re.compile(r"^\*\*Summary\*\*\s*:(.*)$", re.MULTILINE)
+FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+# shortcut: inline code spans are matched per line; a span crossing a line break is not seen.
+CODE_SPAN_RE = re.compile(r"(`+).+?\1")
+
+
+def _is_header_block(head: str) -> bool:
+    """True when every line is header material: the H1, blanks, `**Field**:`
+    lines, their hard-wrapped continuations and list items, a blockquote banner."""
+    prev = None  # kind of the previous non-blank line, or "blank"
+    for line in head.splitlines():
+        s = line.strip()
+        if not s:
+            kind = "blank"
+        elif FIELD_LINE_RE.match(s):
+            kind = "field"
+        elif re.match(r"[-*+]\s", s):
+            if prev not in ("field", "item"):
+                return False
+            kind = "item"
+        elif s.startswith(">"):
+            kind = "quote"
+        elif re.match(r"#\s", s):
+            kind = "h1"
+        elif prev in ("field", "wrap"):
+            kind = "wrap"
+        else:
+            return False
+        prev = kind
+    return True
+
+
 def page_body(text: str) -> str:
-    """Return the page body after the first `---` separator (or whole text)."""
-    parts = text.split("\n---", 1)
-    return parts[1] if len(parts) == 2 else text
+    """Return the page body: after the first `---` when everything before it is
+    header material, else everything after the H1 (a `---` in prose is a rule)."""
+    head, sep, rest = text.partition("\n---")
+    if sep and _is_header_block(head):
+        return rest
+    return body_after_h1(text)
+
+
+def _fence_step(line: str, fence: Optional[str]) -> Tuple[bool, Optional[str]]:
+    """(line is fenced code or a fence delimiter, fence open after the line)."""
+    f = FENCE_RE.match(line)
+    if fence is None:
+        return (True, f.group(1)) if f else (False, None)
+    if f and f.group(1)[0] == fence[0] and len(f.group(1)) >= len(fence) \
+            and not line[f.end():].strip():
+        return True, None
+    return True, fence
+
+
+def _non_ws(s: str) -> int:
+    return len(re.sub(r"\s+", "", s))
+
+
+def stub_marker(text: str) -> Optional[str]:
+    """The `STUB_MARKERS` phrase that makes a page a stub, or None.
+
+    A stub has a marker in its Summary or in body prose (not fenced code,
+    inline code or blockquotes) AND, once marker sentences, header fields,
+    headings and the `## Related pages` section are removed, a body below
+    `EMPTY_BODY_CHARS` non-whitespace characters.
+    """
+    def marker_in(s: str) -> Optional[str]:
+        lowered = s.lower()
+        return next((m for m in STUB_MARKERS if m in lowered), None)
+
+    summary = SUMMARY_LINE_RE.search(text)
+    found = marker_in(CODE_SPAN_RE.sub(" ", summary.group(1))) if summary else None
+    kept = 0
+    fence: Optional[str] = None
+    related = False
+    for line in page_body(text).splitlines():
+        in_code, fence = _fence_step(line, fence)
+        s = line.strip()
+        if in_code or s.startswith(">"):
+            kept += 0 if related else _non_ws(line)
+            continue
+        if re.match(r"#{1,6}(\s|$)", s):  # ATX heading only; `#1 priority` is prose
+            related = s.lstrip("#").strip().lower() == "related pages"
+            continue
+        if related or HEADER_FIELD_RE.match(s):
+            continue
+        kept += sum(_non_ws(c.group(0)) for c in CODE_SPAN_RE.finditer(line))
+        for sentence in SENTENCE_SPLIT_RE.split(CODE_SPAN_RE.sub(" ", line)):
+            m = marker_in(sentence)
+            if m:
+                found = found or m
+            else:
+                kept += _non_ws(sentence)
+    return found if found and kept < EMPTY_BODY_CHARS else None
 
 
 def body_after_h1(text: str) -> str:
@@ -163,14 +314,17 @@ def build_edges(pages: List[dict]) -> Dict[str, List[str]]:
     edges: Dict[str, List[str]] = {}
     for page in pages:
         slug = slug_from_path(page["path"])
-        targets = sorted(set(wiki_links_in(page["text"])))
+        targets = sorted(resolved_links(page["text"]))
         edges[slug] = targets
     return edges
 
 
 def inbound_counts(edges: Dict[str, List[str]]) -> Dict[str, int]:
     counts: Dict[str, int] = {}
-    for _, targets in edges.items():
+    for src, targets in edges.items():
+        # Hub pages link everything; a link from them doesn't de-orphan a page.
+        if src in EXEMPT_PAGES:
+            continue
         for t in targets:
             counts[t] = counts.get(t, 0) + 1
     return counts
@@ -194,7 +348,7 @@ def find_status_pages(pages: List[dict]) -> List[dict]:
 
 
 def retired_slugs(pages: List[dict]) -> set:
-    """Slugs of pages whose Status retires them from orphan/stale nagging."""
+    """Slugs of pages whose Status retires them from orphan nagging."""
     retired = set()
     for page in pages:
         status, _ = parse_status(page["text"])
@@ -210,7 +364,7 @@ def find_orphans(
     orphans = []
     for page in pages:
         slug = slug_from_path(page["path"])
-        if slug in EXEMPT_ORPHANS or slug in retired:
+        if skip_judgment(slug) or slug in retired:
             continue
         if inbound.get(slug, 0) == 0:
             orphans.append(slug)
@@ -246,6 +400,8 @@ def find_broken_links(
 def find_format_violations(pages: List[dict]) -> List[dict]:
     violations: List[dict] = []
     for page in pages:
+        if skip_judgment(slug_from_path(page["path"])):
+            continue
         text = page["text"]
         missing = []
         if not H1_RE.search(text):
@@ -265,13 +421,10 @@ def find_empty_pages(pages: List[dict]) -> List[dict]:
     empty: List[dict] = []
     for page in pages:
         slug = slug_from_path(page["path"])
-        if slug in EXEMPT_ORPHANS:
+        if skip_judgment(slug):
             continue
-        body = page_body(page["text"])
-        lowered = body.lower()
-        marker = next((m for m in STUB_MARKERS if m in lowered), None)
-        non_ws = re.sub(r"\s+", "", body)
-        if marker:
+        non_ws = re.sub(r"\s+", "", page_body(page["text"]))
+        if stub_marker(page["text"]):
             empty.append(
                 {"page": slug, "reason": "stub placeholder", "char_count": len(non_ws)}
             )
@@ -280,6 +433,42 @@ def find_empty_pages(pages: List[dict]) -> List[dict]:
                 {"page": slug, "reason": "body too short", "char_count": len(non_ws)}
             )
     return empty
+
+
+def is_traversal(path: str) -> bool:
+    """True when a path has a `..` segment (would escape raw/)."""
+    return ".." in Path(path.strip()).parts
+
+
+def traversal_source_paths(text: str) -> List[str]:
+    """Return the Sources `raw/...` tokens that contain a `..` segment."""
+    return [
+        t.strip()
+        for entry in parse_sources(text)
+        for t in PATH_TOKEN_RE.findall(entry)
+        if is_traversal(t)
+    ]
+
+
+def resolve_source_paths(text: str, raw_dir: Path) -> List[str]:
+    """Return the wiki-root-relative raw paths cited in a page's Sources block.
+
+    Explicit `raw/...` tokens are kept as-is, except ones with a `..` segment,
+    which are dropped (see `traversal_source_paths`). A bare filename
+    (`api-guide.md`) resolves to `<raw_dir name>/<name>` (normally
+    `raw/<name>`) only when that file exists in raw_dir; other bare words are
+    dropped.
+    """
+    out: List[str] = []
+    for entry in parse_sources(text):
+        out.extend(
+            t.strip() for t in PATH_TOKEN_RE.findall(entry) if not is_traversal(t)
+        )
+        for piece in re.split(r"[\s,]+", entry):
+            name = piece.strip("`'\"()[]")
+            if name and "/" not in name and (raw_dir / name).is_file():
+                out.append(f"{raw_dir.name}/{name}")
+    return out
 
 
 def find_missing_sources(pages: List[dict], raw_dir: Path) -> List[dict]:
@@ -292,21 +481,11 @@ def find_missing_sources(pages: List[dict], raw_dir: Path) -> List[dict]:
     wiki_root = raw_dir.parent
     out: List[dict] = []
     for page in pages:
-        missing: List[str] = []
-        for entry in parse_sources(page["text"]):
-            for candidate in PATH_TOKEN_RE.findall(entry):
-                candidate = candidate.strip()
-                # Only check entries that look like a raw/ path.
-                if not candidate.startswith("raw/"):
-                    continue
-                if ".." in Path(candidate).parts:
-                    # Never resolve a traversal attempt against the real
-                    # filesystem — treat it as an invalid Sources entry
-                    # rather than a read-oracle for paths outside raw/.
-                    missing.append(candidate)
-                    continue
-                if not (wiki_root / candidate).exists():
-                    missing.append(candidate)
+        # Traversal entries are reported, never resolved against the filesystem.
+        missing = traversal_source_paths(page["text"]) + [
+            c for c in resolve_source_paths(page["text"], raw_dir)
+            if not (wiki_root / c).exists()
+        ]
         if missing:
             out.append(
                 {"page": slug_from_path(page["path"]), "missing": sorted(set(missing))}
@@ -314,13 +493,14 @@ def find_missing_sources(pages: List[dict], raw_dir: Path) -> List[dict]:
     return out
 
 
-def cited_raw_slugs(pages: List[dict]) -> set:
+def cited_raw_slugs(pages: List[dict], raw_dir: Path) -> set:
     """Return the set of raw slugs that ANY wiki page depends on.
 
     A raw file is "cited" if `raw/<slug>.md` (or an image under
     `raw/images/<slug>/`) is referenced anywhere in a page's text — the Sources
     block, an inline image link, or prose. We scan the whole page text (not just
-    Sources) so inline references also protect a raw from pruning.
+    Sources) so inline references also protect a raw from pruning; bare
+    filenames in the Sources block count too (via `resolve_source_paths`).
 
     Tokens are matched exactly and normalized to the slug: `raw/foo.md` →
     `foo`, `raw/images/foo/0.png` → `foo`. Exact-token extraction avoids
@@ -328,11 +508,14 @@ def cited_raw_slugs(pages: List[dict]) -> set:
     """
     cited: set = set()
     for page in pages:
-        for token in PATH_TOKEN_RE.findall(page["text"]):
+        tokens = PATH_TOKEN_RE.findall(page["text"])
+        tokens += resolve_source_paths(page["text"], raw_dir)
+        for token in tokens:
             token = token.strip()
-            if not token.startswith("raw/"):
+            head, _, rest = token.partition("/")
+            # Bare-name resolution yields the configured raw dir name.
+            if head not in ("raw", raw_dir.name) or is_traversal(token):
                 continue
-            rest = token[len("raw/"):]
             if rest.startswith("images/"):
                 # raw/images/<slug>/<file> → slug is the first path segment
                 parts = rest[len("images/"):].split("/", 1)
@@ -444,6 +627,8 @@ def find_unbannered_archive_links(
 
     out: List[dict] = []
     for slug, targets in edges.items():
+        if slug in EXEMPT_PAGES:
+            continue
         for t in targets:
             archived_slug = archived_slug_of(t)
             if archived_slug and not has_banner(archived_slug):
@@ -451,67 +636,97 @@ def find_unbannered_archive_links(
     return out
 
 
-def find_stale(
+_COMMIT_CACHE: Dict[Tuple[str, str, bool], Optional[Tuple[str, int]]] = {}
+
+
+def _git(wiki_root: Path, *args: str) -> Optional[str]:
+    """stdout of `git -C wiki_root <args>`, or None if git is missing or fails."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(wiki_root), *args], capture_output=True, text=True
+        )
+    except OSError:
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def _git_paths(wiki_root: Path, *args: str) -> set:
+    """Paths printed by a path-listing git command, read with -z so non-ASCII
+    names are not C-quoted; empty set if git fails."""
+    return set(filter(None, (_git(wiki_root, args[0], "-z", *args[1:]) or "").split("\0")))
+
+
+def last_commit(
+    wiki_root: Path, rel_path: str, skip_lint: bool = False
+) -> Optional[Tuple[str, int]]:
+    """(sha, committer_unix_time) of the newest commit touching rel_path.
+
+    With skip_lint, commits whose subject starts with `lint:` are ignored, so a
+    lint link-fix never counts as the page catching up with its sources.
+    """
+    key = (str(wiki_root), rel_path, skip_lint)
+    if key not in _COMMIT_CACHE:
+        found = None
+        log = _git(wiki_root, "log", "--format=%H%x09%ct%x09%s", "--", rel_path) or ""
+        for line in log.splitlines():
+            sha, ct, subject = (line.split("\t", 2) + [""])[:3]
+            if skip_lint and subject.startswith("lint:"):
+                continue
+            found = (sha, int(ct))
+            break
+        _COMMIT_CACHE[key] = found
+    return _COMMIT_CACHE[key]
+
+
+def find_source_drift(
     pages: List[dict],
+    wiki_root: Path,
+    wiki_subdir: str,
     raw_dir: Path,
-    stale_days: int,
+    warnings: List[str],
     retired: Optional[set] = None,
 ) -> List[dict]:
-    retired = retired or set()
-    now = datetime.now(timezone.utc)
-    stale: List[dict] = []
-    raw_files: List[dict] = []
-    if raw_dir.exists():
-        for p in raw_dir.iterdir():
-            if p.is_file() and p.suffix.lower() == ".md":
-                raw_files.append(
-                    {
-                        "name": p.name,
-                        "stem": p.stem,
-                        "mtime": datetime.fromtimestamp(
-                            p.stat().st_mtime, tz=timezone.utc
-                        ),
-                    }
-                )
+    """Pages whose cited raws changed in git after the page's last non-lint commit.
 
+    A cited raw with uncommitted changes (modified or untracked) is always drift.
+    An untracked page is never drifted; EXEMPT_PAGES and retired pages are
+    skipped. No repo / no commits -> [] + warning.
+    """
+    if _git(wiki_root, "rev-parse", "--verify", "-q", "HEAD") is None:
+        warnings.append("source_drift skipped: wiki root is not a git repo with commits")
+        return []
+    # ls-files prints paths relative to wiki_root (git status --porcelain would
+    # print them relative to the repo top, which differs for a nested wiki).
+    dirty = _git_paths(wiki_root, "ls-files", "-m", "-o", "--exclude-standard", "--", raw_dir.name)
+    out: List[dict] = []
     for page in pages:
-        text = page["text"]
         slug = slug_from_path(page["path"])
-        if slug in retired:
+        if skip_judgment(slug) or slug in (retired or set()):
             continue
-        last_updated = parse_last_updated(text)
-        if last_updated is None:
+        page_c = last_commit(wiki_root, f"{wiki_subdir}/{page['path'].name}", skip_lint=True)
+        if page_c is None:
             continue
-        age_days = (now - last_updated).days
-        if age_days < stale_days:
-            continue
-
-        related_raws: List[str] = []
-        for rf in raw_files:
-            if rf["mtime"] <= last_updated:
-                continue
-            if slug in rf["stem"] or any(
-                token in rf["stem"] for token in slug.split("-") if len(token) > 3
-            ):
-                related_raws.append(rf["name"])
-
-        if not related_raws:
-            continue
-
-        stale.append(
-            {
-                "page": slug,
-                "last_updated": last_updated.date().isoformat(),
-                "age_days": age_days,
-                "newer_raw_files": sorted(related_raws),
-            }
-        )
-    return stale
+        drifted = []
+        for raw in dict.fromkeys(resolve_source_paths(page["text"], raw_dir)):
+            raw_c = last_commit(wiki_root, raw)
+            uncommitted = raw in dirty
+            if uncommitted or (raw_c and raw_c[0] != page_c[0] and raw_c[1] > page_c[1]):
+                drifted.append({
+                    "raw": raw,
+                    "page_commit": page_c[0],
+                    "raw_commit": raw_c[0] if raw_c else None,
+                    "uncommitted": uncommitted,
+                })
+        if drifted:
+            out.append({"page": slug, "drifted": drifted})
+    return out
 
 
 def find_unsourced(pages: List[dict]) -> List[dict]:
     unsourced: List[dict] = []
     for page in pages:
+        if skip_judgment(slug_from_path(page["path"])):
+            continue
         text = page["text"]
         sources = parse_sources(text)
         needs_marker_count = len(NEEDS_VERIFICATION_RE.findall(text))
@@ -524,6 +739,486 @@ def find_unsourced(pages: List[dict]) -> List[dict]:
                 }
             )
     return unsourced
+
+
+NUM_TOKEN_RE = re.compile(r"(?:\d[\d.,:/\-]*\d|\d)%?")
+CITATION_RE = re.compile(r"\(source:[^)]*\)", re.IGNORECASE)
+# `.!?` end a sentence only before whitespace/end, so `1.5` and `raw/a.md` stay whole.
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])|\n")
+
+
+def prose_sentences(body: str) -> List[str]:
+    """Sentences from prose only: drops fenced code, table rows, headings and
+    the `## Related pages` list."""
+    kept: List[str] = []
+    in_fence = in_related = False
+    for line in body.splitlines():
+        s = line.strip()
+        if s.startswith("```") or s.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence or s.startswith("|"):
+            continue
+        if s.startswith("#"):
+            in_related = s.lstrip("#").strip().lower() == "related pages"
+            continue
+        if not in_related:
+            kept.append(line)
+    return [t.strip() for t in SENTENCE_SPLIT_RE.split("\n".join(kept)) if t.strip()]
+
+
+def _info(page: dict, raw_dir: Path) -> dict:
+    """Per-page derived data, computed once and cached on the page dict."""
+    if "_info" not in page:
+        # Citations are dropped so a shared `(source: raw/...)` does not inflate text_sim.
+        prose = CITATION_RE.sub("", " ".join(prose_sentences(page_body(page["text"]))))
+        page["_info"] = {
+            "slug": slug_from_path(page["path"]),
+            "sources": set(resolve_source_paths(page["text"], raw_dir)),
+            "links": resolved_links(page_body(page["text"])),
+            # No prose (table- or code-only page) -> no shingles, so text_sim is 0, not 1.
+            "shingles": {prose[i:i + SHINGLE] for i in range(max(len(prose) - SHINGLE + 1, 1))} if prose else set(),
+        }
+    return page["_info"]
+
+
+def _numeric(page: dict) -> List[Tuple[str, str, List[str]]]:
+    """(sentence, normalized number-stripped text, numeric tokens) for each prose
+    sentence carrying a numeric token; cached on the page dict."""
+    if "_numeric" not in page:
+        out = []
+        for s in prose_sentences(page_body(page["text"])):
+            bare = CITATION_RE.sub("", s)
+            tokens = NUM_TOKEN_RE.findall(bare)
+            if tokens:
+                out.append((s, " ".join(NUM_TOKEN_RE.sub("", bare).lower().split()), tokens))
+        page["_numeric"] = out
+    return page["_numeric"]
+
+
+def active_pages(pages: List[dict]) -> List[dict]:
+    """Content pages compared by overlap/collision checks: not exempt, journal or retired."""
+    retired = retired_slugs(pages)
+    return [p for p in pages
+            if not skip_judgment(slug_from_path(p["path"])) and slug_from_path(p["path"]) not in retired]
+
+
+def related_pairs(
+    pages: List[dict], raw_dir: Path, warnings: Optional[List[str]] = None
+) -> List[Tuple[dict, dict]]:
+    """Active content pages sharing a cited raw, a link key (outbound link or
+    own slug), or a slug token of >= SLUG_TOKEN_MIN chars, via inverted indexes."""
+    active = active_pages(pages)
+    index: Dict[str, List[int]] = {}
+    for i, page in enumerate(active):
+        info = _info(page, raw_dir)
+        keys = {f"s:{s}" for s in info["sources"]}
+        keys |= {f"l:{l}" for l in info["links"] | {info["slug"]}}
+        keys |= {f"t:{t}" for t in re.split(r"[-_/\s]+", info["slug"]) if len(t) >= SLUG_TOKEN_MIN}
+        for k in keys:
+            index.setdefault(k, []).append(i)
+    seen = set()
+    for key, bucket in sorted(index.items()):
+        # A key shared by very many pages would make pairing O(n^2); the exact
+        # collision pass still covers these pages, and the skip is reported.
+        if len(bucket) > MAX_BUCKET:
+            if warnings is not None:
+                warnings.append(f"overlap: skipped hub key {key[2:]} shared by {len(bucket)} pages")
+            continue
+        seen.update(combinations(bucket, 2))
+    return [(active[i], active[j]) for i, j in sorted(seen)]
+
+
+def _jaccard(a: set, b: set) -> float:
+    return len(a & b) / len(a | b) if a | b else 0.0
+
+
+def find_overlap(pairs: List[Tuple[dict, dict]], raw_dir: Path, limit: Optional[int]) -> List[dict]:
+    out: List[dict] = []
+    for pa, pb in pairs:
+        a, b = sorted((_info(pa, raw_dir), _info(pb, raw_dir)), key=lambda x: x["slug"])
+        slug_sim = SequenceMatcher(None, a["slug"], b["slug"], autojunk=False).ratio()
+        # Character-shingle Jaccard: linear, symmetric, order-insensitive, language-agnostic.
+        text_sim = _jaccard(a["shingles"], b["shingles"])
+        score = (W_SOURCES * _jaccard(a["sources"], b["sources"])
+                 + W_LINKS * _jaccard(a["links"], b["links"])
+                 + W_SLUG * slug_sim + W_TEXT * text_sim)
+        if score < OVERLAP_THRESHOLD and not (
+                a["sources"] & b["sources"] and text_sim >= SHARED_SOURCE_TEXT_SIM):
+            continue
+        out.append({
+            "pages": [a["slug"], b["slug"]],
+            "score": round(score, 3),
+            "shared_sources": len(a["sources"] & b["sources"]),
+            "shared_links": len(a["links"] & b["links"]),
+            "slug_sim": round(slug_sim, 3),
+            "text_sim": round(text_sim, 3),
+        })
+    out.sort(key=lambda c: (-c["score"], c["pages"]))
+    return out[:limit]
+
+
+def _differing(ka: List[str], kb: List[str]) -> List[List[str]]:
+    """Tokens each side has that the other lacks (multiset); positional
+    differences when both hold the same tokens in another order."""
+    def minus(xs: List[str], other: List[str]) -> List[str]:
+        left, out = Counter(other), []
+        for t in xs:
+            if left[t]:
+                left[t] -= 1
+            else:
+                out.append(t)
+        return out
+
+    da, db = minus(ka, kb), minus(kb, ka)
+    if not da and not db:  # same multiset, so same length
+        da = [x for x, y in zip(ka, kb) if x != y]
+        db = [y for x, y in zip(ka, kb) if x != y]
+    return [da, db]
+
+
+def find_fact_collisions(
+    pairs: List[Tuple[dict, dict]],
+    pages: Iterable[dict] = (),
+    stop_after: int = COLLISION_SCAN_LIMIT,
+    stats: Optional[dict] = None,
+    accept: Optional[Callable[[str, str, str, str], bool]] = None,
+) -> List[dict]:
+    """Prose sentences that agree once numbers are removed but whose numbers differ.
+
+    Exact pass (wiki-wide over `pages`, independent of pairing): sentences with
+    identical normalized number-stripped text. Fuzzy pass (related `pairs`
+    only): SequenceMatcher ratio >= SENTENCE_SIM_THRESHOLD. Exact hits first,
+    groups shared by the fewest pages first (a sentence templated across many
+    pages is least likely a real contradiction), then fuzzy hits; de-duplicated.
+    Each entry carries `kind` ("exact" | "fuzzy"). Each pass stops after
+    `stop_after` hits of its own; a `stats` dict, if given, gets
+    `truncated = True` when either pass stopped. `accept(pa, pb, sa, sb)`, if
+    given, drops a hit before it counts against the budget (scope, review memory).
+    """
+    found: List[dict] = []
+    seen = set()
+
+    def add(kind: str, pa: str, sa: str, ka: List[str], pb: str, sb: str, kb: List[str]) -> None:
+        if pa > pb:
+            pa, sa, ka, pb, sb, kb = pb, sb, kb, pa, sa, ka
+        key = (pa, pb, sa, sb)
+        if key not in seen:
+            seen.add(key)
+            if accept is None or accept(*key):
+                found.append({"pages": [pa, pb], "sentences": [sa, sb],
+                              "differing": _differing(ka, kb), "kind": kind})
+
+    exact: Dict[str, Dict[Tuple[str, Tuple[str, ...]], str]] = {}
+    for page in active_pages(list(pages)):
+        slug = slug_from_path(page["path"])
+        for s, norm, tokens in _numeric(page):
+            exact.setdefault(norm, {}).setdefault((slug, tuple(tokens)), s)
+
+    def exact_pass() -> bool:
+        def page_count(norm: str) -> int:
+            return len({slug for slug, _ in exact[norm]})
+        for norm in sorted(exact, key=lambda n: (page_count(n), n)):
+            for ((pa, ka), sa), ((pb, kb), sb) in combinations(sorted(exact[norm].items()), 2):
+                if pa != pb and ka != kb:
+                    add("exact", pa, sa, list(ka), pb, sb, list(kb))
+                    if len(found) >= stop_after:
+                        return True
+        return False
+
+    def fuzzy_pass(budget_end: int) -> bool:
+        sm = SequenceMatcher(autojunk=False)
+        for pa, pb in pairs:
+            a, b = sorted((pa, pb), key=lambda p: slug_from_path(p["path"]))
+            na, nb = _numeric(a), _numeric(b)
+            for sb, tb, kb in nb:
+                sm.set_seq2(tb)
+                for sa, ta, ka in na:
+                    if ka == kb or ta == tb:  # identical text is the exact pass's job
+                        continue
+                    sm.set_seq1(ta)
+                    # real_quick_ratio and quick_ratio are upper bounds on ratio().
+                    if (sm.real_quick_ratio() >= SENTENCE_SIM_THRESHOLD
+                            and sm.quick_ratio() >= SENTENCE_SIM_THRESHOLD
+                            and sm.ratio() >= SENTENCE_SIM_THRESHOLD):
+                        add("fuzzy", slug_from_path(a["path"]), sa, ka, slug_from_path(b["path"]), sb, kb)
+                        if len(found) >= budget_end:
+                            return True
+        return False
+
+    truncated = exact_pass()
+    truncated = fuzzy_pass(len(found) + stop_after) or truncated
+    if stats is not None:
+        stats["truncated"] = truncated
+    return found
+
+
+REVIEWED_FILE = ".lint-reviewed.json"
+REVIEW_KINDS = ("pairs", "collisions", "drift")
+VERDICTS = ("fine", "rejected")
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def pair_hash(text_a: str, text_b: str) -> str:
+    """Hash of two page texts, given in slug order."""
+    return _sha(f"{text_a}\0{text_b}".encode("utf-8"))
+
+
+def collision_hash(s1: str, s2: str) -> str:
+    return _sha("\0".join(sorted((s1, s2))).encode("utf-8"))
+
+
+def _review_key(kind: str, entry: dict) -> tuple:
+    if kind == "drift":
+        return (entry["page"], entry["raw"])
+    if kind == "collisions":  # a page pair can hold several reviewed collisions
+        return (tuple(entry["pages"]), entry["hash"])
+    return tuple(entry["pages"])
+
+
+def _two_strings(pages: object) -> bool:
+    return (isinstance(pages, list) and len(pages) == 2
+            and all(isinstance(p, str) for p in pages) and pages[0] != pages[1])
+
+
+def _valid_entry(kind: str, e: object) -> bool:
+    if not isinstance(e, dict):
+        return False
+    if kind == "drift":
+        return all(isinstance(e.get(f), str) for f in ("page", "raw", "hash"))
+    return _two_strings(e.get("pages")) and all(isinstance(e.get(f), str) for f in ("hash", "verdict"))
+
+
+def load_reviewed(wiki_dir: Path, warnings: Optional[List[str]] = None) -> dict:
+    """The review memory `wiki/.lint-reviewed.json`; empty lists when absent.
+    Malformed entries are dropped (one warning with the count). Raises
+    ValueError on a malformed file."""
+    path = wiki_dir / REVIEWED_FILE
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    if not isinstance(data, dict) or not all(isinstance(data.get(k, []), list) for k in REVIEW_KINDS):
+        raise ValueError(f"{REVIEWED_FILE} is not an object of lists")
+    out = {k: [e for e in data.get(k, []) if _valid_entry(k, e)] for k in REVIEW_KINDS}
+    bad = sum(len(data.get(k, [])) - len(out[k]) for k in REVIEW_KINDS)
+    if bad and warnings is not None:
+        warnings.append(f"{REVIEWED_FILE}: ignored {bad} malformed entr{'y' if bad == 1 else 'ies'}")
+    return out
+
+
+def mark_reviewed(wiki_dir: Path, raw_dir: Path, payload: dict) -> dict:
+    """Hash and merge reviewed items into the review memory, prune entries for
+    pages that no longer exist, write it sorted. Raises ValueError on a bad
+    payload (nothing is written then)."""
+    def text(slug: str) -> str:
+        path = wiki_dir / f"{slug}.md"
+        if "/" in slug or not path.is_file():
+            raise ValueError(f"no such page: {slug}")
+        return load_page(path)["text"]
+
+    def raw_bytes(raw: str) -> bytes:
+        path = raw_dir.parent / raw
+        if is_traversal(raw) or not path.is_file():
+            raise ValueError(f"no such raw file: {raw}")
+        return path.read_bytes()
+
+    def verdict(item: dict) -> str:
+        if item["verdict"] not in VERDICTS:
+            raise ValueError(f"verdict must be one of {VERDICTS}: {item['verdict']!r}")
+        return item["verdict"]
+
+    def pages_of(item: dict) -> List[str]:
+        if not _two_strings(item["pages"]):
+            raise ValueError(f"pages must be two different page slugs: {item['pages']!r}")
+        return sorted(item["pages"])
+
+    def prose(slug: str) -> set:
+        return set(prose_sentences(page_body(text(slug))))
+
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a JSON object")
+    new: Dict[str, List[dict]] = {k: [] for k in REVIEW_KINDS}
+    try:
+        for item in payload.get("pairs", []):
+            a, b = pages_of(item)
+            new["pairs"].append({"pages": [a, b], "hash": pair_hash(text(a), text(b)),
+                                 "verdict": verdict(item)})
+        for item in payload.get("collisions", []):
+            a, b = pages_of(item)
+            if not _two_strings(item["sentences"]):
+                raise ValueError(f"sentences must be two different strings: {item['sentences']!r}")
+            s1, s2 = item["sentences"]
+            pa, pb = prose(a), prose(b)
+            if not ((s1 in pa and s2 in pb) or (s1 in pb and s2 in pa)):
+                raise ValueError(f"sentences do not occur in pages {a} and {b}")
+            new["collisions"].append({"pages": [a, b], "hash": collision_hash(s1, s2),
+                                      "verdict": verdict(item)})
+        for item in payload.get("drift", []):
+            if not isinstance(item["raw"], str):
+                raise ValueError(f"raw must be a path string: {item['raw']!r}")
+            text(item["page"])
+            new["drift"].append({"page": item["page"], "raw": item["raw"],
+                                 "hash": _sha(raw_bytes(item["raw"]))})
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"bad --mark-reviewed entry: {e}") from e
+
+    memory = load_reviewed(wiki_dir)
+    pruned = 0
+    for kind in REVIEW_KINDS:
+        merged = {_review_key(kind, e): e for e in memory[kind] + new[kind]}
+        live = [e for e in merged.values()
+                if all((wiki_dir / f"{p}.md").is_file()
+                       for p in (e["pages"] if "pages" in e else [e["page"]]))]
+        pruned += len(merged) - len(live)
+        memory[kind] = sorted(live, key=lambda e: _review_key(kind, e))
+    (wiki_dir / REVIEWED_FILE).write_text(
+        json.dumps(memory, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    return {"recorded": sum(len(v) for v in new.values()), "pruned": pruned}
+
+
+LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s")
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _unlink_deleted(text: str, gone: set, index: bool) -> Tuple[str, List[str], List[str]]:
+    """Unlink `[[links]]` to deleted pages outside code and embeds; in the index,
+    drop a list line whose only link is to a deleted page. Returns (text,
+    unlinked targets, removed index slugs). Line endings are kept as they are."""
+    dropped: List[str] = []
+    removed: List[str] = []
+
+    def sub(m: "re.Match") -> str:
+        target = link_target(m.group(1))
+        if target not in gone or (m.start() and m.string[m.start() - 1] == "!"):
+            return m.group(0)
+        dropped.append(target)
+        return (m.group(2) or m.group(1)).strip()
+
+    lines = text.splitlines(keepends=True)
+    out: List[str] = []
+    fence: Optional[str] = None
+    for i, line in enumerate(lines):
+        in_code, fence = _fence_step(line, fence)
+        if not in_code:
+            # Index removal counts only real links: not in inline code, not embeds.
+            plain = CODE_SPAN_RE.sub(lambda s: " " * len(s.group(0)), line)
+            links = [m.group(1) for m in WIKI_LINK_RE.finditer(plain)
+                     if not (m.start() and plain[m.start() - 1] == "!")]
+            if (index and LIST_ITEM_RE.match(line)
+                    and len(links) == 1 and link_target(links[0]) in gone):
+                target = link_target(links[0])
+                nxt = next((l for l in lines[i + 1:] if l.strip()), "")
+                if nxt and _indent(nxt) > _indent(line):
+                    print(f"note: index.md line for deleted page {target} kept "
+                          "(nested content follows)", file=sys.stderr)
+                    out.append(line)
+                else:
+                    removed.append(target)
+                continue
+            pos, parts = 0, []
+            for span in CODE_SPAN_RE.finditer(line):
+                parts += [WIKI_LINK_RE.sub(sub, line[pos:span.start()]), span.group(0)]
+                pos = span.end()
+            line = "".join(parts) + WIKI_LINK_RE.sub(sub, line[pos:])
+        out.append(line)
+    return "".join(out), dropped, removed
+
+
+def apply_fixes(
+    pages: List[dict], wiki_dir: Path, raw_dir: Path, warnings: Optional[List[str]] = None
+) -> dict:
+    """Judgment-free cleanups: delete stub-placeholder pages, unlink links to
+    the pages deleted in this run (and drop their index lines), repoint a
+    missing Sources path to the one `raw/*.md` with exactly its stem.
+
+    Never writes log.md, journal pages or a page that is not valid UTF-8;
+    keeps every byte it does not change (line endings included). Other broken
+    links are left for the report.
+    """
+    texts: Dict[str, str] = {}
+    for page in pages:
+        try:
+            with open(page["path"], encoding="utf-8", newline="") as f:
+                texts[slug_from_path(page["path"])] = f.read()
+        except UnicodeDecodeError:
+            if warnings is not None:
+                warnings.append(f"--fix skipped {page['path'].name}: not valid UTF-8")
+
+    retired = retired_slugs(pages)
+    deleted = sorted(
+        s for s, t in texts.items()
+        if not skip_judgment(s) and s not in retired
+        and stub_marker(t))
+    for slug in deleted:
+        (wiki_dir / f"{slug}.md").unlink()
+
+    raws = ({p.stem: p for p in raw_dir.glob("*.md") if p.is_file()}
+            if raw_dir.name == "raw" and raw_dir.is_dir() else {})
+    wiki_root = raw_dir.parent
+    unlinked: List[dict] = []
+    repaired: List[dict] = []
+    removed: List[str] = []
+
+    for slug, old in texts.items():
+        if slug in deleted or slug == "log" or is_journal_slug(slug):
+            continue
+        text, dropped, rm = _unlink_deleted(old, set(deleted), slug == "index")
+        unlinked += [{"page": slug, "target": t} for t in dict.fromkeys(dropped)]
+        removed += rm
+
+        done = set()
+        for missing in dict.fromkeys(resolve_source_paths(text, raw_dir)):
+            raw = raws.get(Path(missing).stem)
+            if raw is None or (wiki_root / missing).exists():
+                continue
+            new = f"raw/{raw.name}"
+            m = SOURCES_BLOCK_RE.search(text)
+            block = PATH_TOKEN_RE.sub(lambda t: new if t.group(0) == missing else t.group(0), m.group(1))
+            text = text[:m.start(1)] + block + text[m.end(1):]
+            if new not in done:
+                done.add(new)
+                repaired.append({"page": slug, "from": missing, "to": new})
+
+        if text != old:
+            with open(wiki_dir / f"{slug}.md", "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+    return {"deleted_pages": deleted, "unlinked": unlinked,
+            "repaired_sources": repaired, "removed_index_lines": removed}
+
+
+def fix_refusal(wiki_root: Path, wiki_subdir: str, allow_dirty: bool) -> Optional[str]:
+    """Why `--fix` must not run here, or None: it needs a git work tree and,
+    unless allow_dirty, no uncommitted changes under the wiki dir."""
+    if (_git(wiki_root, "rev-parse", "--is-inside-work-tree") or "").strip() != "true":
+        return f"--fix needs a git work tree; {wiki_root} is not inside one"
+    if allow_dirty:
+        return None
+    dirty = (_git_paths(wiki_root, "ls-files", "-m", "--", wiki_subdir)
+             | _git_paths(wiki_root, "diff", "--cached", "--name-only", "--relative", "--", wiki_subdir)
+             | {p for p in _git_paths(wiki_root, "ls-files", "-o", "--exclude-standard", "--", wiki_subdir)
+                if p.endswith(".md")})
+    if dirty:
+        shown = ", ".join(sorted(dirty)[:5]) + (", ..." if len(dirty) > 5 else "")
+        return (f"--fix refused: uncommitted changes under {wiki_subdir}/ ({shown}); "
+                "commit them or pass --allow-dirty")
+    return None
+
+
+def changed_since_last_lint(wiki_root: Path) -> Optional[set]:
+    """Wiki-root-relative paths changed (committed or not) since the newest
+    commit whose subject starts with `lint:`; None when there is no such commit."""
+    log = _git(wiki_root, "log", "--format=%H%x09%s", "--", ".") or ""
+    base = next((sha for sha, _, subject in (l.partition("\t") for l in log.splitlines())
+                 if subject.startswith("lint:")), None)
+    if base is None:
+        return None
+    # Diffing against the work tree covers base..HEAD plus staged/unstaged edits.
+    return (_git_paths(wiki_root, "diff", "--name-only", "--relative", base)
+            | _git_paths(wiki_root, "ls-files", "-o", "--exclude-standard"))
 
 
 def scan_raw(raw_dir: Path) -> List[dict]:
@@ -545,10 +1240,32 @@ def scan_raw(raw_dir: Path) -> List[dict]:
     return out
 
 
+def resolve_dirs(
+    wiki_root: Path,
+    wiki_dir_arg: Optional[str] = None,
+    raw_dir_arg: Optional[str] = None,
+    warnings: Optional[List[str]] = None,
+) -> Tuple[Path, Path]:
+    """(wiki_dir, raw_dir): CLI override, else `.wikirc.json` value, else wiki/raw.
+    An unreadable `.wikirc.json` is ignored with a note in `warnings`."""
+    wiki_subdir = wiki_dir_arg or "wiki"
+    raw_subdir = raw_dir_arg or "raw"
+    config_path = wiki_root / ".wikirc.json"
+    if config_path.exists():
+        try:
+            with config_path.open("r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            wiki_subdir = wiki_dir_arg or cfg.get("wiki_dir") or wiki_subdir
+            raw_subdir = raw_dir_arg or cfg.get("raw_dir") or raw_subdir
+        except (json.JSONDecodeError, OSError) as e:
+            if warnings is not None:
+                warnings.append(f"ignored unreadable {config_path.name}: {e}")
+    return wiki_root / wiki_subdir, wiki_root / raw_subdir
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Deterministic wiki linter")
     parser.add_argument("--wiki-root", type=Path, required=True)
-    parser.add_argument("--stale-days", type=int, default=90)
     parser.add_argument(
         "--sources",
         action="store_true",
@@ -564,32 +1281,68 @@ def main() -> int:
         default=None,
         help="Override raw subdir name (defaults to 'raw' or .wikirc.json value)",
     )
+    parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="Include the wiki-link graph (edges, inbound_counts) in the report",
+    )
+    parser.add_argument(
+        "--max-candidates",
+        type=int,
+        default=MAX_CANDIDATES,
+        help=f"Cap on overlap_candidates (default {MAX_CANDIDATES})",
+    )
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--full", action="store_true",
+                       help="Compare and check every page (default)")
+    scope.add_argument("--since-last-lint", action="store_true",
+                       help="Limit overlap, collisions and drift to pages/raws changed "
+                            "since the newest `lint:` commit")
+    writes = parser.add_mutually_exclusive_group()
+    writes.add_argument("--mark-reviewed", action="store_true",
+                        help=f"Record reviewed items read from stdin into wiki/{REVIEWED_FILE}; "
+                             "runs no checks")
+    writes.add_argument("--fix", action="store_true",
+                        help="Delete stub-placeholder pages, unlink links to them, repair "
+                             "missing Sources paths by exact stem, then report on the fixed wiki")
+    parser.add_argument("--allow-dirty", action="store_true",
+                        help="With --fix: run despite uncommitted changes under the wiki dir")
     args = parser.parse_args()
+    warnings: List[str] = []
 
     wiki_root = args.wiki_root.resolve()
+    wiki_dir, raw_dir = resolve_dirs(wiki_root, args.wiki_dir, args.raw_dir, warnings)
+    wiki_subdir = os.path.relpath(wiki_dir, wiki_root)
 
-    wiki_subdir = args.wiki_dir or "wiki"
-    raw_subdir = args.raw_dir or "raw"
-
-    config_path = wiki_root / ".wikirc.json"
-    if config_path.exists():
-        try:
-            with config_path.open("r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            wiki_subdir = args.wiki_dir or cfg.get("wiki_dir") or wiki_subdir
-            raw_subdir = args.raw_dir or cfg.get("raw_dir") or raw_subdir
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    wiki_dir = wiki_root / wiki_subdir
-    raw_dir = wiki_root / raw_subdir
+    claude_md = wiki_root / "CLAUDE.md"
+    if claude_md.is_file() and "<!-- llm-wiki:begin -->" not in (
+        line.strip() for line in claude_md.read_text(encoding="utf-8", errors="replace").splitlines()
+    ):
+        warnings.append("CLAUDE.md has no llm-wiki managed block — "
+                        f"run bootstrap.py --upgrade --target {wiki_root}")
 
     if not wiki_dir.exists():
         print(f"ERROR: wiki dir not found: {wiki_dir}", file=sys.stderr)
         return 1
 
-    page_paths = collect_pages(wiki_dir)
-    pages = [load_page(p) for p in page_paths]
+    if args.mark_reviewed:
+        try:
+            result = mark_reviewed(wiki_dir, raw_dir, json.loads(sys.stdin.read() or "{}"))
+        except (ValueError, OSError) as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 1
+        print(json.dumps(result))
+        return 0
+
+    pages = [load_page(p) for p in collect_pages(wiki_dir)]
+    fixed = None
+    if args.fix:
+        refusal = fix_refusal(wiki_root, wiki_subdir, args.allow_dirty)
+        if refusal:
+            print(f"ERROR: {refusal}", file=sys.stderr)
+            return 2
+        fixed = apply_fixes(pages, wiki_dir, raw_dir, warnings)
+        pages = [load_page(p) for p in collect_pages(wiki_dir)]
 
     archived = archived_slugs(wiki_dir)
     edges = build_edges(pages)
@@ -599,13 +1352,87 @@ def main() -> int:
     broken, missing = find_broken_links(pages, edges, archived)
     unbannered_archive_links = find_unbannered_archive_links(edges, wiki_dir, archived)
     format_violations = find_format_violations(pages)
-    stale = find_stale(pages, raw_dir, args.stale_days, retired)
+    source_drift = find_source_drift(pages, wiki_root, wiki_subdir, raw_dir, warnings, retired)
     unsourced = find_unsourced(pages)
     empty_pages = find_empty_pages(pages)
     status_pages = find_status_pages(pages)
     missing_sources = find_missing_sources(pages, raw_dir)
-    cited = cited_raw_slugs(pages)
+    cited = cited_raw_slugs(pages, raw_dir)
     empty_raw = find_empty_raw(raw_dir, cited)
+    pairs = related_pairs(pages, raw_dir, warnings)
+
+    # Scope and review memory apply before the caps, and inside the collision
+    # scan before its budget, so dropped items never take report slots.
+    changed = changed_since_last_lint(wiki_root) if args.since_last_lint else None
+    if args.since_last_lint and changed is None:
+        warnings.append("--since-last-lint: no `lint:` commit found; checked the full wiki")
+    texts = {slug_from_path(p["path"]): p["text"] for p in pages}
+
+    def touched(slug: str) -> bool:
+        return changed is None or f"{wiki_subdir}/{slug}.md" in changed
+
+    if changed is not None:
+        pairs = [(a, b) for a, b in pairs
+                 if touched(slug_from_path(a["path"])) or touched(slug_from_path(b["path"]))]
+        source_drift = [d for d in source_drift if touched(d["page"])
+                        or changed & set(resolve_source_paths(texts[d["page"]], raw_dir))]
+
+    try:
+        reviewed = load_reviewed(wiki_dir, warnings)
+    except (ValueError, OSError) as e:
+        warnings.append(f"ignored unreadable {REVIEWED_FILE}: {e}")
+        reviewed = {k: [] for k in REVIEW_KINDS}
+    seen_pairs = {(tuple(e["pages"]), e["hash"]) for e in reviewed["pairs"]}
+    seen_collisions = {(tuple(e["pages"]), e["hash"]) for e in reviewed["collisions"]}
+    acked = {(e["page"], e["raw"]): e["hash"] for e in reviewed["drift"]}
+    suppressed = {k: 0 for k in REVIEW_KINDS}
+
+    overlap = []
+    for c in find_overlap(pairs, raw_dir, None):
+        a, b = c["pages"]
+        if seen_pairs and ((a, b), pair_hash(texts[a], texts[b])) in seen_pairs:
+            suppressed["pairs"] += 1
+        else:
+            overlap.append(c)
+    overlap = overlap[:args.max_candidates]
+
+    def accept_collision(pa: str, pb: str, sa: str, sb: str) -> bool:
+        if not (touched(pa) or touched(pb)):
+            return False
+        if seen_collisions and ((pa, pb), collision_hash(sa, sb)) in seen_collisions:
+            suppressed["collisions"] += 1
+            return False
+        return True
+
+    scan: dict = {}
+    collisions = find_fact_collisions(pairs, pages, stats=scan, accept=accept_collision)
+
+    def drift_acked(page: str, raw: str) -> bool:
+        path = wiki_root / raw
+        return (page, raw) in acked and path.is_file() and acked[(page, raw)] == _sha(path.read_bytes())
+
+    kept_drift = []
+    for d in source_drift:
+        raws = [r for r in d["drifted"] if not drift_acked(d["page"], r["raw"])]
+        suppressed["drift"] += len(d["drifted"]) - len(raws)
+        if raws:
+            kept_drift.append({**d, "drifted": raws})
+    source_drift = kept_drift
+
+    exact = [c for c in collisions if c["kind"] == "exact"]
+    fuzzy = [c for c in collisions if c["kind"] == "fuzzy"]
+    for c in collisions:
+        del c["kind"]
+    # Exact hits get at most MAX_EXACT_COLLISIONS slots while fuzzy hits exist;
+    # slots either kind leaves unused go to the other.
+    n_exact = min(len(exact), max(MAX_EXACT_COLLISIONS, MAX_COLLISIONS - len(fuzzy)))
+    shown = exact[:n_exact] + fuzzy[:MAX_COLLISIONS - n_exact]
+    if scan["truncated"] or len(collisions) > MAX_COLLISIONS:
+        total = f"at least {len(collisions)}" if scan["truncated"] else len(collisions)
+        warnings.append(f"fact_collisions: showing {len(shown)} of {total} found "
+                        f"(exact: {len(exact)}, fuzzy: {len(fuzzy)})"
+                        + ("; collision scan truncated, more may exist" if scan["truncated"] else ""))
+    collisions = shown
 
     report = {
         "wiki_root": str(wiki_root),
@@ -613,20 +1440,29 @@ def main() -> int:
         "raw_dir": str(raw_dir),
         "page_count": len(pages),
         "archived_count": len(archived),
-        "edges": edges,
-        "inbound_counts": inbound,
         "orphans": orphans,
         "broken_links": broken,
         "missing_pages": dict(sorted(missing.items())),
         "archive_links_without_banner": unbannered_archive_links,
         "format_violations": format_violations,
         "empty_pages": empty_pages,
-        "stale_pages": stale,
+        "source_drift": source_drift,
         "unsourced_claims": unsourced,
         "status_pages": status_pages,
         "missing_sources": missing_sources,
         "empty_raw": empty_raw,
+        "overlap_candidates": overlap,
+        "fact_collisions": collisions,
+        "suppressed": suppressed,
+        "warnings": warnings,
     }
+
+    if fixed is not None:
+        report["fixed"] = fixed
+
+    if args.graph:
+        report["edges"] = edges
+        report["inbound_counts"] = inbound
 
     if args.sources:
         report["raw_sources"] = scan_raw(raw_dir)

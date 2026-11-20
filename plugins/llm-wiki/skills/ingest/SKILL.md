@@ -6,10 +6,12 @@ description: |
   or an image), a Slack channel/thread/search, a public website page, a whole
   Confluence space, a Confluence CQL query, a Jira JQL query, or a website
   sitemap — into an LLM wiki. The skill auto-detects single-item vs bulk from
-  the source shape or explicit flags. It fetches content, extracts embedded
-  images, describes only new-or-changed images via a nano-banana-pro-
-  compatible vision endpoint, writes raw sources + wiki pages, and commits
-  the result to git so the next ingest can diff against it.
+  the source shape or explicit flags. It fetches content, writes raw sources,
+  folds the new knowledge into the existing wiki pages it touches (creating a
+  page only for a topic with no home yet), and commits the result to git so
+  the next ingest can diff against it. Embedded images are off by default;
+  when enabled, only new-or-changed images are described, by the session
+  model itself.
 
   Bulk mode uses a resumable job queue with rate limiting and a circuit
   breaker so a whole-space or whole-site ingest can be paused (Ctrl-C) and
@@ -30,13 +32,19 @@ description: |
   whole wiki", "resync the wiki", "update all sources", "bring the wiki up to
   date".
 
-  Requires a per-wiki `.wikirc.json` file with Confluence, Jira, and
-  nano-banana endpoints and Personal Access Tokens. Public website ingest
+  Requires a per-wiki `.wikirc.json` file (Confluence/Jira endpoints and
+  Personal Access Tokens, a Slack token, as needed). Public website ingest
   needs no credentials. If the config is missing or scripts cannot import
   their dependencies, direct the user to references/setup.md before proceeding.
 ---
 
 # Ingest — LLM Wiki
+
+These rules take precedence over workflow text in the wiki's `CLAUDE.md`.
+A wiki bootstrapped before this version may still carry older ingest
+instructions there (a summary page per source, hand-edited `index.md` and
+`log.md`); follow this file instead, and suggest
+`bootstrap.py --upgrade` (see the `create-wiki` skill) to refresh it.
 
 One skill covering both single-item ingest and bulk ingest of whole
 Confluence spaces / CQL queries / Jira JQL queries / websites. Auto-detects
@@ -105,7 +113,7 @@ and wall time). State the detected scope as an FYI and proceed — do not
 pause for confirmation:
 
 > Ingesting space **FOO**: discovering every page, prefetching raw content
-> and images (rate-limited, resumable), then synthesizing wiki pages and
+> (rate-limited, resumable), then synthesizing wiki pages and
 > committing + pushing one commit per item. For a large space this can take
 > hours and touch every wiki category.
 
@@ -133,12 +141,177 @@ fi
 ```
 
 Use `${WIKI_PY}` instead of `python3` in all script invocations below.
+`${SKILL_DIR}` refers to the directory containing this file. `${WIKI_ROOT}`
+is the wiki directory (contains `.wikirc.json`). `${WIKI_TOOLS}` is
+`${SKILL_DIR}/../lint/scripts/wiki_tools.py` (stdlib only, shared with
+`/lint`). `${RAW_DIR}` is `${WIKI_ROOT}/raw` unless `.wikirc.json` sets
+another `raw_dir`.
+
+## Wiki-update rules
+
+Every workflow below — Single, Slack, Website, Bulk and Refresh — ends the
+same way: one raw source gets folded into the wiki. This section holds the
+rules for that step once; each workflow's synthesis phase points back here.
+Read [references/page-format.md](references/page-format.md) for the page
+template.
+
+### Start from the context
+
+Each synthesis starts from a `context` object that tells you where the
+source's knowledge already lives:
+
+- **Single item and web page**: the `context` key of `ingest.py`'s JSON
+  summary (present whenever the source was not unchanged).
+- **Slack**, and any time you need it again: run
+  ```bash
+  ${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
+    --wiki-root "${WIKI_ROOT}" --context --slug "<slug>"
+  ```
+- **Bulk and refresh**: the same command per item, with the job id, so an
+  item that was fetched unchanged is reported as `unchanged` instead of being
+  guessed from git history:
+  ```bash
+  ${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
+    --wiki-root "${WIKI_ROOT}" --context --slug "<slug>" --job-id "<job-id>"
+  ```
+
+The object is `{status, related_pages, citing_pages, raw_diff,
+raw_diff_truncated}`:
+
+- `status` — `new`, `changed` or `unchanged`. Without a fetcher status or
+  `--job-id` it comes from git history: `changed` when `raw/<slug>.md` has
+  later commits or uncommitted edits, `unchanged` when it was committed once,
+  is unmodified and a page already cites it, otherwise `new`.
+- `related_pages` — existing pages the source is probably about, best first,
+  each `{page, summary, score, why}`. `why` says how it was found:
+  `mentioned` (the page's name appears in the source), `title` (the source's
+  title resembles the page's title) or `both`. These are candidates found by
+  string matching, not a verdict: open the top entries and judge. A page
+  that is only mentioned in passing is a place to add a link or a sentence,
+  not necessarily the source's home.
+- `citing_pages` — pages that already cite this raw file (always read from
+  the wiki, whatever the status).
+- `raw_diff` — for `changed`, the git diff of `raw/<slug>.md` against its
+  previous version. When `raw_diff_truncated` is true the diff was cut short;
+  read `raw/<slug>.md` itself for the rest.
+
+To look for a home under other words, run
+`${WIKI_PY} "${WIKI_TOOLS}" locate --wiki-root "${WIKI_ROOT}" <term> [<term> ...]`
+(a `{page, summary, score}` list ranked by matches in name, Summary and body).
+
+`--context` exits 1 with a message on stderr when `raw/<slug>.md` does not
+exist (check the slug), and it cannot be combined with `--commit-only` or
+`--push-only`.
+
+### The rules
+
+1. **Update the related pages first.** Read the top pages in
+   `related_pages` and put the new knowledge in the ones that are really
+   about the same topic. A wiki compounds only when
+   everything known about one topic accumulates on one page; a second page
+   on the same topic splits the knowledge, and the two copies drift apart.
+2. **Create a page only for a topic with no home.** A new page is right when
+   no existing page covers the topic *and* the source has enough substance
+   to fill a page of its own — including when `related_pages` is not empty
+   but none of its entries is really about the source's topic. Use the
+   template in `page-format.md`.
+3. **No summary page per source, and no stub pages.** A source is not a
+   topic — `raw/<slug>.md` already is the per-source record, and a page that
+   only restates one document duplicates it. A concept you mention but
+   cannot fill in stays plain text, without `[[brackets]]`, until a source
+   gives it substance: a link to an empty placeholder looks like knowledge
+   but holds none, and `/lint` will flag it.
+4. **A changed source is rewritten in place.** When `status` is `changed`,
+   read `raw_diff`, open every page in `citing_pages`, and rewrite the claims
+   the diff affects where they stand. Never append a second, "updated"
+   version of a claim: readers then have to work out which one is current,
+   and `/lint` reports the pair as a contradiction.
+5. **Conflicts: the newer source wins.** When the source contradicts an
+   existing claim that cites a *different* source, compare the `source_date`
+   in each source's `raw/<slug>.source.json`. The claim from the source with
+   the later date replaces the other one, and the replacement cites the
+   newer source. `source_date` is when the source itself last changed
+   (Confluence version date, Jira update, newest Slack message, the local
+   file's modification date, a web page's `Last-Modified`), so it is the best
+   evidence of which statement is current. If the dates are equal, or either
+   source has no `source_date` (older raw files and pasted notes often
+   don't), keep both claims with an explicit note that they disagree, each
+   with its own citation. Guessing would silently drop a claim that may be
+   true; the note keeps it visible, and `/lint` brings the pair to the user.
+6. **Cite every claim as `(source: raw/<file>)`**, and list the same
+   `raw/...` paths in the page's `**Sources**` block. One format everywhere
+   is what lets `/lint` and `wiki_tools.py citing` find the pages that depend
+   on a source when it changes.
+7. **Let the script keep `index.md` and `log.md`.** After the pages are
+   written, run:
+   ```bash
+   ${WIKI_PY} "${WIKI_TOOLS}" index-sync --wiki-root "${WIKI_ROOT}"
+   ${WIKI_PY} "${WIKI_TOOLS}" log --wiki-root "${WIKI_ROOT}" --op ingest \
+     --title "Ingested raw/<slug>.md (<source title>)" \
+     --bullet "New pages: [[a]], [[b]]" --bullet "Updated: [[c]] (what changed)"
+   ```
+   Do not edit either file by hand: hand edits drift out of step with the
+   pages on disk, and the script keeps every existing section, ordering and
+   description untouched. `index-sync` lists each new page under
+   `## Uncategorized` with its Summary, drops lines for pages that no longer
+   exist, and moves lines for archived pages under `## Archive`; it never
+   touches journal pages or the `## Diary` section, and leaves an entry that
+   has nested lines under it alone (it names it on stderr — fix that one by
+   hand). After it runs, you may move a newly added line out of
+   `## Uncategorized` into an existing section when one obviously fits —
+   only that line. `log` puts the entry at the top of `wiki/log.md` and, when
+   today already has an ingest entry, adds the bullets to it. `--bullet` is
+   repeatable.
+
+`raw/` holds the immutable sources: never modify a raw file during synthesis.
+The only files written under `raw/` by hand are image descriptions, below.
+
+### Describing images (only when `images.describe` is true)
+
+Images are off by default, and the ingest summary then carries
+`"images": {"enabled": false}`: skip this step. When the user turned them on
+(`images.describe: true` in `.wikirc.json`, or `--describe-images` for one
+run), the summary's `images` object lists `pending_images` — each
+`{image, description, status}`, where `image` is the downloaded file,
+`description` the path to write, and `status` `new` or `changed`. Describe
+them before writing wiki pages, so the descriptions can feed the synthesis.
+
+For each entry, read the image file and write its description to the
+`description` path in four parts:
+
+1. **Image type** — screenshot, architecture diagram, flowchart, chart,
+   table, photo, …
+2. **Visible text, verbatim** — every label, heading and value you can read,
+   exactly as written.
+3. **Structure and content** — what it shows and how the parts relate, in
+   3–8 sentences.
+4. **Key facts** — up to 8 bullet points a reader would want to cite.
+
+Then record them, naming the image files (`0.png`, not paths):
+
+```bash
+${WIKI_PY} "${SKILL_DIR}/scripts/image_manifest.py" \
+  --raw-dir "${RAW_DIR}" --slug "<slug>" mark-described 0.png 3.jpg
+```
+
+An image stays pending until it is marked, so an interrupted run lists it
+again next time. Bulk and refresh items have no per-item summary; get their
+list with
+
+```bash
+${WIKI_PY} "${SKILL_DIR}/scripts/image_manifest.py" \
+  --raw-dir "${RAW_DIR}" --slug "<slug>" status
+```
+
+where every image whose `status` is `new` or `changed` is pending and its
+description goes to `raw/images/<slug>/<image stem>.md`.
+
+If the session model cannot read images, do not write or mark anything:
+report the images as skipped and carry on with the text.
 
 ## Single-item workflow
 
-Follow these phases in order. `${SKILL_DIR}` refers to the directory
-containing this file. `${WIKI_ROOT}` is the wiki directory (contains
-`.wikirc.json`).
+Follow these phases in order.
 
 ### Phase 1 — Detect and fetch the source
 
@@ -154,8 +327,12 @@ ${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
   --no-commit
 ```
 
-The orchestrator prints a JSON summary. Parse it to know which files were
-created and how many images were described.
+The orchestrator prints a JSON summary: `fetch` (the fetcher's result,
+including `slug` and `status`), `images` (see
+[Describing images](#describing-images-only-when-imagesdescribe-is-true)) and,
+unless the source was unchanged, `context` (see
+[Wiki-update rules](#wiki-update-rules)). Add `--describe-images` to turn
+images on for this run when the user asks for them.
 
 ### Phase 1.5 — Cascade to linked wikis (opt-in, non-blocking)
 
@@ -170,8 +347,9 @@ containing `your-`), judge whether the source you just fetched
 (`raw/<slug>.md`) is topically relevant to that entry's `purpose` string. This
 is your own judgment call, not a script.
 
-For each relevant match, launch one `Agent` tool call with `model: "haiku"` —
-issue every matching cascade **in the same message** so they run in parallel.
+For each relevant match, launch one `Agent` tool call (no model override —
+it runs on the session model) — issue every matching cascade **in the same
+message** so they run in parallel.
 Prompt template:
 
 ```
@@ -211,21 +389,21 @@ in) sees no change at all from this phase.
 
 ### Phase 2 — Report takeaways (non-blocking)
 
-After the orchestrator finishes, read the newly written `raw/<slug>.md`
-and any image description files under `raw/images/<slug>/`. Print a short
-summary for the user's awareness, then **proceed directly to Phase 3** —
-do not wait for confirmation:
+After the orchestrator finishes, read the newly written `raw/<slug>.md`.
+If images are enabled, describe the pending ones now (see
+[Describing images](#describing-images-only-when-imagesdescribe-is-true)) and
+read their descriptions. Print a short summary for the user's awareness, then
+**proceed directly to Phase 3** — do not wait for confirmation:
 
 > I ingested **[title]** from [source-type]. Key takeaways:
 >
 > - [3-6 bullet points on what the source is about]
 >
-> Images: [N new, M changed, K unchanged, described via nano-banana-pro]
+> Images: [off | N described, K unchanged, S skipped]
 >
 > Updating the wiki now:
-> - [[proposed-page-1]] — [one-line reason]
-> - [[proposed-page-2]] — [one-line reason]
 > - Update [[existing-page]] with [what changes]
+> - New page [[new-topic]] — [why no existing page fits]
 
 This summary is informational. Ingest is fully automatic: fetch →
 synthesize → commit → push runs end-to-end without pausing. (The user can
@@ -234,15 +412,10 @@ always reviewable, and unwanted changes can be reverted.)
 
 ### Phase 3 — Update wiki pages
 
-Follow the rules in [references/page-format.md](references/page-format.md).
-For each page you touch:
-
-- Use the page template (Summary / Sources / Last updated / body).
-- Add or update `[[wiki-links]]` to connect related concepts.
-- Cite every factual claim: `(source: <raw-filename>)`.
-- Update `wiki/index.md` with new pages and one-line descriptions.
-- Append an entry to `wiki/log.md` with the date, source name, and what
-  changed.
+Apply the [Wiki-update rules](#wiki-update-rules) with the summary's
+`context`: update the `related_pages` first, rewrite claims in the
+`citing_pages` when the source changed, create a page only for a topic with
+no home, then run `index-sync` and `log --op ingest`.
 
 ### Phase 4 — Commit and push (raw + wiki together)
 
@@ -272,7 +445,11 @@ are ignored and stay local, while each `<n>.md` description and the per-slug
 skips the ignored bytes automatically.
 
 Skip this phase only when Phase 1 reported `status="unchanged"` (nothing was
-staged, so there's nothing to commit or push).
+staged, so there's nothing to commit or push). One exception: with images
+enabled, an unchanged source still lists images an earlier run left
+undescribed. If you describe them, there is nothing to synthesize, but run
+the `--commit-only` above so the new description files and manifest are
+committed.
 
 ## Slack workflow
 
@@ -346,8 +523,9 @@ Phase 3** — do not wait for confirmation.
 
 ### Phase 3 — Update wiki pages + commit
 
-Follow the standard wiki-update rules (page template, `[[wiki-links]]`,
-citations, `wiki/index.md`, `wiki/log.md`). Commit message format:
+`fetch_slack.py` prints no `context`, so get it with
+`ingest.py --context --slug "<slug>"`, then apply the
+[Wiki-update rules](#wiki-update-rules). Commit message format:
 
 ```
 ingest: <slug> (<N> messages, <date-range>)
@@ -400,7 +578,9 @@ per item, no pauses).
 
 Run the orchestrator with a bulk source. It will invoke `discover.py`
 (paginating the space/query into a queue) then `prefetch.py` (fetching
-each item, downloading images, describing new/changed images).
+each item and, only when images are enabled, downloading its images and
+counting the new/changed ones for you to describe at synthesis time). Add
+`--describe-images` to enable images for this run.
 
 ```bash
 ${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
@@ -525,19 +705,28 @@ not pause for confirmation:
 For each item with `raw_status in {done, unchanged}` and
 `wiki_status == pending`, run this end-to-end without pausing:
 
-1. Read `raw/<slug>.md` and every `raw/images/<slug>/*.md`.
-2. Follow the single-item **Phase 3** (update wiki pages, index.md,
-   log.md). Reuse existing pages when possible — bulk ingest is where a
-   space's structure emerges, so many items will feed the same concept
-   pages rather than each producing a new page.
-3. Mark the item done:
+1. Get the item's context — prefetch ran long before this, so the context is
+   computed now:
+
+    ```bash
+    ${WIKI_PY} "${SKILL_DIR}/scripts/ingest.py" \
+      --wiki-root "${WIKI_ROOT}" --context --slug "<slug>" --job-id "<job-id>"
+    ```
+
+2. Read `raw/<slug>.md`. If images are enabled, describe the item's pending
+   images (`image_manifest.py … status`, see
+   [Describing images](#describing-images-only-when-imagesdescribe-is-true)).
+3. Apply the [Wiki-update rules](#wiki-update-rules). They matter most here:
+   bulk ingest is where a space's structure emerges, and many items should
+   feed the same topic pages rather than each producing a page of its own.
+4. Mark the item done:
 
     ```bash
     ${WIKI_PY} "${SKILL_DIR}/scripts/queue_admin.py" --wiki-root "${WIKI_ROOT}" \
       mark <job-id> --ref <ref> --wiki-done
     ```
 
-4. Commit **and push** this item immediately via `ingest.py --commit-only`
+5. Commit **and push** this item immediately via `ingest.py --commit-only`
    (this is what triggers `git_push` when `auto_push: true` — never use a
    bare `git commit`, which would skip the push):
 
@@ -547,10 +736,18 @@ For each item with `raw_status in {done, unchanged}` and
       --message "ingest: <slug> (bulk <job-id>)"
     ```
 
-5. Continue automatically to the next item. Do not ask whether to continue.
+6. Continue automatically to the next item. Do not ask whether to continue.
 
 If a specific item is clearly a draft or otherwise unwanted, mark it with
 `--wiki-skipped` and move on.
+
+A *new* item whose page rendered empty never reaches this loop: prefetch
+deletes its raw files and marks it `wiki_status: skipped` with
+`last_error: "empty body"`, because an empty page has nothing to synthesize
+and would only become an empty raw file for `/lint` to prune. List those
+items in the final report so the user knows they were left out. (A source
+already in the wiki that becomes empty is kept and synthesized like any other
+change.)
 
 ### Bulk Phase 4 — Final report
 
@@ -558,8 +755,9 @@ If a specific item is clearly a draft or otherwise unwanted, mark it with
 ${WIKI_PY} "${SKILL_DIR}/scripts/queue_admin.py" --wiki-root "${WIKI_ROOT}" show <job-id>
 ```
 
-Tell the user how many items are done, skipped, and (if any) still
-failed. Offer to `/ingest --resume <job-id>` for failures.
+Tell the user how many items are done, skipped (naming the `empty body`
+ones), and (if any) still failed. Offer to `/ingest --resume <job-id>` for
+failures.
 
 ## Refresh-all workflow
 
@@ -650,15 +848,18 @@ Each item lands in one of:
 Ctrl-C is safe; the circuit breaker stops after 5 consecutive failures. Either
 way re-run `--resume refresh` to continue.
 
-Pass `--force` to bypass every diff gate and re-fetch, re-describe images, and
-re-synthesize everything.
+Pass `--force` to bypass every diff gate and re-fetch, re-download images (when
+enabled), and re-synthesize everything.
 
 ### Refresh Phase 3 — Synthesis (only what changed)
 
 Identical to **Bulk Phase 3** above, with `<job-id>` = `refresh`: for each item
-with `raw_status in {done, unchanged}` and `wiki_status == pending`, read
-`raw/<slug>.md`, update the wiki pages, `queue_admin.py mark refresh --ref
-<ref> --wiki-done`, then commit + push that item with `--commit-only`.
+with `raw_status in {done, unchanged}` and `wiki_status == pending`, run
+`ingest.py --context --slug <slug> --job-id refresh`, read `raw/<slug>.md`,
+apply the [Wiki-update rules](#wiki-update-rules) — a refreshed source is
+usually `changed`, so this is mostly rewriting claims in its `citing_pages`
+from the `raw_diff` — then `queue_admin.py mark refresh --ref <ref>
+--wiki-done`, and commit + push that item with `--commit-only`.
 
 On a wiki that is already current this list is **empty** — that is the expected
 outcome, and the right report is "everything is up to date", not silence.
@@ -697,10 +898,18 @@ Report, in this order:
   - `raw/<slug>.source.json` — stable metadata:
     `{ "type", "url" or "path", "title", "content_sha256", "source_sha256"
     (local only), "original_filename"/"original_path" (local only),
-    "image_hints", "version_number" (Confluence), "updated_at" (Jira) }`.
+    "image_hints", "version_number" (Confluence), "updated_at" (Jira),
+    "source_date" }`.
     For local files `path` is the **relative** in-wiki copy
     (`raw/<slug><ext>`), never an external absolute path. **No wall-clock
-    timestamps.**
+    timestamps.** `source_date` is source-side time, not fetch time — the
+    ISO date the source itself last changed (Confluence version date, Jira
+    `updated_at`, newest Slack message, the local file's modification time
+    when copied, a web page's `Last-Modified`). It is omitted when unknown
+    (a web page without `Last-Modified`, a pasted `/log` note, a raw file
+    written before this field existed). It is left out of the change
+    comparison, so adding it never makes an unchanged source `changed`. The
+    wiki-update rules use it to decide which of two conflicting claims wins.
   - `raw/<slug>.<ext>` — for **local** ingests, the original file copied into
     the wiki (same stem as the `.md`). Documents/spreadsheets/presentations are
     **committed** (wiki stays self-contained + diffable); image/video/audio
@@ -708,8 +917,9 @@ Report, in this order:
     copy, so diffs survive the external original moving or being deleted.
   - `raw/images/<slug>/<n>.<ext>` — downloaded image bytes. **Git-ignored,
     kept local only** (large binaries; re-downloaded fresh each ingest).
-  - `raw/images/<slug>/<n>.md` — nano-banana-pro description. **Committed** —
-    the cached description so unchanged images are never re-described.
+  - `raw/images/<slug>/<n>.md` — the description the session model wrote.
+    **Committed** — the cached description so unchanged images are never
+    re-described.
   - `raw/images/<slug>/.manifest.json` — per-image `{ sha256, source_url,
     description_file, described_at }`; the source of truth for image diffs
     and URL-based dedup. **Committed** — it is the SHA baseline every future
@@ -746,7 +956,7 @@ Report, in this order:
   `raw_status="unchanged"`, so only genuinely new or changed items reach
   `Queue.pending_wiki()`.
   - The hint is **retired the moment a fetch comes back changed**. Every
-    failure path after the fetch (image download, image description) marks the
+    failure path after the fetch (such as an image download) marks the
     item `failed` *after* the new raw bytes are already on disk — so without
     this, a retry would refetch, see `unchanged`, and restore
     `wiki_status="done"` for a page whose wiki side was never re-synthesized.
@@ -784,17 +994,30 @@ Report, in this order:
   be mistaken for "unchanged". In bulk mode, unchanged items skip the image
   and description steps.
 - **Orchestrator gate (Layer 2)**: when the fetcher reports `unchanged`,
-  `ingest.py` skips image download, image description, and the git commit.
-  Only `.wiki-state/last-fetched.json` is updated. Pass `--force` to
-  bypass this and re-run every step. (Single-item only; bulk always uses
-  the queue for its skip logic.)
+  `ingest.py` skips image download and the git commit, and prints no
+  `context`. Only `.wiki-state/last-fetched.json` is updated (with images
+  enabled, the summary still lists images an earlier run left pending).
+  Pass `--force` to bypass this and re-run every step. (Single-item only;
+  bulk always uses the queue for its skip logic.)
 - **Image dedup gate (Layer 3)**: `extract_images.py` downloads each image
   into memory, hashes it, and looks up the manifest by `source_url` first,
   then by `sha256`. Matches reuse the existing filename; mismatched hashes
   overwrite the same filename in place.
 - **Image description gate (Layer 4)**: `image_manifest.py.classify()`
   returns `new` / `changed` / `unchanged`. Only `new` or `changed` images
-  invoke `describe_image.py`.
+  are listed as `pending_images` for you to describe; `mark-described`
+  records the sha that was described, so an image is pending again only when
+  its bytes change.
+- **Images are opt-in**: off unless `images.describe` is `true` in
+  `.wikirc.json` or the run passes `--describe-images`; `--skip-images` wins
+  over both. With images off nothing is downloaded and no manifest is
+  touched, but each source's `image_hints` stay in its `source.json`, so a
+  later run with images on can still pick them up. Turning images on acts
+  only on sources that are new or changed in that run — or on any source
+  when combined with `--force` — so it does not by itself reopen unchanged
+  sources. A local image file ingested as the source is already on disk, and
+  is likewise only described when images are on. No script calls a model:
+  the description is always written by the session.
 - **Web image filtering**: web pages are mostly chrome, so hints are collected
   from the extracted content subtree only, then filtered by form (`data:`,
   `.svg`, `.ico`), by name/role pattern
@@ -802,12 +1025,11 @@ Report, in this order:
   dimensions (<100px), and finally by byte size (`web.min_image_bytes`, default
   8192, applied after download in `extract_images.py`). Max 20 hints per page.
   Survivors go through Layers 3 and 4 exactly like Confluence attachments.
-- **Rate limiting**: every HTTP call to Atlassian, nano-banana-pro, Slack, and
-  the open web goes through `rate_limiter.py`. Config lives in `.wikirc.json`
-  under `atlassian.rate_limit_rps` / `.burst` / `.max_retries` /
-  `.retry_base_delay_seconds` (and the same keys under `nano_banana`, `slack`,
-  and `web`). Defaults: Atlassian 2 rps / burst 5, nano-banana 1 rps / burst 2,
-  web 1 rps / burst 2. On HTTP 429 or 503, the limiter respects `Retry-After`
+- **Rate limiting**: every HTTP call to Atlassian, Slack, and the open web
+  goes through `rate_limiter.py`. Config lives in `.wikirc.json` under
+  `atlassian.rate_limit_rps` / `.burst` / `.max_retries` /
+  `.retry_base_delay_seconds` (and the same keys under `slack` and `web`).
+  Defaults: Atlassian 2 rps / burst 5, web 1 rps / burst 2. On HTTP 429 or 503, the limiter respects `Retry-After`
   (seconds or HTTP-date) and otherwise backs off exponentially with jitter.
   After `max_retries` a request fails and (in bulk mode) the item's queue entry
   goes to `failed`.
@@ -843,7 +1065,9 @@ Report, in this order:
   Server/DC. If the required PAT is empty in `.wikirc.json`, the fetch
   script exits with a clear message — direct the user to fill in the token.
 - **Never modify anything in `raw/`** during wiki-update phases. `raw/` is
-  the immutable ingested source; wiki pages are your synthesis.
+  the immutable ingested source; wiki pages are your synthesis. The one
+  exception is writing image descriptions (`raw/images/<slug>/<n>.md`) and
+  recording them with `image_manifest.py mark-described`.
 
 ## Individual script reference
 
@@ -852,6 +1076,7 @@ You can run scripts individually for debugging or non-standard flows.
 | Script | Purpose |
 |--------|---------|
 | `scripts/ingest.py` | Orchestrator — single or bulk, auto-detects |
+| `scripts/ingest.py --wiki-root <p> --context --slug <s> [--job-id <id>]` | Print the synthesis context for one raw source |
 | `scripts/config.py --wiki-root <path>` | Print the resolved `.wikirc.json` (redacts PATs) |
 | `scripts/fetch_confluence.py --wiki-root <path> --url <url>` | Fetch one Confluence page |
 | `scripts/fetch_jira.py --wiki-root <path> --key <KEY-123>` | Fetch one Jira issue |
@@ -860,8 +1085,9 @@ You can run scripts individually for debugging or non-standard flows.
 | `scripts/web_discover.py` | Library: sitemap/robots discovery + bounded crawler (no CLI) |
 | `scripts/web_url.py` | Library: URL normalization + `web_slug()` (no CLI) |
 | `scripts/extract_images.py --wiki-root <p> --source-json <f>` | Download image_hints for a slug |
-| `scripts/image_manifest.py --wiki-root <p> --slug <s> status` | Print per-image diff status |
-| `scripts/describe_image.py --wiki-root <p> --image <p> --output <p>` | Describe one image |
+| `scripts/image_manifest.py --raw-dir <raw> --slug <s> status` | Print per-image diff status |
+| `scripts/image_manifest.py --raw-dir <raw> --slug <s> mark-described <name>...` | Record that each image's description is written |
+| `../lint/scripts/wiki_tools.py locate \| citing \| index-sync \| log --wiki-root <p> …` | Find pages, find citing pages, sync `index.md`, add a `log.md` entry |
 | `scripts/discover.py --wiki-root <p> --space/--cql/--jql/--sitemap/--site/--crawl <q>` | Enumerate items, write a job queue |
 | `scripts/discover.py --wiki-root <p> --refresh` | Build the one `refresh` queue covering every known source |
 | `scripts/prefetch.py --wiki-root <p> --job-id <id>` | Fetch + diff every item in a queue, resumable |
@@ -883,15 +1109,16 @@ All scripts respond to `--help` with their full argument list.
   native parsing.
 - **Image URL is authenticated** (Confluence attachment): the fetcher
   passes the Confluence PAT when downloading images from the same host.
-- **`nano_banana.api_key` empty or placeholder**: image description is
-  skipped; the manifest records images without descriptions and the user
-  is warned. Everything else still runs.
+- **Images enabled but the session model cannot read images**: leave the
+  images undescribed and unmarked, report them as skipped, and carry on —
+  they stay pending for a later session that can read them. A leftover
+  vision-endpoint block from an older `.wikirc.json` is ignored.
 - **Wiki not a git repo**: `ingest.py` refuses to run with
   `auto_commit=true` and instructs the user to `git init` or run
   `/create-wiki`.
 - **Re-ingest of unchanged source (single)**: the content diff gate
-  matches; skill reports `status="unchanged"`, skips image download /
-  description / commit, and only updates `.wiki-state/last-fetched.json`.
+  matches; skill reports `status="unchanged"`, skips image download and
+  the commit, and only updates `.wiki-state/last-fetched.json`.
   Pass `--force` to override.
 - **User manually deleted a file under `raw/`**: for Confluence/Jira/local,
   the diff gate still sees the source as unchanged (source hash matches) and

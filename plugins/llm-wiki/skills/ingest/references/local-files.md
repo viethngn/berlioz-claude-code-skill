@@ -14,7 +14,16 @@ Load when debugging local file ingestion or adding support for a new format.
 | `.xlsx` | openpyxl | Each sheet → `##` heading + GFM table; formula cells read cached computed values; images via zipped `xl/media/*` |
 | `.csv` | stdlib `csv` | Delimiter auto-detected (`csv.Sniffer`); single GFM table |
 | `.pptx` | python-pptx | Each slide → `##` heading + bullet text + tables; embedded picture shapes extracted per slide |
-| `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif` | image | The file **is** the source; describe via nano-banana-pro |
+| `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif` | image | The file **is** the source; described by the session model when images are enabled |
+
+Embedded images are written to `raw/images/<slug>/` as part of parsing (they
+come out of the file itself, so there is nothing to download). They are
+**described only when images are enabled** (`images.describe: true` in
+`.wikirc.json`, or `--describe-images`); otherwise they stay undescribed and
+the wiki is built from the text alone. When enabled, the ingest summary lists
+them as `pending_images`, and the session model writes each description and
+records it with `image_manifest.py … mark-described` (see the ingest
+`SKILL.md`, "Describing images").
 
 Legacy binary formats — `.xls`, `.ppt`, `.doc` — have **no native parser**
 (openpyxl/python-pptx/python-docx only read the modern OOXML zip formats).
@@ -122,8 +131,8 @@ Edge cases:
   fails, the ingest exits with a clear message asking for the password.
 - **OCR-only PDF (scanned images, no text layer)**: text extraction returns
   empty strings. Fall back to treating each page as an image — write each
-  page to `raw/images/<slug>/page-<n>.png` and let `describe_image.py`
-  process them.
+  page to `raw/images/<slug>/page-<n>.png` and, with images enabled, have
+  the session model describe them like any other pending image.
 - **Non-Latin scripts**: pypdf handles Unicode; no special handling needed.
 
 ## DOCX
@@ -258,7 +267,8 @@ Edge cases:
 ## Images
 
 Standalone images (`.png`/`.jpg`/`.webp`/`.gif`) are the source itself. Copy
-to `raw/images/<slug>/0.<ext>`, add to the manifest, and describe. The raw
+to `raw/images/<slug>/0.<ext>`; with images enabled it is listed as pending
+and described. The raw
 Markdown file `raw/<slug>.md` for a standalone image looks like:
 
 ```markdown
@@ -269,8 +279,10 @@ Markdown file `raw/<slug>.md` for a standalone image looks like:
 See `raw/images/{slug}/0.md` for the description.
 ```
 
-The description file `raw/images/<slug>/0.md` is populated by
-`describe_image.py`.
+The description file `raw/images/<slug>/0.md` is written by the session model
+when images are enabled; until then the image is the whole source and the
+wiki has only its filename to go on, so suggest `--describe-images` when the
+user ingests a standalone image.
 
 ## Adding a new format
 

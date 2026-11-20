@@ -17,13 +17,16 @@ Usage:
     python3 bootstrap.py --target ... --no-git       # skip git init
     python3 bootstrap.py --target ... --skip-deps     # skip dep install/verify (CI/air-gapped)
     python3 bootstrap.py --target ... --marketplace /path/to/berlioz-claude-code-skill
+    python3 bootstrap.py --upgrade --target /path/to/wiki  # refresh CLAUDE.md managed block
 """
 
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -81,6 +84,96 @@ def render_template(template_path: Path, context: dict) -> str:
     for key, value in context.items():
         text = text.replace("{{ " + key + " }}", str(value))
     return text
+
+
+BEGIN_MARKER = "<!-- llm-wiki:begin -->"
+END_MARKER = "<!-- llm-wiki:end -->"
+# Sections the pre-marker template wrote; --upgrade replaces them with the block.
+OLD_SECTIONS = {
+    "## Folder structure", "## Ingest workflow", "## Page format", "## Citation rules",
+    "## Question answering", "## Lint", "## Rules",
+}
+
+
+def managed_block(context: dict) -> str:
+    """The template CLAUDE.md's marker-to-marker text (markers included)."""
+    text = render_template(TEMPLATE_DIR / "CLAUDE.md", context)
+    return text[text.index(BEGIN_MARKER):text.index(END_MARKER) + len(END_MARKER)]
+
+
+_FENCE_RE = re.compile(r"(`{3,}|~{3,})(.*)$")
+_HEADING_RE = re.compile(r"#{1,2} ")
+
+
+def _upgrade_text(text: str, block: str) -> tuple[str, bool]:
+    """Return (new text, appended) — appended is True when no marker and no
+    known template section was found, so the block went to the end."""
+    crlf = text.count("\r\n")
+    nl = "\r\n" if crlf > text.count("\n") - crlf else "\n"
+    block = block.replace("\n", nl)
+    lines = text.splitlines(keepends=True)
+
+    begin = next((i for i, l in enumerate(lines) if l.strip() == BEGIN_MARKER), None)
+    if begin is not None:
+        end = next((i for i in range(begin + 1, len(lines)) if lines[i].strip() == END_MARKER), None)
+        if end is None:
+            raise ValueError(f"{BEGIN_MARKER} has no matching {END_MARKER} line")
+        ending = lines[end][len(lines[end].rstrip("\r\n")):]
+        return "".join(lines[:begin] + [block + ending] + lines[end + 1:]), False
+
+    kept: list[str] = []
+    insert_at: Optional[int] = None
+    dropping = False
+    fence: Optional[str] = None  # opening fence string while inside a code block
+    for line in lines:
+        m = _FENCE_RE.match(line.strip())
+        if m and fence is None:
+            fence = m.group(1)
+        elif m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
+            fence = None
+        elif fence is None and _HEADING_RE.match(line):
+            # Any # / ## heading ends a dropped section; only known ## ones start one.
+            dropping = line.rstrip() in OLD_SECTIONS
+            if dropping and insert_at is None:
+                insert_at = len(kept)
+        if not dropping:
+            kept.append(line)
+
+    if insert_at is None:
+        return text.rstrip("\r\n") + nl + nl + block + nl, True
+    kept.insert(insert_at, block + nl + nl)
+    return "".join(kept).rstrip("\r\n") + nl, False
+
+
+def upgrade_claude_md(text: str, block: str) -> str:
+    """Return `text` with the llm-wiki managed block replaced or inserted."""
+    return _upgrade_text(text, block)[0]
+
+
+def _upgrade(target: Path, context: dict) -> int:
+    path = target.expanduser().resolve() / "CLAUDE.md"
+    if not path.is_file():
+        print(f"ERROR: {path} not found — is --target a wiki root?", file=sys.stderr)
+        return 1
+    with path.open(encoding="utf-8", newline="") as f:  # keep CRLF as-is
+        old = f.read()
+    try:
+        new, appended = _upgrade_text(old, managed_block(context))
+    except ValueError as e:
+        print(f"ERROR: {path}: {e}", file=sys.stderr)
+        return 1
+    if new == old:
+        print("CLAUDE.md already up to date")
+        return 0
+    if appended:
+        print("note: no known template sections found — managed block appended at the end; "
+              "check CLAUDE.md for leftover old instructions", file=sys.stderr)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        f.write(new)
+    sys.stdout.writelines(difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        "a/CLAUDE.md", "b/CLAUDE.md"))
+    return 0
 
 
 def merge_claude_settings(existing: dict, marketplace: Optional[Path]) -> dict:
@@ -380,7 +473,7 @@ def _bootstrap(
     next_steps = [
         f"cd {target}",
         "Edit .wikirc.json — fill in the integrations you want (Confluence/Jira "
-        "URLs + PATs, nano-banana vision endpoint + key, Slack token). Each is "
+        "URLs + PATs, Slack token). Each is "
         "optional; leaving one empty just skips that source type.",
         f"If the plugin is not installed yet: /plugin marketplace add {marketplace_str} "
         "then /plugin install llm-wiki@berlioz-claude-code-skill",
@@ -414,9 +507,19 @@ def main() -> int:
         action="store_true",
         help="skip automatic dependency install/verify (CI / air-gapped)",
     )
+    parser.add_argument(
+        "--upgrade",
+        action="store_true",
+        help="rewrite only the llm-wiki managed block of <target>/CLAUDE.md; prints a diff, no commit",
+    )
     args = parser.parse_args()
 
     marketplace = resolve_marketplace(args.marketplace)
+    if args.upgrade:
+        return _upgrade(args.target, {
+            "title": args.title,
+            "marketplace_path": str(marketplace) if marketplace else "REPLACE_ME",
+        })
     summary = _bootstrap(
         target=args.target,
         title=args.title,

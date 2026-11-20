@@ -11,10 +11,11 @@ For each pending / previously-failed item in the queue, this script:
      fetch_jira.py, fetch_web.py, fetch_local.py or fetch_slack.py) via
      subprocess so it inherits the diff gates and error handling of the
      existing single-source flow.
-  2. Runs extract_images.py to download any image_hints (with the SHA-based
-     dedup pass).
-  3. Runs the image-diff loop from ingest.py against the resulting slug so
-     new / changed images are described by nano-banana-pro.
+  2. When images are enabled (--describe-images or images.describe, and no
+     --skip-images), runs extract_images.py to download any image_hints (with
+     the SHA-based dedup pass) and
+  3. runs the image-diff loop from ingest.py against the resulting slug so
+     new / changed images are counted as pending for the session to describe.
   4. Updates the queue item's raw_status, slug, and image counts.
   5. Writes the queue after every item so Ctrl-C is safe.
 
@@ -146,17 +147,29 @@ def _fetch_one(queue: Queue, item, wiki_root: Path, force: bool = False) -> dict
     raise ValueError(f"unknown source kind: {source_kind}")
 
 
-def _describe_changed_images(wiki_root: Path, slug: str) -> dict:
-    """Delegate to ingest.py's image loop by calling it as a subprocess
-    against the specific slug. Uses --commit-only-noop trick: we invoke a
-    small helper subcommand.
-
-    Simpler: import the function directly.
-    """
+def _diff_images(wiki_root: Path, slug: str) -> dict:
+    """Run ingest.py's image diff loop for one slug (lists pending images)."""
     # Import lazily so this module stays cheap for `queue_admin.py list`.
     from ingest import do_image_diff_loop  # noqa: WPS433
 
     return do_image_diff_loop(wiki_root, slug)
+
+
+def _is_empty_new_source(wiki_root: Path, fetch_status: str, raw_md: Optional[str]) -> bool:
+    """A brand-new source (never committed) whose raw body is effectively empty.
+
+    A known source that becomes empty is not this: it keeps its files and is
+    synthesized like any other changed source.
+    """
+    from ingest import raw_commits  # also puts lint/scripts on sys.path
+    from lint import EMPTY_BODY_CHARS, body_after_h1
+
+    if fetch_status != "new" or not raw_md or not Path(raw_md).exists():
+        return False
+    body = body_after_h1(Path(raw_md).read_text(encoding="utf-8"))
+    if len("".join(body.split())) >= EMPTY_BODY_CHARS:
+        return False
+    return not raw_commits(wiki_root, Path(raw_md))
 
 
 def _prefetch_one(
@@ -208,9 +221,21 @@ def _prefetch_one(
     # wiki_status="done" for a page whose wiki side was never touched.
     item.prior_wiki_status = None
 
-    # Download image_hints (Confluence attachments, Jira attachments)
+    raw_md = fetch_result.get("raw_md")
+    if _is_empty_new_source(wiki_root, fetch_status, raw_md):
+        # Nothing to synthesize: drop the just-written raw files. raw_status
+        # stays "done" so the item never trips the circuit breaker.
+        # With no source.json left, each refresh re-fetches it (one API call, no model work).
+        Path(raw_md).unlink()
+        Path(raw_md).with_suffix(".source.json").unlink(missing_ok=True)
+        item.raw_status = "done"
+        item.wiki_status = "skipped"
+        item.last_error = "empty body"
+        return {"ref": item.ref, "status": "skipped", "slug": slug, "reason": "empty body"}
+
+    # Download image_hints (Confluence / Jira attachments, web images)
     source_json = fetch_result.get("source_json")
-    if source_json and (fetch_result.get("image_hints") or []):
+    if do_images and source_json and (fetch_result.get("image_hints") or []):
         try:
             _run_script(
                 "extract_images.py",
@@ -228,13 +253,13 @@ def _prefetch_one(
             item.last_error = f"extract_images failed: {e}"[:500]
             return {"ref": item.ref, "status": "failed", "reason": item.last_error}
 
-    # Run image-diff loop (describe new/changed images)
+    # Run image-diff loop (count new/changed images still to describe)
     if do_images:
         try:
-            image_summary = _describe_changed_images(wiki_root, slug)
+            image_summary = _diff_images(wiki_root, slug)
         except Exception as e:  # noqa: BLE001
             item.raw_status = "failed"
-            item.last_error = f"image description failed: {e}"[:500]
+            item.last_error = f"image diff failed: {e}"[:500]
             return {"ref": item.ref, "status": "failed", "reason": item.last_error}
         item.images_new = int(image_summary.get("new", 0))
         item.images_changed = int(image_summary.get("changed", 0))
@@ -276,13 +301,18 @@ def main() -> int:
         action="store_true",
         help=(
             "Bypass each fetcher's content-diff gate so every item is rewritten "
-            "and its images re-described (fetch_local.py has no gate to bypass)"
+            "and its images re-downloaded when enabled (fetch_local.py has no gate to bypass)"
         ),
     )
     parser.add_argument(
         "--skip-images",
         action="store_true",
-        help="Skip the nano-banana-pro description step (still downloads image bytes)",
+        help="Disable image download and the image diff (wins over --describe-images)",
+    )
+    parser.add_argument(
+        "--describe-images",
+        action="store_true",
+        help="Enable images for this run (default: images.describe in .wikirc.json)",
     )
     args = parser.parse_args()
 
@@ -328,7 +358,7 @@ def main() -> int:
                 queue,
                 item,
                 cfg.wiki_root,
-                do_images=not args.skip_images,
+                do_images=(args.describe_images or cfg.describe_images) and not args.skip_images,
                 force=args.force,
             )
             queue.save()  # checkpoint after every item

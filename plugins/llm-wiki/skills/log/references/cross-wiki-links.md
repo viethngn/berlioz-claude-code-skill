@@ -36,11 +36,11 @@ into a link.
 ## Explicit non-goals
 
 - **No cross-wiki lint validation.** `/lint`'s `lint.py` only ever scans its
-  own `wiki/` directory; teaching it to resolve `[[label/slug]]` against
-  another wiki's config and file tree is out of scope here. A `[[label/slug]]`
-  link will show up in `/lint`'s broken-link report for the wiki it's written
-  in — **this is expected, cosmetic noise**, not a defect. Revisit only if it
-  becomes genuinely annoying in practice.
+  own `wiki/` directory; resolving `[[label/slug]]` against another wiki's
+  file tree is out of scope. Instead it recognises the shape — a `/` whose
+  first part is not `archive` — and skips such links: they are never
+  reported as broken and never unlinked, so a link to a page that is missing
+  in the other wiki goes unnoticed.
 - **No Obsidian cross-vault resolution.** Each wiki repo is a separate
   Obsidian vault; Obsidian has no built-in way to resolve a link into a
   different vault. `[[label/slug]]` will render as an unresolved/red link in
