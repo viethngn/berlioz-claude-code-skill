@@ -62,7 +62,10 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 # Overlap / fact-collision tuning. Score = weighted sum of components in [0, 1];
 # a shared source alone (W_SOURCES) must stay below OVERLAP_THRESHOLD.
 MAX_CANDIDATES = 20
-OVERLAP_THRESHOLD = 0.35
+OVERLAP_THRESHOLD = 0.5
+# Second path: pages sharing a cited raw are candidates from this text_sim alone
+# (test fixtures: paraphrased duplicate 0.21; distinct sibling pages 0.11-0.16).
+SHARED_SOURCE_TEXT_SIM = 0.2
 SENTENCE_SIM_THRESHOLD = 0.8
 W_SOURCES = 0.2
 W_LINKS = 0.1
@@ -767,7 +770,8 @@ def prose_sentences(body: str) -> List[str]:
 def _info(page: dict, raw_dir: Path) -> dict:
     """Per-page derived data, computed once and cached on the page dict."""
     if "_info" not in page:
-        prose = " ".join(prose_sentences(page_body(page["text"])))
+        # Citations are dropped so a shared `(source: raw/...)` does not inflate text_sim.
+        prose = CITATION_RE.sub("", " ".join(prose_sentences(page_body(page["text"]))))
         page["_info"] = {
             "slug": slug_from_path(page["path"]),
             "sources": set(resolve_source_paths(page["text"], raw_dir)),
@@ -839,7 +843,8 @@ def find_overlap(pairs: List[Tuple[dict, dict]], raw_dir: Path, limit: Optional[
         score = (W_SOURCES * _jaccard(a["sources"], b["sources"])
                  + W_LINKS * _jaccard(a["links"], b["links"])
                  + W_SLUG * slug_sim + W_TEXT * text_sim)
-        if score < OVERLAP_THRESHOLD:
+        if score < OVERLAP_THRESHOLD and not (
+                a["sources"] & b["sources"] and text_sim >= SHARED_SOURCE_TEXT_SIM):
             continue
         out.append({
             "pages": [a["slug"], b["slug"]],

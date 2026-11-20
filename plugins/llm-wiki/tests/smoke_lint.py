@@ -291,13 +291,48 @@ def test_paraphrased_overlap_shared_source(tmp):
     _assert(any(c["pages"] == ["auth", "authentication-flow"] for c in cands), f"paraphrase found: {cands}")
 
 
+BILLING_SIBLINGS = {
+    "billing-invoices": "Invoices are generated on the first business day of each month for every active "
+        "subscription. Each invoice lists the plan, the seat count and any usage overage, and it is emailed "
+        "to the account owner as a PDF. Unpaid invoices are retried by the card processor three times before "
+        "the account is flagged for the collections team.",
+    "billing-refunds": "Refunds are issued only by the support lead and go back to the original payment "
+        "method. A customer who cancels within fourteen days of a renewal gets the full amount back; after "
+        "that, only unused seats are credited. Partial refunds appear as a negative line on the next "
+        "statement rather than as a separate transfer.",
+    "billing-taxes": "Sales tax is calculated from the customer's billing address, not from where their "
+        "users sit. European business customers who supply a valid VAT number are reverse-charged, and "
+        "the number is checked against the VIES service at checkout. Tax exemption certificates must be "
+        "uploaded by finance before the exemption takes effect.",
+    "billing-currencies": "Prices are set in US dollars, euros and pounds; every other country is billed "
+        "in dollars. The currency is fixed when the first subscription is created and cannot be switched "
+        "later without opening a new account. Exchange rates are never applied to existing contracts.",
+    "payments": "Card payments run through the external processor, while enterprise customers may pay by "
+        "bank wire against a purchase order. Wire payments are matched to accounts by the reference code "
+        "printed on the statement, and unmatched wires are held in a suspense ledger for manual review.",
+}
+
+
+def test_billing_siblings_not_overlap(tmp):
+    # Distinct pages on one handbook, sharing its source and linking to each other: not duplicates.
+    root = make_wiki(tmp)
+    write_raw(root, "billing-handbook.md", "# Billing handbook\n\nInvoices, refunds, taxes, currencies, payments.\n")
+    for slug, prose in BILLING_SIBLINGS.items():
+        links = " ".join(f"[[{o}]]" for o in BILLING_SIBLINGS if o != slug)
+        write_page(root, slug, f"{prose} (source: raw/billing-handbook.md)\n\nSee also {links}.",
+                   sources=("raw/billing-handbook.md",))
+    commit(root, "ingest: billing")
+    cands = run_lint(root)["overlap_candidates"]
+    _assert(not any(set(c["pages"]) <= set(BILLING_SIBLINGS) for c in cands), f"siblings reported: {cands}")
+
+
 def test_no_prose_pages_text_sim_zero(tmp):
     root = make_wiki(tmp)
     write_raw(root, "a.md", "# a\n\nsource body that is long enough to count.\n")
     write_page(root, "rates-table", "| plan | rate |\n|---|---|\n| a | 1 |\n")
     write_page(root, "rates-tables", "```\nrate = 2\n```\n")
     cands = run_lint(root)["overlap_candidates"]
-    _assert(cands and all(c["text_sim"] == 0 for c in cands), f"no prose -> text_sim 0: {cands}")
+    _assert(cands == [], f"no prose -> text_sim 0, so slug + source alone do not report: {cands}")
 
 
 def test_hub_key_exact_collision_and_warning(tmp):
