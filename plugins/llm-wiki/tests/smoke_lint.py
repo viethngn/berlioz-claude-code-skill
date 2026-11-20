@@ -496,14 +496,18 @@ def test_fix_stub_needs_short_body(tmp):
     (root / "wiki/foo.md").write_text(   # the stub template from ingest/references/page-format.md
         "# Foo\n\n**Summary**: TBD — mentioned in [[bar]] but not yet expanded.\n\n**Sources**: (none yet)\n\n"
         "**Last updated**: 2026-01-01\n\n---\n\nPlaceholder — add content when a source covers this concept.\n")
+    # `#1 ...` is prose, not a heading: its text counts as content.
+    write_page(root, "priorities", "Placeholder — add content.\n"
+               "#1 priority: the payments refactor ships before the audit deadline.\n")
+    (root / "wiki/index.md").write_text("# Index\n\n- [[priorities]] — what ships first\n")
     commit(root, "ingest: initial")
     before = wiki_bytes(root)
     r = run_lint(root, "--fix")
     _assert(r["fixed"]["deleted_pages"] == ["foo"], f"only the real stub deleted: {r['fixed']}")
-    for slug in long_pages:
+    for slug in [*long_pages, "priorities", "index"]:
         key = f"wiki/{slug}.md"
         _assert((root / key).read_bytes() == before[key], f"{slug} byte-identical")
-    _assert(not any(e["page"] in long_pages for e in r["empty_pages"]), f"not stubs: {r['empty_pages']}")
+    _assert(not any(e["page"] in [*long_pages, "priorities"] for e in r["empty_pages"]), f"not stubs: {r['empty_pages']}")
 
 
 def test_page_body_header_detection(tmp):

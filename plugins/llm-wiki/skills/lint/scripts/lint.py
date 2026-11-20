@@ -267,7 +267,7 @@ def stub_marker(text: str) -> Optional[str]:
         if in_code or s.startswith(">"):
             kept += 0 if related else _non_ws(line)
             continue
-        if s.startswith("#"):
+        if re.match(r"#{1,6}(\s|$)", s):  # ATX heading only; `#1 priority` is prose
             related = s.lstrip("#").strip().lower() == "related pages"
             continue
         if related or HEADER_FIELD_RE.match(s):
