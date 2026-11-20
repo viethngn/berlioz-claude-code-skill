@@ -56,11 +56,8 @@ Every wiki has a `.wikirc.json` at its root. Fields:
     "jira_pat": "REPLACE_ME_OR_LEAVE_EMPTY",
     "verify_ssl": true
   },
-  "nano_banana": {
-    "base_url": "https://your-nano-banana-endpoint.example.com/v1/",
-    "api_key": "REPLACE_ME",
-    "vision_model": "gemini-3-pro",
-    "verify_ssl": true
+  "images": {
+    "describe": false
   },
   "web": {
     "user_agent": "Mozilla/5.0 (compatible; llm-wiki-ingest/1.0)",
@@ -84,13 +81,14 @@ Every wiki has a `.wikirc.json` at its root. Fields:
   everything else keeps working.
 - **`atlassian.verify_ssl`** — Set to `false` only for a corporate network
   that intercepts TLS. Prefer setting a proper CA cert instead (see below).
-- **`nano_banana.base_url`** — Base URL of your Gemini-compatible vision
-  endpoint. Trailing slash matters — include it (e.g. `.../v1/`).
-- **`nano_banana.api_key`** — Bearer token or API key.
-- **`nano_banana.vision_model`** — Model ID for image understanding
-  (e.g. `gemini-3-pro`, `gemini-2.5-pro`). Not `-image-preview` — that model
-  is for image generation, not description.
-- **`nano_banana.verify_ssl`** — Same semantics as `atlassian.verify_ssl`.
+- **`images.describe`** — `false` by default: ingest downloads no images and
+  only text reaches the wiki (each source's `image_hints` stay in its
+  `source.json`, so turning this on later can still pick them up). Set it to
+  `true` to download embedded images of new or changed sources and have
+  Claude — the session you are running, no separate endpoint or key —
+  describe the new or changed ones. `ingest.py --describe-images` turns it
+  on for one run; `--skip-images` turns it off for one run. An old
+  vision-endpoint block left over from an earlier version is ignored.
 - **`slack.verify_ssl`** / **`web.verify_ssl`** — Same semantics as
   `atlassian.verify_ssl`, for Slack API and website requests respectively.
 - **`web.*`** — Website ingest. Every key has a default, so this whole block is
@@ -101,7 +99,8 @@ Every wiki has a `.wikirc.json` at its root. Fields:
     bulk website ingest (`--site` / `--sitemap` / `--crawl`) and advisory for a
     single explicitly-named page.
   - **`min_image_bytes`** — Web images smaller than this are skipped as
-    decoration, so no vision call is spent on icons and spacers.
+    decoration, so no description is spent on icons and spacers (only
+    relevant when `images.describe` is on).
   - **`extra_headers`** — Arbitrary headers, e.g.
     `{"Cookie": "session=…"}` for a page behind a login. `config.py` redacts the
     values when printing the config.
@@ -189,12 +188,3 @@ for those API calls.
 - Jira: same rules.
 - Some corporate networks strip the `Authorization` header at the proxy —
   check with `curl -v` first.
-
-### Gemini vision endpoint returns 404 or empty candidates
-
-- Ensure `nano_banana.base_url` ends with `/` and matches the shape your
-  endpoint expects (e.g. `.../v1/`).
-- Ensure `nano_banana.vision_model` is a model that supports image inputs
-  (not `-image-preview` which is generation-only).
-- If your endpoint uses a non-Vertex-AI shape, you may need to adapt
-  `describe_image.py`.

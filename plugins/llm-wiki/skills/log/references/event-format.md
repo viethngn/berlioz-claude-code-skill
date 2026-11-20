@@ -10,7 +10,9 @@ for the generic page shape, adapted for one-page-per-day event logging.
 A day-page is `wiki/YYYY-MM-DD.md` — a **flat page, same as every other page
 in the wiki**. There is no `wiki/diary/` or similar subfolder; this keeps the
 wiki structurally identical to every other llm-wiki instance, and keeps
-day-pages visible to `/lint`'s ordinary (non-recursive) `wiki/*.md` scan.
+day-pages in `/lint`'s ordinary (non-recursive) `wiki/*.md` scan, which
+treats them as journal pages: their links count, but they are never judged
+or edited.
 
 ```markdown
 # YYYY-MM-DD

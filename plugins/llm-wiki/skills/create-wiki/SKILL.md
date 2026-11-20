@@ -14,6 +14,8 @@ description: |
   scaffold, set up, or start a new LLM wiki. Trigger on phrases like:
   "create a new wiki", "bootstrap an LLM wiki", "set up a knowledge base",
   "initialize a wiki in ~/foo", "make a new wiki repo", or "scaffold a wiki".
+  Also upgrades an existing wiki's CLAUDE.md to the current plugin rules
+  ("upgrade my wiki's CLAUDE.md", "refresh the wiki's CLAUDE.md").
 ---
 
 # Create Wiki — LLM Wiki
@@ -114,11 +116,12 @@ Read `config` and `deps` from the JSON and tell the user plainly what happened.
 
   > Edit `.wikirc.json` and fill in the integrations you want:
   > - **Confluence / Jira** — `*_base_url` + `*_pat`
-  > - **nano-banana vision** — `nano_banana.base_url` + `api_key`
   > - **Slack** — `slack.token`
   >
   > Each is optional — leave one empty and that source type is simply skipped;
-  > everything else still works.
+  > everything else still works. Embedded images are off by default; set
+  > `images.describe` to `true` to have them downloaded and described by
+  > Claude itself during ingest (no extra endpoint or key).
 
   If `config.created` is `false` because a `.wikirc.json` already existed, say
   so and don't touch it.
@@ -133,6 +136,45 @@ llm-wiki@berlioz-claude-code-skill` commands from `next_steps` (the wiki's
 Ask the user if they want to do a first ingest right away. If yes,
 invoke the `/ingest` skill with their chosen source. If no, stop
 here — everything is ready when they are.
+
+## Upgrade an existing wiki's CLAUDE.md
+
+A wiki's `CLAUDE.md` is copied from the template when the wiki is created,
+and Claude loads it every session. A wiki created before the current plugin
+version still carries the old workflow text there (a summary page per
+source, hand-edited `index.md`/`log.md`, the old citation format), which
+competes with the skills. When the user asks to upgrade or refresh it — or
+`/lint` warns that `CLAUDE.md has no llm-wiki managed block` — run:
+
+```bash
+python3 "${SKILL_DIR}/scripts/bootstrap.py" --upgrade --target "<wiki-root>"
+```
+
+The plugin-owned text lives between `<!-- llm-wiki:begin -->` and
+`<!-- llm-wiki:end -->`. The command rewrites only `CLAUDE.md`:
+
+- **Markers present**: the text between them is replaced with the current
+  template block. Everything outside the markers is kept.
+- **No markers** (a wiki from before this version): the old template
+  sections are removed by heading — `## Folder structure`,
+  `## Ingest workflow`, `## Page format`, `## Citation rules`,
+  `## Question answering`, `## Lint`, `## Rules` — and the managed block is
+  inserted where the first of them was. The title, `## Purpose` and every
+  other section are kept as they are. If none of those headings is found,
+  the block is appended at the end with a note on stderr to check for
+  leftover old instructions.
+
+Caveat to tell the user: anything they edited *inside* those old template
+sections (or inside the markers) is replaced, because the command cannot
+tell their edits from the old template text. Their own instructions belong
+in sections of their own, outside the markers.
+
+It prints a unified diff of `CLAUDE.md` (or `CLAUDE.md already up to date`
+— running it twice changes nothing) and **does not commit**: show the user
+the diff and let them review it with git (`git diff CLAUDE.md`) and commit
+it themselves, or restore their version with `git checkout CLAUDE.md`. It
+exits with an error, changing nothing, when `<wiki-root>/CLAUDE.md` does not
+exist or has a begin marker without an end marker.
 
 ## Edge cases
 

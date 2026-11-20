@@ -8,19 +8,24 @@ Four skills for maintaining a personal LLM knowledge wiki, backed by git.
   public website page, **or** bulk-ingest a whole Confluence space / CQL query /
   JQL query / website sitemap.
   The skill auto-detects single vs bulk from the source shape or explicit flags.
-  Extracts embedded images, describes them via a nano-banana-pro-compatible
-  vision endpoint **only when they change**, and updates the wiki. Bulk mode
-  uses a resumable job queue with rate limiting and a circuit breaker. Commits
-  raw + wiki to git and optionally pushes to remote.
-- **`/lint`** — Thoroughly clean the wiki. Auto-removes empty pages, triages
-  orphans (integrate valuable ones back into the graph, delete duplicates,
-  archive the rest), fixes broken `[[wiki-links]]` and format violations, and
-  archives outdated knowledge by **moving it to `wiki/archive/`** so reads
-  always surface the latest info. Contradictions, outdated facts, **and the
-  deletion of empty non-contributing `raw/` source files** are batched into one
-  report you confirm before applying (`raw/` contents are never edited). Updates
-  `index.md`, appends a `log.md` entry, then commits (grouped by category) and
-  pushes.
+  It folds each source into the existing pages it touches first — a new page
+  only for a topic with no home, no summary page per source, no stubs — and
+  rewrites claims in place when a source changes. Images are off by default;
+  when enabled, Claude itself describes new or changed images (no separate
+  endpoint). Bulk mode uses a resumable job queue with rate limiting and a
+  circuit breaker. Commits raw + wiki to git and optionally pushes to remote.
+- **`/lint`** — Thoroughly clean the wiki. A script applies only the
+  judgment-free fixes (deletes placeholder stub pages and unlinks links to
+  them, repairs a renamed `Sources` path) and shortlists likely
+  contradictions, near-duplicate pages, pages whose sources changed since
+  they were written, orphans and structural problems. Claude judges the
+  shortlist; every merge, rewrite, archive, page deletion **and the deletion
+  of empty non-contributing `raw/` source files** goes into one report you
+  approve before anything is applied (`raw/` contents are never edited).
+  Retired pages are archived by **moving them to `wiki/archive/`**. Verdicts
+  are remembered in `wiki/.lint-reviewed.json` so settled items don't come
+  back. Updates `index.md` and `log.md` by script, then commits (grouped,
+  `lint:` prefix) and pushes.
 - **`/create-wiki`** — Bootstrap a fresh LLM wiki in one run: folder layout,
   `CLAUDE.md` system prompt, page template, git repo, and marketplace pinning so
   `/ingest` and `/lint` are auto-discovered on next session. Also **installs +
@@ -34,7 +39,7 @@ Four skills for maintaining a personal LLM knowledge wiki, backed by git.
   links into other configured `llm-wiki` instances (via `linked_wikis` in
   `.wikirc.json`) — never written into those wikis. Bare `/log` auto-scans for
   raw sources not yet reflected in a day-page. `/ingest` can also opt in to
-  cascading a matching source into a linked wiki via a cheap-model subagent —
+  cascading a matching source into a linked wiki via a subagent —
   see `linked_wikis[].cascade_ingest` below.
 
 Vendor-neutral: no hardcoded URLs or product names. Every endpoint comes from
@@ -157,15 +162,8 @@ optional; leave one empty and that source type is simply skipped.
     "max_retries": 5,
     "retry_base_delay_seconds": 2
   },
-  "nano_banana": {
-    "base_url": "https://your-nano-banana-endpoint.example.com/v1/",
-    "api_key": "YOUR_NANO_BANANA_API_KEY",
-    "vision_model": "gemini-3-pro",
-    "verify_ssl": true,
-    "rate_limit_rps": 1,
-    "burst": 2,
-    "max_retries": 3,
-    "retry_base_delay_seconds": 2
+  "images": {
+    "describe": false
   },
   "slack": {
     "token": "xoxp-YOUR_USER_OAUTH_TOKEN",
@@ -200,9 +198,16 @@ just works. No token goes in `.wikirc.json`.
 via `[[label/slug]]` (used by `/log` to resolve Who/What mentions read-only —
 never writing into the linked wiki) and, if `cascade_ingest: true`, that
 `/ingest` can automatically re-ingest a matching source into, via a
-`model: haiku` subagent. The two entries above are illustrative placeholders
+subagent. The two entries above are illustrative placeholders
 (`/absolute/path/to/your-...-wiki`) — entirely optional and inert until you
 replace them with real paths, or delete them to leave the array empty.
+
+**`images.describe`** — `false` by default: ingest downloads no images and
+the wiki is built from text (each source's image references stay in its
+`source.json`). Set `true` to download embedded images of new or changed
+sources and have Claude describe the new or changed ones during ingest — no
+separate endpoint or key. `/ingest … --describe-images` turns it on for one
+run.
 
 **`slack.token`** — a Slack User OAuth Token (`xoxp-…`). See
 [How to get a Slack token](#how-to-get-a-slack-token) below.
@@ -228,6 +233,16 @@ would land in a filename and in committed metadata. Use `extra_headers`.
 Rate-limit knobs are optional. Defaults are conservative so a first-time bulk
 run won't get anyone rate-banned. Every HTTP call flows through `rate_limiter.py`,
 which respects `Retry-After` on 429/503 and uses exponential backoff with jitter.
+
+#### Upgrading a wiki created with an earlier version
+
+Ask Claude to "upgrade my wiki's CLAUDE.md". It runs
+`bootstrap.py --upgrade --target <wiki-root>`, which replaces the
+plugin-owned workflow text in the wiki's `CLAUDE.md` with the current rules,
+keeps your own sections, prints the diff and does not commit. Edits you made
+*inside* the old template sections are replaced, so review the diff. An old
+vision-endpoint block left in `.wikirc.json` is simply ignored; add
+`"images": {"describe": true}` if you want images described.
 
 #### How to get a Slack token
 
@@ -292,10 +307,10 @@ existing raw file instead of creating a duplicate. Re-ingesting replays the
 stored `ETag` as `If-None-Match` — an unchanged page costs a single `304` and
 never gets re-parsed or re-committed.
 
-Images are filtered hard before any vision call: only images inside the
-extracted content survive, and logos, icons, spacers, SVGs, tracking pixels,
-and anything under `web.min_image_bytes` are dropped. Diagrams and screenshots
-go through the normal describe-on-change flow.
+When images are enabled they are filtered hard before anything is described:
+only images inside the extracted content survive, and logos, icons, spacers,
+SVGs, tracking pixels, and anything under `web.min_image_bytes` are dropped.
+Diagrams and screenshots go through the normal describe-on-change flow.
 
 A JavaScript-rendered page has nothing to extract from its HTML — save it from
 your browser (Save As → Web Page, Complete) and ingest the `.html` file instead.
@@ -451,18 +466,25 @@ day-page and processes only what's pending.
 2. Fetch and convert to Markdown, then compare against `raw/<slug>.md` on disk.
 3. **Content diff gate.** If the freshly-rendered Markdown matches the previous
    `content_sha256`, mark the source `unchanged` and skip everything else —
-   no image download, no vision calls, no git commit. Only
+   no image download, no synthesis, no git commit. Only
    `.wiki-state/last-fetched.json` is updated. Pass `--force` to override.
-4. Otherwise, download each `image_hint` into memory, hash it, and reconcile
-   against the manifest at `raw/images/<slug>/.manifest.json` — matching URLs
-   overwrite in place, matching hashes reuse the existing filename, new
-   content lands at the next available index. No duplicates on re-ingest.
-5. For images that end up genuinely new or changed, call the nano-banana-pro
-   vision endpoint to produce a text description at `raw/images/<slug>/<n>.md`.
-   Unchanged images reuse the existing description.
+4. Only when images are enabled: download each `image_hint` into memory, hash
+   it, and reconcile against the manifest at
+   `raw/images/<slug>/.manifest.json` — matching URLs overwrite in place,
+   matching hashes reuse the existing filename, new content lands at the next
+   available index. No duplicates on re-ingest.
+5. Still only with images on: Claude reads each genuinely new or changed
+   image and writes its description to `raw/images/<slug>/<n>.md`, then
+   records it in the manifest. Unchanged images reuse the existing
+   description.
 6. Print key takeaways for your awareness (non-blocking — no pause).
-7. Create or update pages in `wiki/` following your `CLAUDE.md` rules
-   (page format, `[[wiki-links]]`, citations, `wiki/index.md`, `wiki/log.md`).
+7. Update the wiki. `ingest.py` hands Claude the existing pages the source
+   is probably about (`related_pages`) and, for a changed source, the pages
+   citing it plus the raw diff. Claude updates those pages first, creates a
+   page only for a topic with no home, rewrites changed claims in place, lets
+   the newer source (by `source_date`) win a conflict, cites
+   `(source: raw/<file>)`, and updates `wiki/index.md` / `wiki/log.md` with
+   `wiki_tools.py`.
 8. Commit raw + wiki together in a single commit via
    `ingest.py --commit-only --slug <slug>` (message
    `ingest: <slug> (N new, M changed images)`), then push when
@@ -478,7 +500,7 @@ day-page and processes only what's pending.
 | 1. Source-file gate (local only) | `fetch_local.py` | SHA-256 of the raw file bytes; skips parsing PDFs/DOCX when unchanged |
 | 2. Content-diff gate | `raw_store.write_raw_if_changed` | SHA-256 of the rendered Markdown; skips rewriting `raw/<slug>.md` + `raw/<slug>.source.json` when unchanged |
 | 3. Image dedup gate | `extract_images.py` | Manifest lookup by `source_url`, then by SHA-256; prevents duplicate files |
-| 4. Description gate | `image_manifest.py.classify()` | SHA-256 + presence of a description file; only new/changed images invoke nano-banana-pro |
+| 4. Description gate | `image_manifest.py.classify()` | SHA-256 recorded when an image was last described; only new/changed images are listed for Claude to describe |
 
 Pass `--force` to `ingest.py` to bypass gates 0, 1 and 2 for a full refresh.
 
@@ -499,9 +521,12 @@ same per-item flow but routes it through three phases:
    to `queue.json`, so Ctrl-C is always safe. A circuit breaker aborts
    the run after 5 consecutive item failures.
 3. **Synthesis** — Claude reads items with
-   `raw_status in {done, unchanged}` and `wiki_status == pending`, writes
-   wiki pages, and commits + pushes one commit per item via
-   `ingest.py --commit-only` automatically — no per-batch pause.
+   `raw_status in {done, unchanged}` and `wiki_status == pending`, gets each
+   item's context with `ingest.py --context --slug <slug> --job-id <job-id>`,
+   updates the wiki, and commits + pushes one commit per item via
+   `ingest.py --commit-only` automatically — no per-batch pause. A new item
+   whose page is empty is skipped (`last_error: "empty body"`) instead of
+   becoming an empty raw file.
 
 **Refresh mode** (`/ingest` with no source) is a fourth queue kind rather than a
 fourth code path — it reuses discovery → prefetch → synthesis exactly as above,
@@ -532,30 +557,31 @@ top-level `queue.py` would shadow the stdlib `queue` module (which
 
 ### `/lint`
 
-Runs [lint.py](skills/lint/scripts/lint.py) to build a JSON report of orphaned
-pages, broken links, missing concept pages, format violations, empty/stub
-pages, stale pages, unsourced claims, `Status`-tagged pages, `Sources` paths
-that no longer exist in `raw/`, and `empty_raw` (empty, uncited raw source
-files). Then Claude:
+Runs [lint.py](skills/lint/scripts/lint.py) `--fix --since-last-lint` (stdlib
+only, git-based). The script:
 
-1. **Auto-cleans structure** (no approval): deletes empty pages, fixes broken
-   links, triages orphans (integrate / delete / archive), repairs format
-   violations.
-2. **Verifies conflicts + raw deletions with you**: contradictions, outdated
-   facts, and any empty-raw prune candidates are gathered into a single report;
-   you approve before they apply.
-3. **Archives retired pages by moving them to `wiki/archive/`**: the page
-   leaves active lint scope but stays in git and linkable (references to it
-   aren't broken), and is tagged under an `## Archive` section of `index.md`.
-   Every read is routed to the current page.
-4. **Prunes empty raw sources (gated)**: title-only container pages that no
-   wiki page cites are deleted with their `.source.json` (+ any images dir),
-   only after you confirm. `raw/` file *contents* are never edited; non-empty
-   and cited raws are never deleted.
-5. **Maintains logs**: appends a `## <date> (lint)` entry to `wiki/log.md` and
-   updates `index.md`.
-6. **Commits + pushes**: one commit per category, then `ingest.py --push-only`
-   pushes them all (gated on `auto_push`).
+- **Fixes only what needs no judgment**: deletes placeholder stub pages,
+  unlinks links to them, and repairs a `Sources` path whose file was renamed
+  (exact filename match). It refuses to run on uncommitted wiki changes, so
+  every fix is a reviewable diff.
+- **Shortlists what needs judgment**: `fact_collisions` (the same sentence
+  with different numbers on two pages), `overlap_candidates` (likely
+  duplicate pages), `source_drift` (a cited raw file changed after the page
+  was written), orphans, broken links, short pages, format violations,
+  missing sources, and `empty_raw` (empty, uncited raw files). Long lists are
+  capped and the cap is reported.
+
+Then Claude judges the shortlist and puts every proposed change — resolve a
+contradiction, merge duplicates, rewrite drifted claims, archive or delete a
+page, prune raw files — into **one report you approve** before anything is
+applied. Retired pages are archived by **moving them to `wiki/archive/`**
+(still linkable). Verdicts ("these two pages are fine") are stored in
+`wiki/.lint-reviewed.json` and committed, so settled items don't come back
+until the pages change. Finally `wiki_tools.py` updates `index.md` and
+`log.md`, and lint commits by category (every message starts with `lint:`)
+and pushes with `ingest.py --push-only`. Day-pages written by `/log` are
+never judged or edited by lint, and `[[label/slug]]` cross-wiki links are
+never reported as broken.
 
 ### `/log`
 
@@ -576,8 +602,9 @@ files). Then Claude:
    `templates/day-page.md` if needed), inserting the Event in time-of-day
    order. A correction to an already-logged Event appends a dated
    `Update`/`Amends` block rather than editing it in place.
-5. Update `wiki/index.md`'s Diary section and append one entry to the
-   operational `wiki/log.md` — a separate file from the day-pages themselves.
+5. Update `wiki/index.md`'s Diary section and add one entry to the
+   operational `wiki/log.md` (via `wiki_tools.py log --op log`) — a separate
+   file from the day-pages themselves.
 6. Commit (and push, if `auto_push`) via `ingest.py --commit-only`, reused
    as-is.
 
@@ -617,10 +644,11 @@ my-wiki/
 │   └── images/<slug>/
 │       ├── .manifest.json    # COMMITTED — sha256 + source_url per image (SHA baseline for diffs and dedup)
 │       ├── <n>.<ext>         # git-ignored, LOCAL ONLY — image bytes, re-downloaded each ingest
-│       └── <n>.md            # COMMITTED — nano-banana-pro description (cache; avoids re-describing)
+│       └── <n>.md            # COMMITTED — image description written by Claude (only when images are enabled)
 ├── wiki/                     # Claude-maintained pages
 │   ├── index.md
 │   ├── log.md                # operational log (every /ingest, /lint, /log run) — distinct from day-pages below
+│   ├── .lint-reviewed.json   # COMMITTED — /lint's memory of reviewed pairs, collisions and drift
 │   ├── <page>.md
 │   ├── YYYY-MM-DD.md         # day-pages written by /log — flat pages, same as any other
 │   └── archive/              # retired pages moved here by /lint (out of active scope, still linkable)
@@ -653,7 +681,7 @@ my-wiki/
 - Python 3.10 or newer
 - `git` on PATH
 - `bash`
-- Access to your Confluence, Jira, and nano-banana-pro endpoints
+- Access to your Confluence and Jira (only for those source types)
 - Personal Access Tokens for Confluence and Jira (either optional if you don't
   use that source)
 - Nothing extra for website ingest — public pages need no credentials

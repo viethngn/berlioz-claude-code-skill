@@ -123,7 +123,7 @@ suppresses the write.
 
 ## Images
 
-Web pages are full of chrome, and a vision call per logo is wasted money. Five
+Web pages are full of chrome, and describing every logo is wasted effort. Five
 filters run in order:
 
 1. **Content subtree only.** Hints are collected from the node the extractor
@@ -142,8 +142,10 @@ filters run in order:
 
 At most 20 hints per page are kept; past that a `WARNING:` goes to stderr.
 Survivors then go through the normal manifest → `new`/`changed`/`unchanged`
-classification and nano-banana description, identical to Confluence
-attachments.
+classification, identical to Confluence attachments, and the new or changed
+ones are described by the session model. All of this happens only when images
+are enabled (`images.describe` or `--describe-images`); by default no web
+image is downloaded at all and the hints just stay in `source.json`.
 
 `extract_images.py` always sends `web.user_agent` for `web` sources (a bare
 `python-requests` User-Agent is `403`d by many CDNs) and uses the `web` rate
@@ -182,7 +184,7 @@ a `Cookie` header is present it follows redirects manually, carrying the header
 across **same-origin** hops and dropping it cross-origin — the same rule
 `requests` already applies correctly to `Authorization` via `rebuild_auth`.
 Capped at 10 hops. It's a no-op when no `Cookie` is configured, so the
-Atlassian/Slack/nano-banana callers are unaffected.
+Atlassian/Slack callers are unaffected.
 
 ## Bulk discovery
 
