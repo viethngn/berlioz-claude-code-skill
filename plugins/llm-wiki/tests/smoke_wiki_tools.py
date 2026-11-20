@@ -76,6 +76,29 @@ def test_related_mention_title_and_cjk(tmp):
     _assert(related(root / "wiki", "Quarterly", "nothing relevant here") == [], "no hits -> empty")
 
 
+def test_related_word_bounds_plurals_and_title(tmp):
+    sys.path.insert(0, str(TOOL.parent))
+    from wiki_tools import related
+
+    root = make_wiki(tmp)
+    for slug, h1 in (("data", "Data"), ("auth", "Auth"), ("team", "Team"), ("payments", "Payments"),
+                     ("payment-retries", "Payment Retries"), ("sso", "SSO"), ("glossary", "Glossary")):
+        _titled_page(root, slug, h1)
+    noise = "Metadata lives in the database. Authored by Ann; authorize first. The steam rose; teammates left."
+    hits = [h["page"] for h in related(root / "wiki", "Weekly notes", noise)]
+    _assert(not {"data", "auth", "team"} & set(hits), f"word-bounded: {hits}")
+    hits = related(root / "wiki", "Payment Retry Strategy v2", "We retry failed card charges three times.")
+    by = {h["page"]: h for h in hits}
+    _assert("payment-retries" in by and by["payment-retries"]["why"] == "title", f"ies<->y in title: {hits}")
+    _assert("payments" in by, f"payments<->payment in title: {hits}")
+    _assert(not {"data", "auth", "team", "sso"} & set(by), f"no noise: {hits}")
+    # Title as build_context prepares it: Jira key stripped.
+    hits = related(root / "wiki", "SSO login fails for Okta users", "Users of Okta cannot sign in.")
+    _assert([h["page"] for h in hits] == ["sso"], f"3-char acronym page: {hits}")
+    hits = related(root / "wiki", "Notes", "The payment retry job ran; payments retried.")
+    _assert({"payment-retries", "payments"} <= {h["page"] for h in hits}, f"plural forms in text: {hits}")
+
+
 def test_locate_and_citing(tmp):
     root = collision_fixture(tmp)
     write_page(root, "2026-01-02", "## 09:00 — rate limit note\n\nrate limit rate limit\n")

@@ -307,6 +307,12 @@ def test_related_pages_signal(tmp: Path) -> None:
     hits = _related(root, "PROJ-12")
     _assert(hits[:1] == ["login-timeouts"], f"jira: {hits}")
     _assert("code-review" not in hits and "release-process" not in hits, f"jira boilerplate matched: {hits}")
+    # 3-char acronym page found through the key-stripped Jira title.
+    write_page(root, "sso", "Single sign-on setup.", title="SSO")
+    (raw / "PROJ-481.md").write_text("# PROJ-481 — SSO login fails for Okta users\n\n## Description\n\nOkta users cannot sign in.\n")
+    (raw / "PROJ-481.source.json").write_text(json.dumps({"type": "jira", "title": "PROJ-481 — SSO login fails for Okta users"}))
+    hits = _related(root, "PROJ-481")
+    _assert(hits[:1] == ["sso"], f"jira sso: {hits}")
     # PDF-shaped raw: 60 generated page headings, no real mentions.
     (raw / "report.md").write_text(
         "# Quarterly Report\n\n" + "".join(f"## Page {i}\n\nLorem ipsum dolor sit amet.\n\n" for i in range(1, 61))

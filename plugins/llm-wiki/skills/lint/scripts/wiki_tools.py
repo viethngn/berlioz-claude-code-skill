@@ -96,10 +96,11 @@ def citing(wiki_dir: Path, raw_slug: str, raw_dir: Optional[Path] = None) -> Lis
     )
 
 
-MENTION_MIN_CHARS = 4  # shorter page names match too much by accident
+ASCII_MIN_CHARS = 3  # word-bounded, so `sso` / `api` pages are findable
+OTHER_MIN_CHARS = 4  # CJK etc.: substring match, so shorter names are too noisy
 MENTION_CAP = 5  # occurrences counted per page
 TITLE_MIN_CONTAINMENT = 0.6  # share of the source title's trigrams found in the page
-TITLE_WEIGHT = 3  # score of a perfect title match
+TITLE_WEIGHT = 3  # score of a title match (containment scales it)
 
 
 def _norm(text: str) -> str:
@@ -111,14 +112,35 @@ def _trigrams(text: str) -> set:
     return {text[i:i + 3] for i in range(len(text) - 2)} or ({text} if text else set())
 
 
-def related(wiki_dir: Path, title: str, text: str, limit: int = 10) -> List[dict]:
-    """Pages a source is about: named in its text, or titled like it.
+def _forms(name: str) -> set:
+    """`name` plus its other number: retries<->retry, payments<->payment, process->processes."""
+    if name.endswith("ies"):
+        return {name, name[:-3] + "y"}
+    if name.endswith("ss"):
+        return {name, name + "es"}
+    if name.endswith("s"):
+        return {name, name[:-1]}
+    if name.endswith("y") and name[-2:-1] not in "aeiou":
+        return {name, name[:-1] + "ies"}
+    return {name, name + "s"}
 
-    `mentioned`: the page's H1 or slug-as-words occurs in `text` (also with a
-    trailing `s` dropped). `title`: character-trigram containment of `title`
-    in the page's H1 + slug + Summary is at least TITLE_MIN_CONTAINMENT.
+
+def _count(form: str, text: str) -> int:
+    """ASCII names match whole words only (`data` is not in "metadata"); others by substring."""
+    if form.isascii():
+        return len(re.findall(rf"(?<![a-z0-9]){re.escape(form)}(?![a-z0-9])", text))
+    return text.count(form)
+
+
+def related(wiki_dir: Path, title: str, text: str, limit: int = 10) -> List[dict]:
+    """Pages a source is about: named in its text, or in / like its title.
+
+    `mentioned`: the page's H1 or slug-as-words (singular or plural) occurs in
+    `text`. `title`: such a name occurs in `title`, or character-trigram
+    containment of `title` in the page's H1 + slug + Summary is at least
+    TITLE_MIN_CONTAINMENT. ASCII names match on word boundaries.
     """
-    text = _norm(text)
+    text, norm_title = _norm(text), _norm(title)
     want = _trigrams(title)
     hits = []
     for page in _content_pages(wiki_dir):
@@ -126,18 +148,24 @@ def related(wiki_dir: Path, title: str, text: str, limit: int = 10) -> List[dict
         h1 = H1_RE.search(page["text"])
         h1 = h1.group(1) if h1 else ""
         summary = _summary(page["text"])
-        names = {n for n in (_norm(h1), _norm(slug)) if len(n) >= MENTION_MIN_CHARS}
-        names |= {n[:-1] for n in names if len(n) >= 5 and n.endswith("s")}
-        mentions = min(max((text.count(n) for n in names), default=0), MENTION_CAP)
+        names = {
+            n for n in (_norm(h1), _norm(slug))
+            if len(n) >= (ASCII_MIN_CHARS if n.isascii() else OTHER_MIN_CHARS)
+        }
+        forms = set().union(*(_forms(n) for n in names)) if names else set()
+        mentions = min(max((_count(f, text) for f in forms), default=0), MENTION_CAP)
         sim = len(want & _trigrams(f"{h1} {slug} {summary}")) / len(want) if want else 0.0
-        titled = sim >= TITLE_MIN_CONTAINMENT
-        if not (mentions or titled):
+        if any(_count(f, norm_title) for f in forms):
+            title_score = TITLE_WEIGHT
+        else:
+            title_score = TITLE_WEIGHT * sim if sim >= TITLE_MIN_CONTAINMENT else 0
+        if not (mentions or title_score):
             continue
         hits.append({
             "page": slug,
             "summary": summary,
-            "score": round(mentions + (TITLE_WEIGHT * sim if titled else 0), 2),
-            "why": "both" if mentions and titled else ("mentioned" if mentions else "title"),
+            "score": round(mentions + title_score, 2),
+            "why": "both" if mentions and title_score else ("mentioned" if mentions else "title"),
         })
     hits.sort(key=lambda h: (-h["score"], h["page"]))
     return hits[:limit]
