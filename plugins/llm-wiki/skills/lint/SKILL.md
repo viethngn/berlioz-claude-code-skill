@@ -186,7 +186,11 @@ Do not apply anything yet; collect proposals for Step 4.
   page where the text belongs, or keep.
 - **Broken links**: propose, per link, creating the page (only when a source
   has enough on the topic — no stubs), removing the brackets (the text
-  stays), or fixing the target (a typo or a case difference).
+  stays), or fixing the target (a typo or a case difference). A broken link
+  whose `from` is a journal page (`YYYY-MM-DD` or `YYYY-MM-index`) is only
+  reported to the user, never fixed: journal pages are an append-only record
+  that lint does not edit. Creating the missing page is the one way to
+  resolve it, and only when that page deserves to exist anyway.
 - **Missing sources**: propose the right path when you can find the renamed
   file, otherwise marking the claim `(source: needs verification)`. Never
   recreate a raw file.
@@ -304,7 +308,8 @@ ${WIKI_PY} "${LINT}" --wiki-root "${WIKI_ROOT}" --since-last-lint
 
 No `--fix` this time. `broken_links`, `empty_pages`, `format_violations`
 and `missing_sources` must all be empty, apart from items the user chose to
-keep (name them in the final report). Anything else means an applied change
+keep and broken links whose `from` is a journal page (name both in the final
+report). Anything else means an applied change
 left a loose end — a link to a merged page, a moved page still cited by its
 old name — so fix it before committing.
 

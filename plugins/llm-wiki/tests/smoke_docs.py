@@ -62,7 +62,8 @@ def test_required_text() -> None:
               "index-sync", "--describe-images", "--context", "--job-id", "take precedence"]:
         _assert(s in ingest, f"ingest SKILL.md missing {s}")
     for s in ["--fix", "--since-last-lint", "--mark-reviewed", "--allow-dirty", "fact_collisions",
-              "overlap_candidates", "source_drift", "warnings", "index-sync", "take precedence"]:
+              "overlap_candidates", "source_drift", "warnings", "index-sync", "take precedence",
+              "whose `from` is a journal page"]:
         _assert(s in lint, f"lint SKILL.md missing {s}")
     _assert("--upgrade" in (PLUGIN_ROOT / "skills/create-wiki/SKILL.md").read_text(encoding="utf-8"),
             "create-wiki documents --upgrade")
